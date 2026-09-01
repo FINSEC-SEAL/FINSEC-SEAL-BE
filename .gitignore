@@ -21,6 +21,11 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+.gradle/
+out/
+
+# Local runtime
+.java-version.local
 
 # IDE and logs
 .idea/
