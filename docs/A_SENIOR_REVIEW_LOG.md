@@ -195,3 +195,68 @@
   - delete, first-seen/source reparent, severity mutation, 잘못된 신규 first-seen negative test 추가
   - 정상 `OPEN→TRIAGED`, root cause 및 same-release latest-seen 갱신 positive test 추가
 - Reverification: PostgreSQL targeted/full test와 fixed commit 생성 후 9차 검토 요청 예정
+
+## G1 — Ninth review
+
+- Result: approved
+- Reviewed fixed commit: `86177e60294d347292bbae4df4a663908fb1cf1d`
+- Independent verification: 선임의 격리 detached worktree와 PostgreSQL `17.11-alpine`에서 전체 19 tests,
+  실패 0건
+- Confirmed:
+  - Finding delete와 provenance reparent/severity mutation 차단
+  - 정상 `OPEN→TRIAGED`, root-cause 및 same-release latest-seen 갱신 허용
+  - G1 범위의 P0/P1 잔여 항목 없음
+- Gate: G1 PASS
+
+## G2 — First review
+
+- Result: rejected
+- Reviewed fixed commit: `c381ef0c7564ace74a3b7122c11171215918c67c`
+- Independent verification: 선임의 clean detached worktree, PostgreSQL `17.11-alpine`, 19 tests 전부 통과,
+  `git diff --check` 통과, Role B/C/D 로직 침범 없음
+- P0 feedback:
+  - Tool name/version과 operation/adapter/side-effect/trust/classification의 서버 고정 조합 검증이 없어
+    정상 Tool 이름에 다른 adapter를 연결할 수 있음
+  - analyze/fingerprint가 저장된 derived artifact와 Tool/RAG catalog/link 전체를 canonical manifest와
+    재대조하지 않음
+  - idempotency filter가 advisory-lock 전용 connection을 controller 완료까지 점유해 작은 pool에서
+    connection 고갈 가능
+  - analyze와 DRAFT child/catalog mutation이 동일 parent lock으로 완전히 직렬화되지 않음
+- P1/P2 feedback:
+  - Agent archive/create/update 경쟁에 row lock 또는 optimistic version 필요
+  - 불확정 PROCESSING 및 retryable 500 replay의 복구 규칙, request semantic digest 보강 필요
+  - RAG/human-boundary canonical sort tie-breaker와 validator type/meaning 검증 보강 필요
+  - mutable JsonNode setter 방어 복사, integrity 오류의 정확한 API 분류, 실제 actor 증적 필요
+- Gate: G2 FAIL. P0 수정 및 concurrency/negative test 추가 후 재검토 요청
+
+## G2 — First review feedback applied
+
+- Tool contract:
+  - 서버 고정 normal Tool 5종에 대해 name/version/operation/adapter/side-effect/trust/risk/
+    classification 전체 조합을 정확히 대조
+  - `LOAN_DECISION_UPDATE`, `EXTERNAL_HTTP` 등 attack-only Tool의 Release manifest 선언 거부
+- Derived integrity:
+  - canonical manifest에서 artifact 기대 집합을 재생성해 개수/content/digest/sensitivity/canonicalization을 대조
+  - Tool definition/link의 ordinal/enabled/schema/description/metadata/digest와 RAG source/link/config/digest를
+    analyze/validate/fingerprint/diff 전에 전부 대조
+- Idempotency:
+  - 요청 전체 동안 advisory-lock 전용 connection을 점유하던 구조 제거
+  - unique row `INSERT ... ON CONFLICT DO NOTHING` 기반 atomic reservation으로 변경
+  - body뿐 아니라 Content-Type/If-Match를 request digest에 포함
+  - 만료 PROCESSING 및 5xx는 자동 재실행/replay하지 않고 operator recovery가 필요한 fail-closed 상태로 유지
+- Concurrency:
+  - Release child/Tool/RAG definition mutation이 Release parent row를 lock하도록 DB function 보강
+  - Agent update/archive/Release create가 동일 Agent row lock을 사용하고 DB도 archived Agent Release insert 거부
+  - child-first/analyze-first 및 archive-first/create-wait 양방향 real PostgreSQL race test 추가
+- P1/P2:
+  - RAG sourceId+version, human boundary, provider host 배열의 canonical tie-breaker 보강
+  - non-string prompt digest, configured provider/host, human boundary 의미 검증 보강
+  - entity 입력 JsonNode defensive copy 및 manual invalidation 실제 actor 기록
+- Regression found and fixed:
+  - 동시 Event append에서 한 SQL의 row lock+lateral head 조회가 stale snapshot을 반환할 수 있음을 전체
+    테스트가 탐지
+  - Run row lock을 먼저 획득한 뒤 별도 SQL의 새 snapshot으로 event head를 조회하도록 변경하고
+    동시 append 검증을 10회 반복
+- Reverification: `git diff --check` 성공, PostgreSQL `17.11-alpine` 기반
+  `./gradlew clean test --warning-mode all --rerun-tasks` 전체 45 tests, 실패 0건
+- Gate: fixed commit 생성 후 G2 재검토 요청

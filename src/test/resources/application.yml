@@ -10,6 +10,8 @@ spring:
       fail-on-unknown-properties: true
 
 finsec:
+  scheduling:
+    enabled: false
   cors:
     allowed-origins: http://localhost:5173
   crypto:

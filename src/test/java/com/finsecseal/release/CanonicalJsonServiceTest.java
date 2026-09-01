@@ -56,6 +56,27 @@ class CanonicalJsonServiceTest {
         assertThat(newFingerprint.releaseFingerprint()).isNotEqualTo(oldFingerprint.releaseFingerprint());
     }
 
+    @Test
+    void ragSourceVersionTieAndProviderHostOrderingAreCanonical() {
+        ObjectNode first = minimalManifest();
+        ObjectNode second = first.deepCopy();
+        ArrayNode firstSources = (ArrayNode) first.path("ragSources");
+        ArrayNode secondSources = (ArrayNode) second.path("ragSources");
+        ObjectNode versionOne = objectMapper.createObjectNode()
+                .put("sourceId", "policy")
+                .put("version", "1");
+        ObjectNode versionTwo = objectMapper.createObjectNode()
+                .put("sourceId", "policy")
+                .put("version", "2");
+        firstSources.add(versionOne).add(versionTwo);
+        secondSources.add(versionTwo.deepCopy()).add(versionOne.deepCopy());
+        ((ObjectNode) first.path("networkRequirements")).putArray("allowedHosts").add("b").add("a");
+        ((ObjectNode) second.path("networkRequirements")).putArray("allowedHosts").add("a").add("b");
+
+        assertThat(fingerprintService.fingerprint(first, null).agentArtifactFingerprint())
+                .isEqualTo(fingerprintService.fingerprint(second, null).agentArtifactFingerprint());
+    }
+
     private ObjectNode minimalManifest() {
         return (ObjectNode) objectMapper.readTree("""
                 {

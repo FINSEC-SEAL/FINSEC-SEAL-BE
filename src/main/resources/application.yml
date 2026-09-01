@@ -33,6 +33,8 @@ management:
         enabled: true
 
 finsec:
+  scheduling:
+    enabled: ${FINSEC_SCHEDULING_ENABLED:true}
   cors:
     allowed-origins: ${FINSEC_CORS_ALLOWED_ORIGINS}
   crypto:

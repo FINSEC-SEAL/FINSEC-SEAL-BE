@@ -42,10 +42,6 @@ public class CanonicalJsonService {
         if (!(normalized instanceof ObjectNode root)) {
             return normalized;
         }
-        sortObjectArray(root, "tools", "name");
-        sortObjectArray(root, "ragSources", "sourceId");
-        sortObjectArray(root, "humanApprovalBoundaries", "resource");
-        sortTextArray(root, "runtimeContextRequirements");
         if (root.path("tools") instanceof ArrayNode tools) {
             tools.forEach(tool -> {
                 if (tool instanceof ObjectNode object) {
@@ -59,6 +55,16 @@ public class CanonicalJsonService {
                     sortTextArray(object, "operations");
                 }
             });
+        }
+        sortObjectArray(root, "tools", List.of("name", "version"));
+        sortObjectArray(root, "ragSources", List.of("sourceId", "version"));
+        sortObjectArray(root, "humanApprovalBoundaries", List.of("resource", "mode"));
+        sortTextArray(root, "runtimeContextRequirements");
+        if (root.path("networkRequirements") instanceof ObjectNode network) {
+            sortTextArray(network, "allowedHosts");
+        }
+        if (root.path("businessWorkflow") instanceof ObjectNode workflow) {
+            sortTextArray(workflow, "allowedStages");
         }
         return root;
     }
@@ -84,13 +90,18 @@ public class CanonicalJsonService {
         return value.deepCopy();
     }
 
-    private void sortObjectArray(ObjectNode parent, String fieldName, String stableKey) {
+    private void sortObjectArray(ObjectNode parent, String fieldName, List<String> stableKeys) {
         if (!(parent.path(fieldName) instanceof ArrayNode array)) {
             return;
         }
         List<JsonNode> values = new java.util.ArrayList<>();
         array.forEach(values::add);
-        values.sort(Comparator.comparing(node -> node.path(stableKey).asString("")));
+        Comparator<JsonNode> comparator = (left, right) -> 0;
+        for (String stableKey : stableKeys) {
+            comparator = comparator.thenComparing(node -> node.path(stableKey).asString(""));
+        }
+        comparator = comparator.thenComparing(this::canonicalString);
+        values.sort(comparator);
         array.removeAll();
         values.forEach(array::add);
     }

@@ -12,12 +12,7 @@ import jakarta.servlet.http.HttpServletRequestWrapper;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
@@ -25,7 +20,6 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
-import javax.sql.DataSource;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
@@ -47,20 +41,17 @@ public class IdempotencyFilter extends OncePerRequestFilter {
     private static final Pattern KEY = Pattern.compile("^[A-Za-z0-9._:-]{1,128}$");
     private static final int MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 
-    private final DataSource dataSource;
     private final JdbcTemplate jdbcTemplate;
     private final DigestService digestService;
     private final ObjectMapper objectMapper;
     private final Duration ttl;
 
     public IdempotencyFilter(
-            DataSource dataSource,
             JdbcTemplate jdbcTemplate,
             DigestService digestService,
             ObjectMapper objectMapper,
             @Value("${finsec.idempotency.ttl:24h}") Duration ttl
     ) {
-        this.dataSource = dataSource;
         this.jdbcTemplate = jdbcTemplate;
         this.digestService = digestService;
         this.objectMapper = objectMapper;
@@ -104,63 +95,58 @@ public class IdempotencyFilter extends OncePerRequestFilter {
 
         String path = request.getRequestURI()
                 + (request.getQueryString() == null ? "" : "?" + request.getQueryString());
-        String requestDigest = digestService.sha256(body);
-        long lockKey = advisoryLockKey(actor, request.getMethod(), path, key);
-        try (Connection connection = dataSource.getConnection()) {
-            advisoryLock(connection, lockKey, true);
-            try {
-                jdbcTemplate.update("""
-                        delete from api_idempotency_records
-                         where workspace_id = ? and actor_id = ? and http_method = ?
-                           and request_path = ? and idempotency_key = ? and expires_at <= now()
-                        """, AgentService.DEMO_WORKSPACE_ID, actor, request.getMethod(), path, key);
-                StoredResponse stored = find(actor, request.getMethod(), path, key);
-                if (stored != null) {
-                    if (!stored.requestDigest().equals(requestDigest)) {
-                        writeProblem(
-                                response,
-                                ErrorCode.IDEMPOTENCY_CONFLICT,
-                                "Idempotency-Key was already used with a different request body"
-                        );
-                        return;
-                    }
-                    if (!"COMPLETED".equals(stored.state())) {
-                        writeProblem(
-                                response,
-                                ErrorCode.IDEMPOTENCY_IN_PROGRESS,
-                                "The original request is still processing or requires recovery"
-                        );
-                        return;
-                    }
-                    replay(response, stored);
-                    return;
-                }
-
-                reserve(actor, request.getMethod(), path, key, requestDigest);
-
-                CachedBodyRequest cachedRequest = new CachedBodyRequest(request, body);
-                ContentCachingResponseWrapper cachedResponse = new ContentCachingResponseWrapper(response);
-                filterChain.doFilter(cachedRequest, cachedResponse);
-                byte[] responseBody = cachedResponse.getContentAsByteArray();
-                store(
-                        actor,
-                        request.getMethod(),
-                        path,
-                        key,
-                        requestDigest,
-                        cachedResponse.getStatus(),
-                        cachedResponse.getContentType(),
-                        cachedResponse.getHeader(HttpHeaders.LOCATION),
-                        cachedResponse.getHeader("X-Trace-Id"),
-                        responseBody
-                );
-                cachedResponse.copyBodyToResponse();
-            } finally {
-                advisoryLock(connection, lockKey, false);
+        String requestDigest = requestDigest(
+                body,
+                request.getContentType(),
+                request.getHeader(HttpHeaders.IF_MATCH)
+        );
+        deleteExpiredCompleted(actor, request.getMethod(), path, key);
+        boolean reserved = reserve(actor, request.getMethod(), path, key, requestDigest);
+        if (!reserved) {
+            StoredResponse stored = find(actor, request.getMethod(), path, key);
+            if (stored == null) {
+                writeProblem(response, ErrorCode.IDEMPOTENCY_IN_PROGRESS, "Idempotency reservation is being created");
+                return;
             }
-        } catch (java.sql.SQLException exception) {
-            throw new ServletException("Idempotency lock failed", exception);
+            if (!stored.requestDigest().equals(requestDigest)) {
+                writeProblem(
+                        response,
+                        ErrorCode.IDEMPOTENCY_CONFLICT,
+                        "Idempotency-Key was already used with a semantically different request"
+                );
+                return;
+            }
+            if (!"COMPLETED".equals(stored.state())) {
+                writeProblem(
+                        response,
+                        ErrorCode.IDEMPOTENCY_IN_PROGRESS,
+                        "The original request is still processing or requires operator recovery"
+                );
+                return;
+            }
+            replay(response, stored);
+            return;
         }
+
+        CachedBodyRequest cachedRequest = new CachedBodyRequest(request, body);
+        ContentCachingResponseWrapper cachedResponse = new ContentCachingResponseWrapper(response);
+        filterChain.doFilter(cachedRequest, cachedResponse);
+        byte[] responseBody = cachedResponse.getContentAsByteArray();
+        if (cachedResponse.getStatus() < 500) {
+            store(
+                    actor,
+                    request.getMethod(),
+                    path,
+                    key,
+                    requestDigest,
+                    cachedResponse.getStatus(),
+                    cachedResponse.getContentType(),
+                    cachedResponse.getHeader(HttpHeaders.LOCATION),
+                    cachedResponse.getHeader("X-Trace-Id"),
+                    responseBody
+            );
+        }
+        cachedResponse.copyBodyToResponse();
     }
 
     private StoredResponse find(String actor, String method, String path, String key) {
@@ -169,7 +155,7 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                        response_trace_id, response_body
                   from api_idempotency_records
                  where workspace_id = ? and actor_id = ? and http_method = ?
-                   and request_path = ? and idempotency_key = ? and expires_at > now()
+                   and request_path = ? and idempotency_key = ?
                 """, resultSet -> resultSet.next()
                         ? new StoredResponse(
                                 resultSet.getString("request_digest"),
@@ -184,13 +170,15 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                 AgentService.DEMO_WORKSPACE_ID, actor, method, path, key);
     }
 
-    private void reserve(String actor, String method, String path, String key, String requestDigest) {
+    private boolean reserve(String actor, String method, String path, String key, String requestDigest) {
         Instant now = Instant.now();
-        jdbcTemplate.update("""
+        return jdbcTemplate.update("""
                 insert into api_idempotency_records
                     (id, workspace_id, actor_id, http_method, request_path, idempotency_key,
                      request_digest, state, expires_at)
                 values (?, ?, ?, ?, ?, ?, ?, 'PROCESSING', ?)
+                on conflict (workspace_id, actor_id, http_method, request_path, idempotency_key)
+                do nothing
                 """,
                 UuidV7.generate(),
                 AgentService.DEMO_WORKSPACE_ID,
@@ -200,7 +188,16 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                 key,
                 requestDigest,
                 Timestamp.from(now.plus(ttl))
-        );
+        ) == 1;
+    }
+
+    private void deleteExpiredCompleted(String actor, String method, String path, String key) {
+        jdbcTemplate.update("""
+                delete from api_idempotency_records
+                 where workspace_id = ? and actor_id = ? and http_method = ?
+                   and request_path = ? and idempotency_key = ?
+                   and state = 'COMPLETED' and expires_at <= now()
+                """, AgentService.DEMO_WORKSPACE_ID, actor, method, path, key);
     }
 
     private void store(
@@ -271,23 +268,14 @@ public class IdempotencyFilter extends OncePerRequestFilter {
         response.getOutputStream().write(objectMapper.writeValueAsBytes(problem));
     }
 
-    private void advisoryLock(Connection connection, long key, boolean acquire) throws java.sql.SQLException {
-        String function = acquire ? "pg_advisory_lock" : "pg_advisory_unlock";
-        try (PreparedStatement statement = connection.prepareStatement("select " + function + "(?)")) {
-            statement.setLong(1, key);
-            statement.execute();
-        }
-    }
-
-    private long advisoryLockKey(String actor, String method, String path, String key) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest((actor + '\n' + method + '\n' + path + '\n' + key)
-                    .getBytes(StandardCharsets.UTF_8));
-            return ByteBuffer.wrap(hash).getLong();
-        } catch (NoSuchAlgorithmException exception) {
-            throw new IllegalStateException("SHA-256 is unavailable", exception);
-        }
+    private String requestDigest(byte[] body, String contentType, String ifMatch) {
+        String normalizedContentType = contentType == null ? "" : contentType.trim().toLowerCase(java.util.Locale.ROOT);
+        String normalizedIfMatch = ifMatch == null ? "" : ifMatch.trim();
+        byte[] metadata = ("\ncontent-type:" + normalizedContentType + "\nif-match:" + normalizedIfMatch)
+                .getBytes(StandardCharsets.UTF_8);
+        byte[] semanticRequest = java.util.Arrays.copyOf(body, body.length + metadata.length);
+        System.arraycopy(metadata, 0, semanticRequest, body.length, metadata.length);
+        return digestService.sha256(semanticRequest);
     }
 
     private record StoredResponse(

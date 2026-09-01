@@ -79,7 +79,7 @@ public class AgentReleaseEntity extends BaseEntity {
         this.version = version;
         this.businessPurpose = businessPurpose;
         this.manifestSchemaVersion = manifestSchemaVersion;
-        this.manifestJson = manifestJson;
+        this.manifestJson = manifestJson.deepCopy();
         this.agentArtifactFingerprint = agentArtifactFingerprint;
         this.releaseFingerprint = releaseFingerprint;
         this.lifecycleState = ReleaseLifecycleState.DRAFT;
@@ -107,7 +107,7 @@ public class AgentReleaseEntity extends BaseEntity {
         if (lifecycleState.isTerminalDecision()) {
             lifecycleState = ReleaseLifecycleState.NEEDS_REVALIDATION;
             effectiveStatus = ReleaseLifecycleState.NEEDS_REVALIDATION;
-            revalidationReasonJson = reason;
+            revalidationReasonJson = copyReason(reason);
         } else if (lifecycleState == ReleaseLifecycleState.REMEDIATION) {
             transitionTo(ReleaseLifecycleState.VERIFYING);
         }
@@ -119,7 +119,7 @@ public class AgentReleaseEntity extends BaseEntity {
         }
         lifecycleState = ReleaseLifecycleState.NEEDS_REVALIDATION;
         effectiveStatus = ReleaseLifecycleState.NEEDS_REVALIDATION;
-        revalidationReasonJson = reason;
+        revalidationReasonJson = copyReason(reason);
     }
 
     public UUID getAgentId() {
@@ -172,5 +172,9 @@ public class AgentReleaseEntity extends BaseEntity {
 
     public Instant getLastTestedAt() {
         return lastTestedAt;
+    }
+
+    private JsonNode copyReason(JsonNode reason) {
+        return reason == null ? JsonNodeFactory.instance.objectNode() : reason.deepCopy();
     }
 }

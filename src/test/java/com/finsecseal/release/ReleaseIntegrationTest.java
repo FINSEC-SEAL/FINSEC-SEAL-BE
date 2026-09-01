@@ -101,6 +101,18 @@ class ReleaseIntegrationTest {
         assertThat(analyzed.lifecycleState()).isEqualTo(ReleaseLifecycleState.ANALYZED);
         assertThat(releaseService.analyze(created.id()).lifecycleState())
                 .isEqualTo(ReleaseLifecycleState.ANALYZED);
+        entityManager.flush();
+        entityManager.clear();
+        assertThat(jdbcTemplate.queryForObject(
+                "select manifest_json::text from agent_releases where id = ?",
+                String.class,
+                created.id()
+        )).doesNotContain("Review only document completeness").contains("[ENCRYPTED]");
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from audit_records
+                 where resource_type = 'AGENT_RELEASE' and resource_id = ?
+                   and action = 'SYSTEM_PROMPT_DECRYPTED_INTERNAL'
+                """, Integer.class, created.id())).isEqualTo(3);
     }
 
     @Test
@@ -112,15 +124,15 @@ class ReleaseIntegrationTest {
         ));
         releaseService.create(agent.id(), manifest);
 
-        assertThatThrownBy(() -> releaseService.create(agent.id(), manifest))
-                .isInstanceOf(BusinessException.class)
-                .hasMessageContaining("already exists");
-
         JsonNode wrongAgent = manifest.deepCopy();
         ((tools.jackson.databind.node.ObjectNode) wrongAgent.path("agent")).put("id", "another-agent");
         assertThatThrownBy(() -> releaseService.create(agent.id(), wrongAgent))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("agent.id");
+
+        assertThatThrownBy(() -> releaseService.create(agent.id(), manifest))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("already exists");
     }
 
     @Test
@@ -140,6 +152,48 @@ class ReleaseIntegrationTest {
         assertThatThrownBy(() -> releaseService.create(agent.id(), drifted))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("immutable catalog definition");
+    }
+
+    @Test
+    void detectsDraftDerivedArtifactTamperingBeforeFingerprintOrAnalyze() {
+        AgentDto.Response agent = agentService.create(new AgentDto.CreateRequest(
+                "loan-document-review-agent",
+                "Loan Review Agent",
+                "Document completeness only"
+        ));
+        ReleaseDto.Response release = releaseService.create(agent.id(), manifest);
+        jdbcTemplate.update("""
+                update release_artifacts
+                   set content_json = '{"tampered":true}'::jsonb
+                 where release_id = ? and artifact_type = 'MODEL_CONFIG'
+                """, release.id());
+        entityManager.clear();
+
+        assertThatThrownBy(() -> releaseService.fingerprint(release.id()))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("artifact differs");
+    }
+
+    @Test
+    void detectsDraftToolCatalogTamperingBeforeAnalyze() {
+        AgentDto.Response agent = agentService.create(new AgentDto.CreateRequest(
+                "loan-document-review-agent",
+                "Loan Review Agent",
+                "Document completeness only"
+        ));
+        ReleaseDto.Response release = releaseService.create(agent.id(), manifest);
+        jdbcTemplate.update("""
+                update tool_definitions definition
+                   set adapter_key = 'loan_decision_update'
+                  from release_tools link
+                 where link.tool_definition_id = definition.id
+                   and link.release_id = ? and definition.tool_key = 'CASE_CONTEXT_READ'
+                """, release.id());
+        entityManager.clear();
+
+        assertThatThrownBy(() -> releaseService.analyze(release.id()))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Tool catalog differs");
     }
 
     @Test

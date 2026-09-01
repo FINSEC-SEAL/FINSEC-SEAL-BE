@@ -89,6 +89,10 @@ public class ReleaseArtifactEntity {
         return encryptedText;
     }
 
+    public String getSha256() {
+        return sha256;
+    }
+
     public ArtifactType getArtifactType() {
         return artifactType;
     }

@@ -14,6 +14,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
@@ -27,8 +28,11 @@ public class AgentController {
     }
 
     @PostMapping
-    ResponseEntity<ApiResponse<AgentDto.Response>> create(@Valid @RequestBody AgentDto.CreateRequest request) {
-        AgentDto.Response response = agentService.create(request);
+    ResponseEntity<ApiResponse<AgentDto.Response>> create(
+            @Valid @RequestBody AgentDto.CreateRequest request,
+            @RequestHeader(value = "X-Actor-Id", required = false) String actorId
+    ) {
+        AgentDto.Response response = agentService.create(request, actorId);
         return ResponseEntity.created(URI.create("/api/v1/agents/" + response.id()))
                 .body(ApiResponse.success(response, TraceIdFilter.currentTraceId()));
     }
@@ -46,13 +50,17 @@ public class AgentController {
     @PutMapping("/{agentId}")
     ApiResponse<AgentDto.Response> update(
             @PathVariable UUID agentId,
-            @Valid @RequestBody AgentDto.UpdateRequest request
+            @Valid @RequestBody AgentDto.UpdateRequest request,
+            @RequestHeader(value = "X-Actor-Id", required = false) String actorId
     ) {
-        return ApiResponse.success(agentService.update(agentId, request), TraceIdFilter.currentTraceId());
+        return ApiResponse.success(agentService.update(agentId, request, actorId), TraceIdFilter.currentTraceId());
     }
 
     @DeleteMapping("/{agentId}")
-    ApiResponse<AgentDto.Response> archive(@PathVariable UUID agentId) {
-        return ApiResponse.success(agentService.archive(agentId), TraceIdFilter.currentTraceId());
+    ApiResponse<AgentDto.Response> archive(
+            @PathVariable UUID agentId,
+            @RequestHeader(value = "X-Actor-Id", required = false) String actorId
+    ) {
+        return ApiResponse.success(agentService.archive(agentId, actorId), TraceIdFilter.currentTraceId());
     }
 }

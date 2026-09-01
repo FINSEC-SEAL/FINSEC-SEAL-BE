@@ -8,7 +8,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import com.finsecseal.agent.AgentService;
 import com.finsecseal.release.DigestService;
 import org.junit.jupiter.api.Test;
@@ -25,7 +28,10 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 @Testcontainers
-@SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT)
+@SpringBootTest(
+        webEnvironment = WebEnvironment.RANDOM_PORT,
+        properties = "spring.datasource.hikari.maximum-pool-size=2"
+)
 class IdempotencyIntegrationTest {
 
     @Container
@@ -110,8 +116,8 @@ class IdempotencyIntegrationTest {
                 UUID.fromString("0198f200-0000-7000-8000-000000009001"),
                 AgentService.DEMO_WORKSPACE_ID,
                 key,
-                digestService.sha256(body.getBytes(java.nio.charset.StandardCharsets.UTF_8)),
-                java.sql.Timestamp.from(Instant.now().plus(Duration.ofHours(1)))
+                semanticRequestDigest(body, "application/json", ""),
+                java.sql.Timestamp.from(Instant.now().minus(Duration.ofHours(1)))
         );
 
         HttpResponse<String> response = post(body, key);
@@ -123,6 +129,51 @@ class IdempotencyIntegrationTest {
                 "select count(*) from agents where agent_key = 'processing-agent'",
                 Integer.class
         )).isZero();
+    }
+
+    @Test
+    void concurrentDifferentKeysCompleteWithAConnectionPoolOfTwo() throws Exception {
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var first = executor.submit(() -> post(
+                    """
+                    {"agentKey":"pool-agent-one","name":"Pool One","purposeSummary":"test"}
+                    """,
+                    "pool-key-one"
+            ));
+            var second = executor.submit(() -> post(
+                    """
+                    {"agentKey":"pool-agent-two","name":"Pool Two","purposeSummary":"test"}
+                    """,
+                    "pool-key-two"
+            ));
+
+            List<Integer> statuses = List.of(
+                    first.get(10, TimeUnit.SECONDS).statusCode(),
+                    second.get(10, TimeUnit.SECONDS).statusCode()
+            );
+            assertThat(statuses).containsExactlyInAnyOrder(201, 201);
+        }
+    }
+
+    @Test
+    void sameKeyAndBodyWithDifferentContentTypeIsAConflict() throws Exception {
+        String body = """
+                {"agentKey":"content-type-agent","name":"Content Type","purposeSummary":"test"}
+                """;
+        String key = "content-type-key";
+        assertThat(post(body, key).statusCode()).isEqualTo(201);
+
+        HttpRequest request = HttpRequest.newBuilder(endpoint())
+                .header("Content-Type", "application/problem+json")
+                .header("Idempotency-Key", key)
+                .header("X-Actor-Id", "role-a-test")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build();
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        assertThat(response.statusCode()).isEqualTo(409);
+        assertThat(objectMapper.readTree(response.body()).path("code").asString())
+                .isEqualTo("IDEMPOTENCY_CONFLICT");
     }
 
     private HttpResponse<String> post(String body, String key) throws Exception {
@@ -137,5 +188,10 @@ class IdempotencyIntegrationTest {
 
     private URI endpoint() {
         return URI.create("http://127.0.0.1:" + port + "/api/v1/agents");
+    }
+
+    private String semanticRequestDigest(String body, String contentType, String ifMatch) {
+        String value = body + "\ncontent-type:" + contentType + "\nif-match:" + ifMatch;
+        return digestService.sha256(value.getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 }

@@ -10,6 +10,7 @@ import org.springframework.http.ProblemDetail;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.async.AsyncRequestTimeoutException;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
@@ -29,6 +30,11 @@ public class GlobalExceptionHandler {
                     .toList()
                 : List.of(exception.getMessage());
         return problem(ErrorCode.VALIDATION_ERROR, "Request validation failed", errors);
+    }
+
+    @ExceptionHandler(AsyncRequestTimeoutException.class)
+    void handleAsyncTimeout() {
+        // SSE timeout/closed client is a normal stream lifecycle event; the response may already be committed.
     }
 
     @ExceptionHandler(Exception.class)

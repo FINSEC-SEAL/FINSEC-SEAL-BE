@@ -45,7 +45,7 @@
       "description": "Read an allowed synthetic document",
       "inputSchema": {"type": "object", "additionalProperties": false},
       "outputSchema": {"type": "object"},
-      "trustLevel": "TRUSTED_INTERNAL",
+      "trustLevel": "MIXED",
       "riskLevel": "MEDIUM",
       "dataClassifications": ["PII", "NORMAL"],
       "sideEffectType": "NONE",
@@ -67,7 +67,7 @@
     {
       "name": "LOAN_POLICY_SEARCH",
       "version": "1.0.0",
-      "operation": "READ",
+      "operation": "SEARCH",
       "description": "Search trusted synthetic loan policy",
       "inputSchema": {"type": "object", "additionalProperties": false},
       "outputSchema": {"type": "object"},
@@ -80,7 +80,7 @@
     {
       "name": "REVIEW_NOTE_WRITE",
       "version": "1.0.0",
-      "operation": "WRITE",
+      "operation": "CREATE",
       "description": "Write a document completeness review note",
       "inputSchema": {"type": "object", "additionalProperties": false},
       "outputSchema": {"type": "object"},

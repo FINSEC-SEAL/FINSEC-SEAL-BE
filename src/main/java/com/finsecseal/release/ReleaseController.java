@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -28,9 +29,10 @@ public class ReleaseController {
     @PostMapping("/agents/{agentId}/releases")
     ResponseEntity<ApiResponse<ReleaseDto.Response>> create(
             @PathVariable UUID agentId,
-            @RequestBody JsonNode manifest
+            @RequestBody JsonNode manifest,
+            @RequestHeader(value = "X-Actor-Id", required = false) String actorId
     ) {
-        ReleaseDto.Response response = releaseService.create(agentId, manifest);
+        ReleaseDto.Response response = releaseService.create(agentId, manifest, actorId);
         return ResponseEntity.created(URI.create("/api/v1/releases/" + response.id()))
                 .body(ApiResponse.success(response, TraceIdFilter.currentTraceId()));
     }
@@ -46,33 +48,47 @@ public class ReleaseController {
     }
 
     @PostMapping("/releases/{releaseId}:validate")
-    ApiResponse<ReleaseDto.ValidationResponse> validate(@PathVariable UUID releaseId) {
-        return ApiResponse.success(releaseService.validate(releaseId), TraceIdFilter.currentTraceId());
+    ApiResponse<ReleaseDto.ValidationResponse> validate(
+            @PathVariable UUID releaseId,
+            @RequestHeader(value = "X-Actor-Id", required = false) String actorId
+    ) {
+        return ApiResponse.success(releaseService.validate(releaseId, actorId), TraceIdFilter.currentTraceId());
     }
 
     @PostMapping("/releases/{releaseId}:analyze")
-    ApiResponse<ReleaseDto.Response> analyze(@PathVariable UUID releaseId) {
-        return ApiResponse.success(releaseService.analyze(releaseId), TraceIdFilter.currentTraceId());
+    ApiResponse<ReleaseDto.Response> analyze(
+            @PathVariable UUID releaseId,
+            @RequestHeader(value = "X-Actor-Id", required = false) String actorId
+    ) {
+        return ApiResponse.success(releaseService.analyze(releaseId, actorId), TraceIdFilter.currentTraceId());
     }
 
     @GetMapping("/releases/{releaseId}/fingerprint")
-    ApiResponse<ReleaseDto.FingerprintResponse> fingerprint(@PathVariable UUID releaseId) {
-        return ApiResponse.success(releaseService.fingerprint(releaseId), TraceIdFilter.currentTraceId());
+    ApiResponse<ReleaseDto.FingerprintResponse> fingerprint(
+            @PathVariable UUID releaseId,
+            @RequestHeader(value = "X-Actor-Id", required = false) String actorId
+    ) {
+        return ApiResponse.success(releaseService.fingerprint(releaseId, actorId), TraceIdFilter.currentTraceId());
     }
 
     @GetMapping("/releases/{releaseId}/diff")
     ApiResponse<ReleaseDto.DiffResponse> diff(
             @PathVariable UUID releaseId,
-            @RequestParam("against") UUID against
+            @RequestParam("against") UUID against,
+            @RequestHeader(value = "X-Actor-Id", required = false) String actorId
     ) {
-        return ApiResponse.success(releaseService.diff(releaseId, against), TraceIdFilter.currentTraceId());
+        return ApiResponse.success(releaseService.diff(releaseId, against, actorId), TraceIdFilter.currentTraceId());
     }
 
     @PostMapping("/releases/{releaseId}:invalidate")
     ApiResponse<ReleaseDto.Response> invalidate(
             @PathVariable UUID releaseId,
-            @RequestBody(required = false) JsonNode reason
+            @RequestBody(required = false) JsonNode reason,
+            @RequestHeader(value = "X-Actor-Id", required = false) String actorId
     ) {
-        return ApiResponse.success(releaseService.invalidate(releaseId, reason), TraceIdFilter.currentTraceId());
+        return ApiResponse.success(
+                releaseService.invalidate(releaseId, reason, actorId),
+                TraceIdFilter.currentTraceId()
+        );
     }
 }

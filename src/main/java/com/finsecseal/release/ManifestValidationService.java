@@ -6,6 +6,7 @@ import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 import org.springframework.stereotype.Service;
@@ -18,25 +19,33 @@ public class ManifestValidationService {
     private static final Pattern IDENTIFIER = Pattern.compile("^[A-Z][A-Z0-9_]{1,99}$");
     private static final Pattern BUSINESS_KEY = Pattern.compile("^[a-z0-9][a-z0-9-]{2,79}$");
     private static final Pattern HOST_LABEL = Pattern.compile("^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$");
-    private static final Set<String> REQUIRED_TOOLS = Set.of(
-            "CASE_CONTEXT_READ",
-            "DOCUMENT_READER",
-            "CUSTOMER_DATA_READ",
-            "LOAN_POLICY_SEARCH",
-            "REVIEW_NOTE_WRITE"
+    private static final Map<String, ToolContract> NORMAL_TOOL_REGISTRY = Map.of(
+            "CASE_CONTEXT_READ", new ToolContract(
+                    "1.0.0", "READ", "TRUSTED_INTERNAL", "LOW", Set.of("NORMAL"),
+                    "NONE", "case_context_read"
+            ),
+            "DOCUMENT_READER", new ToolContract(
+                    "1.0.0", "READ", "MIXED", "MEDIUM", Set.of("NORMAL", "PII"),
+                    "NONE", "document_reader"
+            ),
+            "CUSTOMER_DATA_READ", new ToolContract(
+                    "1.0.0", "READ", "TRUSTED_INTERNAL", "HIGH",
+                    Set.of("NORMAL", "PII", "SENSITIVE_PII", "FINANCIAL", "CREDIT"),
+                    "NONE", "customer_data_read"
+            ),
+            "LOAN_POLICY_SEARCH", new ToolContract(
+                    "1.0.0", "SEARCH", "TRUSTED_INTERNAL", "LOW", Set.of("NORMAL"),
+                    "NONE", "loan_policy_search"
+            ),
+            "REVIEW_NOTE_WRITE", new ToolContract(
+                    "1.0.0", "CREATE", "TRUSTED_INTERNAL", "MEDIUM", Set.of("NORMAL"),
+                    "INTERNAL_WRITE", "review_note_write"
+            )
     );
     private static final Set<String> REQUIRED_RUNTIME_CONTEXT = Set.of(
             "caseId", "currentApplicantId", "workflowStage", "allowedDocumentIds"
     );
-    private static final Set<String> ALLOWED_ADAPTERS = Set.of(
-            "case_context_read",
-            "document_reader",
-            "customer_data_read",
-            "loan_policy_search",
-            "review_note_write",
-            "loan_decision_update",
-            "mock_exfil_collector"
-    );
+    private static final Set<String> CONFIGURED_PROVIDER_HOSTS = Set.of("configured-provider-host");
     private static final Set<String> TOP_LEVEL_FIELDS = Set.of(
             "schemaVersion", "agent", "release", "businessPurpose", "model", "systemPrompt", "tools",
             "ragSources", "networkRequirements", "businessWorkflow", "humanApprovalBoundaries",
@@ -97,7 +106,7 @@ public class ManifestValidationService {
         }
         requireText(manifest, "/businessPurpose/code", "LOAN_DOCUMENT_COMPLETENESS_REVIEW", issues);
         requireBoundedText(manifest, "/businessPurpose/description", 500, issues);
-        requireBoundedText(manifest, "/model/provider", 100, issues);
+        requireText(manifest, "/model/provider", "openai-compatible", issues);
         requireBoundedText(manifest, "/model/name", 200, issues);
         requireObject(manifest, "/model/parameters", issues);
         validateModelParameters(manifest.path("model").path("parameters"), issues);
@@ -110,7 +119,14 @@ public class ManifestValidationService {
                 prompt.replace("\r\n", "\n").replace('\r', '\n'),
                 Normalizer.Form.NFC
         );
-        if (declared != null && (!DIGEST.matcher(declared).matches()
+        JsonNode declaredNode = manifest.at("/systemPrompt/declaredSha256");
+        if (!declaredNode.isMissingNode() && !declaredNode.isNull() && !declaredNode.isString()) {
+            issues.add(error(
+                    "/systemPrompt/declaredSha256",
+                    "TYPE",
+                    "declaredSha256 must be a string when present"
+            ));
+        } else if (declared != null && (!DIGEST.matcher(declared).matches()
                 || !declared.equals(digestService.sha256(normalizedPrompt)))) {
             issues.add(error("/systemPrompt/declaredSha256", "DIGEST_MISMATCH", "Declared prompt digest does not match"));
         }
@@ -141,16 +157,24 @@ public class ManifestValidationService {
                     "allowedHosts must contain at least one configured provider host label"
             ));
         } else {
+            Set<String> actualHosts = new HashSet<>();
             for (int index = 0; index < allowedHosts.size(); index++) {
                 JsonNode host = allowedHosts.get(index);
                 if (!host.isString() || !HOST_LABEL.matcher(host.asString()).matches()
-                        || host.asString().contains("://")) {
+                        || host.asString().contains("://") || !actualHosts.add(host.asString())) {
                     issues.add(error(
                             "/networkRequirements/allowedHosts/" + index,
                             "HOST_LABEL_ONLY",
                             "allowedHosts accepts configured host labels, not URLs"
                     ));
                 }
+            }
+            if (!actualHosts.equals(CONFIGURED_PROVIDER_HOSTS)) {
+                issues.add(error(
+                        "/networkRequirements/allowedHosts",
+                        "PROVIDER_HOST_SCOPE",
+                        "allowedHosts must exactly match the configured provider host labels"
+                ));
             }
         }
         requireObject(manifest, "/businessWorkflow", issues);
@@ -238,10 +262,10 @@ public class ManifestValidationService {
                     issues,
                     prefix
             );
+            Set<String> classifications = new HashSet<>();
             if (!tool.path("dataClassifications").isArray() || tool.path("dataClassifications").isEmpty()) {
                 issues.add(error(prefix + "/dataClassifications", "TYPE", "dataClassifications must be an array"));
             } else {
-                Set<String> classifications = new HashSet<>();
                 for (int classificationIndex = 0;
                         classificationIndex < tool.path("dataClassifications").size();
                         classificationIndex++) {
@@ -259,14 +283,31 @@ public class ManifestValidationService {
                 }
             }
             String adapter = text(tool, "/adapterKey");
-            if (adapter == null || !ALLOWED_ADAPTERS.contains(adapter)) {
-                issues.add(error(prefix + "/adapterKey", "ADAPTER_ALLOWLIST", "adapterKey is not allowlisted"));
-            }
-            if ("EXTERNAL_HTTP".equals(name) && !"mock_exfil_collector".equals(adapter)) {
-                issues.add(error(prefix + "/adapterKey", "MOCK_ONLY", "EXTERNAL_HTTP must use the mock collector"));
+            ToolContract contract = NORMAL_TOOL_REGISTRY.get(name);
+            if (contract == null) {
+                issues.add(error(
+                        prefix + "/name",
+                        "NORMAL_TOOL_SCOPE",
+                        "Only the server-registered normal Release tools may be declared"
+                ));
+            } else if (!contract.matches(
+                    toolVersion,
+                    text(tool, "/operation"),
+                    text(tool, "/trustLevel"),
+                    text(tool, "/riskLevel"),
+                    classifications,
+                    text(tool, "/sideEffectType"),
+                    adapter
+            )) {
+                issues.add(error(
+                        prefix,
+                        "TOOL_CONTRACT_MISMATCH",
+                        "Tool version/operation/trust/risk/classification/side-effect/adapter must match "
+                                + "the server registry"
+                ));
             }
         }
-        Set<String> missing = new HashSet<>(REQUIRED_TOOLS);
+        Set<String> missing = new HashSet<>(NORMAL_TOOL_REGISTRY.keySet());
         missing.removeAll(names);
         if (!missing.isEmpty()) {
             issues.add(error("/tools", "REQUIRED_TOOL", "Required tools are missing: " + missing));
@@ -278,6 +319,13 @@ public class ManifestValidationService {
             issues.add(error("/humanApprovalBoundaries", "TYPE", "Human approval boundaries must be an array"));
             return;
         }
+        if (boundaries.size() != 1) {
+            issues.add(error(
+                    "/humanApprovalBoundaries",
+                    "P0_BOUNDARY_SCOPE",
+                    "P0 requires exactly one LoanDecision human-only boundary"
+            ));
+        }
         boolean loanDecisionBoundary = false;
         for (JsonNode boundary : boundaries) {
             if (!boundary.isObject()) {
@@ -287,17 +335,22 @@ public class ManifestValidationService {
             rejectUnknown(boundary, "/humanApprovalBoundaries", Set.of("resource", "operations", "mode"), issues);
             Set<String> operations = new HashSet<>();
             if (boundary.path("operations").isArray()) {
-                boundary.path("operations").forEach(operation -> {
-                    if (operation.isString()) {
-                        operations.add(operation.asString());
+                for (int index = 0; index < boundary.path("operations").size(); index++) {
+                    JsonNode operation = boundary.path("operations").get(index);
+                    if (!operation.isString() || !operations.add(operation.asString())) {
+                        issues.add(error(
+                                "/humanApprovalBoundaries/operations/" + index,
+                                "UNIQUE_TEXT",
+                                "Boundary operations must be unique strings"
+                        ));
                     }
-                });
+                }
             } else {
                 issues.add(error("/humanApprovalBoundaries/operations", "TYPE", "operations must be an array"));
             }
             if ("LoanDecision".equals(boundary.path("resource").asString(""))
                     && "HUMAN_ONLY".equals(boundary.path("mode").asString(""))
-                    && operations.containsAll(Set.of("APPROVED", "REJECTED"))) {
+                    && operations.equals(Set.of("APPROVED", "REJECTED"))) {
                 loanDecisionBoundary = true;
             }
         }
@@ -497,5 +550,33 @@ public class ManifestValidationService {
     }
 
     public record ValidationResult(boolean valid, List<Issue> issues) {
+    }
+
+    private record ToolContract(
+            String version,
+            String operation,
+            String trustLevel,
+            String riskLevel,
+            Set<String> dataClassifications,
+            String sideEffectType,
+            String adapterKey
+    ) {
+        private boolean matches(
+                String actualVersion,
+                String actualOperation,
+                String actualTrustLevel,
+                String actualRiskLevel,
+                Set<String> actualClassifications,
+                String actualSideEffectType,
+                String actualAdapter
+        ) {
+            return version.equals(actualVersion)
+                    && operation.equals(actualOperation)
+                    && trustLevel.equals(actualTrustLevel)
+                    && riskLevel.equals(actualRiskLevel)
+                    && dataClassifications.equals(actualClassifications)
+                    && sideEffectType.equals(actualSideEffectType)
+                    && adapterKey.equals(actualAdapter);
+        }
     }
 }

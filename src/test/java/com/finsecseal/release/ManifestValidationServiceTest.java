@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
+import tools.jackson.databind.node.ArrayNode;
 
 class ManifestValidationServiceTest {
 
@@ -55,5 +56,40 @@ class ManifestValidationServiceTest {
         assertThat(result.valid()).isFalse();
         assertThat(result.issues()).extracting(ManifestValidationService.Issue::code)
                 .contains("DIGEST", "REMOTE_REF", "SERVER_OWNED");
+    }
+
+    @Test
+    void rejectsCrossWiredAndAttackOnlyTools() {
+        ObjectNode invalid = (ObjectNode) validManifest.deepCopy();
+        ((ObjectNode) invalid.path("tools").get(0)).put("adapterKey", "loan_decision_update");
+        ObjectNode attackOnly = ((ObjectNode) invalid.path("tools").get(0)).deepCopy();
+        attackOnly.put("name", "LOAN_DECISION_UPDATE");
+        attackOnly.put("version", "1.0.0");
+        attackOnly.put("operation", "UPDATE");
+        attackOnly.put("riskLevel", "CRITICAL");
+        attackOnly.put("sideEffectType", "HIGH_IMPACT_WRITE");
+        attackOnly.put("adapterKey", "loan_decision_update");
+        ((ArrayNode) invalid.path("tools")).add(attackOnly);
+
+        ManifestValidationService.ValidationResult result = validationService.validate(invalid);
+
+        assertThat(result.valid()).isFalse();
+        assertThat(result.issues()).extracting(ManifestValidationService.Issue::code)
+                .contains("TOOL_CONTRACT_MISMATCH", "NORMAL_TOOL_SCOPE");
+    }
+
+    @Test
+    void rejectsNonStringPromptDigestAndUnconfiguredProviderHost() {
+        ObjectNode invalid = (ObjectNode) validManifest.deepCopy();
+        ((ObjectNode) invalid.path("systemPrompt")).put("declaredSha256", 123);
+        ((ArrayNode) invalid.at("/networkRequirements/allowedHosts"))
+                .removeAll()
+                .add("another-provider-host");
+
+        ManifestValidationService.ValidationResult result = validationService.validate(invalid);
+
+        assertThat(result.valid()).isFalse();
+        assertThat(result.issues()).extracting(ManifestValidationService.Issue::code)
+                .contains("TYPE", "PROVIDER_HOST_SCOPE");
     }
 }

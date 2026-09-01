@@ -39,7 +39,7 @@ class MigrationIntegrationTest {
     void appliesAllMigrationsToRealPostgres() {
         Integer appliedMigrations = jdbcTemplate.queryForObject(
                 "select count(*) from flyway_schema_history "
-                        + "where success and version in ('1', '2', '3', '4')",
+                        + "where success and version in ('1', '2', '3', '4', '5', '6')",
                 Integer.class
         );
         Integer platformTables = jdbcTemplate.queryForObject(
@@ -54,7 +54,7 @@ class MigrationIntegrationTest {
                 String.class
         );
 
-        assertThat(appliedMigrations).isEqualTo(4);
+        assertThat(appliedMigrations).isEqualTo(6);
         assertThat(platformTables).isEqualTo(6);
         assertThat(workspace).isEqualTo("FINSEC SEAL Demo");
     }
@@ -293,11 +293,16 @@ class MigrationIntegrationTest {
         );
         insertCaseRun("0198f200-0000-7000-8000-000000000079",
                 "0198f200-0000-7000-8000-000000000057", 0, "CANCELLED", hashA, true);
+        appendTerminalEvent("0198f200-0000-7000-8000-000000000057", "CANCELLED");
         assertSqlState("55000", () -> jdbcTemplate.update("""
                 update test_runs
                    set total_cases = 1, status = 'CANCELLED', completed_cases = 1, completed_at = now()
                  where id = '0198f200-0000-7000-8000-000000000057'
                 """));
+        assertThat(jdbcTemplate.update("""
+                update test_runs set status = 'CANCELLING', cancel_requested_at = now()
+                 where id = '0198f200-0000-7000-8000-000000000057'
+                """)).isEqualTo(1);
         assertThat(jdbcTemplate.update("""
                 update test_runs
                    set status = 'CANCELLED', completed_cases = 1, completed_at = now()
@@ -317,6 +322,7 @@ class MigrationIntegrationTest {
         );
         insertCaseRun("0198f200-0000-7000-8000-000000000128",
                 "0198f200-0000-7000-8000-000000000058", 0, "ERROR", hashA, true);
+        appendTerminalEvent("0198f200-0000-7000-8000-000000000058", "FAILED");
         assertSqlState("23514", () -> jdbcTemplate.update("""
                 update test_runs
                    set status = 'FAILED', completed_cases = 1, operational_error_count = 0,
@@ -475,6 +481,7 @@ class MigrationIntegrationTest {
                    set status = 'FAILED_SECURITY', completed_at = now()
                  where id = '0198f200-0000-7000-8000-000000000071'
                 """);
+        appendTerminalEvent("0198f200-0000-7000-8000-000000000051", "COMPLETED");
         assertThat(jdbcTemplate.update("""
                 update test_runs
                    set status = 'COMPLETED', completed_cases = 1, completed_at = now()
@@ -875,11 +882,61 @@ class MigrationIntegrationTest {
     }
 
     private void completeRun(String runId, String status, int completedCases) {
+        appendTerminalEvent(runId, status);
         jdbcTemplate.update("""
                 update test_runs
                    set status = ?, completed_cases = ?, completed_at = now()
                  where id = ?::uuid
                 """, status, completedCases, runId);
+    }
+
+    private void appendTerminalEvent(String runId, String terminalStatus) {
+        String eventType = switch (terminalStatus) {
+            case "COMPLETED" -> "RUN_COMPLETED";
+            case "FAILED" -> "RUN_FAILED";
+            case "CANCELLED" -> "RUN_CANCEL_REQUESTED";
+            default -> throw new IllegalArgumentException("Unsupported terminal status " + terminalStatus);
+        };
+        EventHead head = jdbcTemplate.queryForObject("""
+                select coalesce(max(sequence), 0) as sequence,
+                       (array_agg(event_hash order by sequence desc))[1] as event_hash
+                  from execution_events
+                 where run_id = ?::uuid
+                """, (resultSet, rowNumber) -> new EventHead(
+                        resultSet.getLong("sequence"),
+                        resultSet.getString("event_hash")
+                ), runId);
+        if (head.sequence() == 0) {
+            String startedHash = "sha256:" + String.format("%064x", 1001);
+            jdbcTemplate.update("""
+                    insert into execution_events
+                        (id, workspace_id, run_id, trace_id, sequence, occurred_at, event_type,
+                         payload_digest, metadata_json, event_hash)
+                    values (?, '0198f1e2-0000-7000-8000-000000000001', ?::uuid, ?, 1, now(),
+                            'RUN_STARTED',
+                            'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                            '{}'::jsonb, ?)
+                    """, UUID.randomUUID(), runId, UUID.randomUUID(), startedHash);
+            head = new EventHead(1, startedHash);
+        }
+        long nextSequence = head.sequence() + 1;
+        String nextHash = "sha256:" + String.format("%064x", nextSequence + 1000);
+        jdbcTemplate.update("""
+                insert into execution_events
+                    (id, workspace_id, run_id, trace_id, sequence, occurred_at, event_type,
+                     payload_digest, metadata_json, prev_event_hash, event_hash)
+                values (?, '0198f1e2-0000-7000-8000-000000000001', ?::uuid, ?, ?, now(), ?,
+                        'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                        '{}'::jsonb, ?, ?)
+                """,
+                UUID.randomUUID(),
+                runId,
+                UUID.randomUUID(),
+                nextSequence,
+                eventType,
+                head.hash(),
+                nextHash
+        );
     }
 
     private void insertCompletedReplayRun(
@@ -1092,7 +1149,8 @@ class MigrationIntegrationTest {
                     2,
                     payloadHash,
                     currentHead,
-                    nextHead
+                    nextHead,
+                    "RUN_FAILED"
             );
             Future<String> terminalUpdate = executor.submit(() -> {
                 terminalUpdateStarted.countDown();
@@ -1356,6 +1414,23 @@ class MigrationIntegrationTest {
             String previousHash,
             String eventHash
     ) throws SQLException {
+        insertEventForRun(
+                connection, eventId, runId, caseRunId, sequence,
+                payloadDigest, previousHash, eventHash, "MODEL_RESPONSE"
+        );
+    }
+
+    private void insertEventForRun(
+            Connection connection,
+            String eventId,
+            String runId,
+            String caseRunId,
+            long sequence,
+            String payloadDigest,
+            String previousHash,
+            String eventHash,
+            String eventType
+    ) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement("""
                 insert into execution_events
                     (id, workspace_id, run_id, test_case_run_id, trace_id, sequence, occurred_at,
@@ -1364,15 +1439,16 @@ class MigrationIntegrationTest {
                     (?::uuid, '0198f1e2-0000-7000-8000-000000000001',
                      ?::uuid, ?::uuid,
                      '0198f200-0000-7000-8000-000000000091', ?, now(),
-                     'MODEL_RESPONSE', ?, '{}'::jsonb, ?, ?)
+                     ?, ?, '{}'::jsonb, ?, ?)
                 """)) {
             statement.setString(1, eventId);
             statement.setString(2, runId);
             statement.setString(3, caseRunId);
             statement.setLong(4, sequence);
-            statement.setString(5, payloadDigest);
-            statement.setString(6, previousHash);
-            statement.setString(7, eventHash);
+            statement.setString(5, eventType);
+            statement.setString(6, payloadDigest);
+            statement.setString(7, previousHash);
+            statement.setString(8, eventHash);
             statement.executeUpdate();
         }
     }
@@ -1468,5 +1544,8 @@ class MigrationIntegrationTest {
             current = current.getCause();
         }
         return null;
+    }
+
+    private record EventHead(long sequence, String hash) {
     }
 }

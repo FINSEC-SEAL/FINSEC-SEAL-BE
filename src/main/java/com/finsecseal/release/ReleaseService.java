@@ -2,6 +2,7 @@ package com.finsecseal.release;
 
 import com.finsecseal.agent.AgentEntity;
 import com.finsecseal.agent.AgentService;
+import com.finsecseal.audit.AuditService;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.ArtifactType;
@@ -47,6 +48,8 @@ public class ReleaseService {
     private final ObjectMapper objectMapper;
     private final ReleaseCatalogWriter catalogWriter;
     private final DecisionInvalidationWriter invalidationWriter;
+    private final AuditService auditService;
+    private final ReleaseIntegrityVerifier integrityVerifier;
 
     public ReleaseService(
             AgentService agentService,
@@ -58,7 +61,9 @@ public class ReleaseService {
             DigestService digestService,
             ObjectMapper objectMapper,
             ReleaseCatalogWriter catalogWriter,
-            DecisionInvalidationWriter invalidationWriter
+            DecisionInvalidationWriter invalidationWriter,
+            AuditService auditService,
+            ReleaseIntegrityVerifier integrityVerifier
     ) {
         this.agentService = agentService;
         this.releaseRepository = releaseRepository;
@@ -70,11 +75,18 @@ public class ReleaseService {
         this.objectMapper = objectMapper;
         this.catalogWriter = catalogWriter;
         this.invalidationWriter = invalidationWriter;
+        this.auditService = auditService;
+        this.integrityVerifier = integrityVerifier;
     }
 
     @Transactional
     public ReleaseDto.Response create(UUID agentId, JsonNode requestManifest) {
-        AgentEntity agent = agentService.getRequired(agentId);
+        return create(agentId, requestManifest, "demo-user");
+    }
+
+    @Transactional
+    public ReleaseDto.Response create(UUID agentId, JsonNode requestManifest, String actorId) {
+        AgentEntity agent = agentService.getRequiredForUpdate(agentId);
         agentService.requireActive(agent);
         JsonNode manifest = requireManifest(requestManifest);
         ManifestValidationService.ValidationResult validation = validationService.validate(manifest);
@@ -99,6 +111,11 @@ public class ReleaseService {
             artifactRepository.saveAll(buildArtifacts(release.getId(), fingerprint.normalizedManifest()));
             artifactRepository.flush();
             catalogWriter.write(agent.getWorkspaceId(), release.getId(), fingerprint.normalizedManifest());
+            ObjectNode auditMetadata = releaseStateDocument(release);
+            auditService.append(
+                    agent.getWorkspaceId(), normalizeActor(actorId), "AGENT_RELEASE_CREATED",
+                    "AGENT_RELEASE", release.getId(), null, release.getReleaseFingerprint(), auditMetadata
+            );
         } catch (DataIntegrityViolationException exception) {
             throw new BusinessException(ErrorCode.RESOURCE_CONFLICT, "Release version or fingerprint already exists");
         }
@@ -116,18 +133,33 @@ public class ReleaseService {
                 .toList();
     }
 
+    @Transactional
     public ReleaseDto.ValidationResponse validate(UUID releaseId) {
+        return validate(releaseId, "system:release-integrity");
+    }
+
+    @Transactional
+    public ReleaseDto.ValidationResponse validate(UUID releaseId, String actorId) {
         AgentReleaseEntity release = getRequired(releaseId);
         if (release.getLifecycleState() != ReleaseLifecycleState.DRAFT) {
             throw new BusinessException(ErrorCode.INVALID_STATE_TRANSITION, "Only DRAFT Release can be validated");
         }
-        JsonNode manifest = loadFullManifest(release);
+        JsonNode manifest = loadFullManifest(release, actorId, "MANIFEST_VALIDATION");
         ManifestValidationService.ValidationResult result = validationService.validate(manifest);
+        if (result.valid()) {
+            AgentEntity agent = agentService.getRequired(release.getAgentId());
+            integrityVerifier.verify(agent.getWorkspaceId(), release.getId(), manifest);
+        }
         return new ReleaseDto.ValidationResponse(result.valid(), result.issues());
     }
 
     @Transactional
     public ReleaseDto.Response analyze(UUID releaseId) {
+        return analyze(releaseId, "system:release-integrity");
+    }
+
+    @Transactional
+    public ReleaseDto.Response analyze(UUID releaseId, String actorId) {
         AgentReleaseEntity release = getRequiredForUpdate(releaseId);
         if (release.getLifecycleState() == ReleaseLifecycleState.ANALYZED) {
             return ReleaseDto.Response.from(release);
@@ -135,21 +167,38 @@ public class ReleaseService {
         if (release.getLifecycleState() != ReleaseLifecycleState.DRAFT) {
             throw new BusinessException(ErrorCode.INVALID_STATE_TRANSITION, "Only DRAFT Release can be analyzed");
         }
-        JsonNode manifest = loadFullManifest(release);
+        String beforeDigest = release.getReleaseFingerprint();
+        JsonNode manifest = loadFullManifest(release, actorId, "RELEASE_ANALYSIS");
         requireValid(validationService.validate(manifest));
+        AgentEntity agent = agentService.getRequired(release.getAgentId());
+        integrityVerifier.verify(agent.getWorkspaceId(), release.getId(), manifest);
         FingerprintService.Result recomputed = fingerprintService.fingerprint(manifest, release.getSafetyContractHash());
         if (!recomputed.agentArtifactFingerprint().equals(release.getAgentArtifactFingerprint())
                 || !recomputed.releaseFingerprint().equals(release.getReleaseFingerprint())) {
             throw new BusinessException(ErrorCode.RELEASE_CHANGED, "Stored Release artifacts do not match fingerprints");
         }
         release.transitionTo(ReleaseLifecycleState.ANALYZED);
+        auditService.append(
+                agent.getWorkspaceId(), normalizeActor(actorId), "AGENT_RELEASE_ANALYZED",
+                "AGENT_RELEASE", release.getId(), beforeDigest, release.getReleaseFingerprint(),
+                releaseStateDocument(release)
+        );
         return ReleaseDto.Response.from(release);
     }
 
+    @Transactional
     public ReleaseDto.FingerprintResponse fingerprint(UUID releaseId) {
+        return fingerprint(releaseId, "system:release-integrity");
+    }
+
+    @Transactional
+    public ReleaseDto.FingerprintResponse fingerprint(UUID releaseId, String actorId) {
         AgentReleaseEntity release = getRequired(releaseId);
+        JsonNode manifest = loadFullManifest(release, actorId, "FINGERPRINT_INTEGRITY_CHECK");
+        AgentEntity agent = agentService.getRequired(release.getAgentId());
+        integrityVerifier.verify(agent.getWorkspaceId(), release.getId(), manifest);
         FingerprintService.Result result = fingerprintService.fingerprint(
-                loadFullManifest(release),
+                manifest,
                 release.getSafetyContractHash()
         );
         if (!result.agentArtifactFingerprint().equals(release.getAgentArtifactFingerprint())
@@ -165,17 +214,23 @@ public class ReleaseService {
         );
     }
 
+    @Transactional
     public ReleaseDto.DiffResponse diff(UUID releaseId, UUID againstId) {
+        return diff(releaseId, againstId, "system:release-integrity");
+    }
+
+    @Transactional
+    public ReleaseDto.DiffResponse diff(UUID releaseId, UUID againstId, String actorId) {
         AgentReleaseEntity release = getRequired(releaseId);
         AgentReleaseEntity against = getRequired(againstId);
         if (!release.getAgentId().equals(against.getAgentId())) {
             throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Release diff requires the same Agent");
         }
         Map<String, String> current = fingerprintService.fingerprint(
-                loadFullManifest(release), release.getSafetyContractHash()
+                verifiedManifest(release, actorId, "RELEASE_DIFF"), release.getSafetyContractHash()
         ).componentDigests();
         Map<String, String> previous = fingerprintService.fingerprint(
-                loadFullManifest(against), against.getSafetyContractHash()
+                verifiedManifest(against, actorId, "RELEASE_DIFF"), against.getSafetyContractHash()
         ).componentDigests();
         Set<String> keys = new LinkedHashSet<>(previous.keySet());
         keys.addAll(current.keySet());
@@ -202,18 +257,32 @@ public class ReleaseService {
 
     @Transactional
     public ReleaseDto.Response invalidate(UUID releaseId, JsonNode reason) {
+        return invalidate(releaseId, reason, "demo-user");
+    }
+
+    @Transactional
+    public ReleaseDto.Response invalidate(UUID releaseId, JsonNode reason, String actorId) {
         AgentReleaseEntity release = getRequiredForUpdate(releaseId);
         ObjectNode reasonDocument = objectMapper.createObjectNode();
         reasonDocument.put("schemaVersion", "1.0");
         reasonDocument.set("reason", reason == null ? objectMapper.nullNode() : reason);
-        invalidationWriter.invalidateLatest(releaseId, reasonDocument, "demo-user");
+        invalidationWriter.invalidateLatest(releaseId, reasonDocument, normalizeActor(actorId));
+        ReleaseLifecycleState beforeState = release.getLifecycleState();
         release.invalidate(reasonDocument);
+        AgentEntity agent = agentService.getRequired(release.getAgentId());
+        ObjectNode metadata = releaseStateDocument(release);
+        metadata.put("fromState", beforeState.name());
+        auditService.append(
+                agent.getWorkspaceId(), normalizeActor(actorId), "AGENT_RELEASE_INVALIDATED",
+                "AGENT_RELEASE", releaseId, release.getReleaseFingerprint(), release.getReleaseFingerprint(), metadata
+        );
         return ReleaseDto.Response.from(release);
     }
 
     @Transactional
     public ReleaseDto.Response applySafetyContractHash(UUID releaseId, String contractHash, JsonNode reason) {
         AgentReleaseEntity release = getRequiredForUpdate(releaseId);
+        String previousFingerprint = release.getReleaseFingerprint();
         String finalFingerprint = fingerprintService.releaseFingerprint(
                 release.getAgentArtifactFingerprint(),
                 contractHash
@@ -226,6 +295,12 @@ public class ReleaseService {
             invalidationWriter.invalidateLatest(releaseId, reasonDocument, "system:contract-approval");
         }
         release.applySafetyContract(contractHash, finalFingerprint, reason);
+        AgentEntity agent = agentService.getRequired(release.getAgentId());
+        auditService.append(
+                agent.getWorkspaceId(), "system:contract-approval", "RELEASE_CONTRACT_FINGERPRINT_APPLIED",
+                "AGENT_RELEASE", releaseId, previousFingerprint, finalFingerprint,
+                releaseStateDocument(release)
+        );
         return ReleaseDto.Response.from(release);
     }
 
@@ -265,15 +340,64 @@ public class ReleaseService {
         return copy;
     }
 
-    private JsonNode loadFullManifest(AgentReleaseEntity release) {
-        ObjectNode manifest = (ObjectNode) release.getManifestJson();
+    private JsonNode loadFullManifest(AgentReleaseEntity release, String actorId, String purpose) {
+        ObjectNode manifest = (ObjectNode) release.getManifestJson().deepCopy();
         ReleaseArtifactEntity promptArtifact = artifactRepository
                 .findByReleaseIdAndArtifactTypeAndName(release.getId(), ArtifactType.SYSTEM_PROMPT, "system-prompt")
                 .orElseThrow(() -> new BusinessException(ErrorCode.RELEASE_CHANGED, "System prompt artifact is missing"));
         ObjectNode prompt = (ObjectNode) manifest.path("systemPrompt");
         prompt.put("text", encryptionService.decrypt(promptArtifact.getEncryptedText()));
         prompt.remove("storedSha256");
+        AgentEntity agent = agentService.getRequired(release.getAgentId());
+        ObjectNode auditMetadata = objectMapper.createObjectNode();
+        auditMetadata.put("schemaVersion", "1.0");
+        auditMetadata.put("purpose", purpose);
+        auditMetadata.put("artifactType", ArtifactType.SYSTEM_PROMPT.name());
+        auditMetadata.put("plaintextReturned", false);
+        auditService.append(
+                agent.getWorkspaceId(),
+                normalizeActor(actorId),
+                "SYSTEM_PROMPT_DECRYPTED_INTERNAL",
+                "AGENT_RELEASE",
+                release.getId(),
+                null,
+                promptArtifact.getSha256(),
+                auditMetadata
+        );
         return manifest;
+    }
+
+    private JsonNode verifiedManifest(AgentReleaseEntity release, String actorId, String purpose) {
+        JsonNode manifest = loadFullManifest(release, actorId, purpose);
+        AgentEntity agent = agentService.getRequired(release.getAgentId());
+        integrityVerifier.verify(agent.getWorkspaceId(), release.getId(), manifest);
+        return manifest;
+    }
+
+    private String normalizeActor(String actorId) {
+        if (actorId == null || actorId.isBlank()) {
+            return "system:release-integrity";
+        }
+        if (actorId.length() > 120) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "X-Actor-Id exceeds 120 characters");
+        }
+        return actorId;
+    }
+
+    private ObjectNode releaseStateDocument(AgentReleaseEntity release) {
+        ObjectNode state = objectMapper.createObjectNode();
+        state.put("schemaVersion", "1.0");
+        state.put("version", release.getVersion());
+        state.put("lifecycleState", release.getLifecycleState().name());
+        state.put("effectiveStatus", release.getEffectiveStatus().name());
+        state.put("agentArtifactFingerprint", release.getAgentArtifactFingerprint());
+        state.put("releaseFingerprint", release.getReleaseFingerprint());
+        if (release.getSafetyContractHash() == null) {
+            state.putNull("safetyContractHash");
+        } else {
+            state.put("safetyContractHash", release.getSafetyContractHash());
+        }
+        return state;
     }
 
     private List<ReleaseArtifactEntity> buildArtifacts(UUID releaseId, JsonNode manifest) {
