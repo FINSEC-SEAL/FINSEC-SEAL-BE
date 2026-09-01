@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -73,6 +74,34 @@ class MigrationIntegrationTest {
                    set agent_artifact_fingerprint = ?, release_fingerprint = ?
                  where id = '0198f200-0000-7000-8000-000000000013'
                 """, hashF, hashF)).isEqualTo(1);
+        assertConcurrentSuiteMutationRejected(hashF, hashA, hashB);
+
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                insert into test_runs
+                    (id, release_id, suite_id, mode, status, baseline_pair_group_id,
+                     agent_artifact_fingerprint, release_fingerprint, config_json, fixture_version,
+                     fixture_digest, model_config_hash, random_seed, total_cases, completed_cases,
+                     completed_at)
+                values
+                    ('0198f200-0000-7000-8000-000000000122',
+                     '0198f200-0000-7000-8000-000000000013',
+                     '0198f200-0000-7000-8000-000000000041', 'BASELINE', 'COMPLETED',
+                     '0198f200-0000-7000-8000-000000000205', ?, ?, '{}'::jsonb, 'v1', ?, ?,
+                     42, 0, 0, now())
+                """, hashF, hashF, hashA, hashA));
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                update test_runs
+                   set status = 'COMPLETED', completed_cases = 1, completed_at = now()
+                 where id = '0198f200-0000-7000-8000-000000000051'
+                """));
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                insert into test_case_runs
+                    (id, test_run_id, test_case_id, trial_index, status, variant_hash, completed_at)
+                values
+                    ('0198f200-0000-7000-8000-000000000123',
+                     '0198f200-0000-7000-8000-000000000053',
+                     '0198f200-0000-7000-8000-000000000061', 1, 'CANCELLED', ?, null)
+                """, hashA));
 
         assertSqlState("55000", () -> jdbcTemplate.update("""
                 insert into release_artifacts
@@ -235,6 +264,40 @@ class MigrationIntegrationTest {
                      '0198f200-0000-7000-8000-000000000092', 1, now(),
                      'RUN_STARTED', ?, '{}'::jsonb, ?)
                 """, hashA, hashC);
+        jdbcTemplate.update("""
+                update test_case_runs
+                   set status = 'FAILED_SECURITY', completed_at = now()
+                 where id = '0198f200-0000-7000-8000-000000000073'
+                """);
+        assertEventCommitPrecedesTerminalTransition(hashA, hashC, hashD);
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                insert into test_case_runs
+                    (id, test_run_id, test_case_id, trial_index, status, variant_hash,
+                     created_at, updated_at)
+                values
+                    ('0198f200-0000-7000-8000-000000000125',
+                     '0198f200-0000-7000-8000-000000000053',
+                     '0198f200-0000-7000-8000-000000000061', 1, 'PENDING', ?, now(), now())
+                """, hashA));
+
+        insertActiveRun(
+                "0198f200-0000-7000-8000-000000000057",
+                "0198f200-0000-7000-8000-000000000012",
+                "BASELINE",
+                null,
+                "0198f200-0000-7000-8000-000000000204",
+                hashC,
+                hashC,
+                42,
+                2
+        );
+        insertCaseRun("0198f200-0000-7000-8000-000000000079",
+                "0198f200-0000-7000-8000-000000000057", 0, "CANCELLED", hashA, true);
+        assertThat(jdbcTemplate.update("""
+                update test_runs
+                   set status = 'CANCELLED', completed_cases = 1, completed_at = now()
+                 where id = '0198f200-0000-7000-8000-000000000057'
+                """)).isEqualTo(1);
         assertSqlState("23514", () -> jdbcTemplate.update("""
                 insert into evidence_references
                     (id, workspace_id, owner_type, owner_id, evidence_type, source_event_id,
@@ -408,8 +471,11 @@ class MigrationIntegrationTest {
                  where id = '0198f200-0000-7000-8000-000000000096'
                 """));
 
+        assertConcurrentApprovalFreezesProposal(hashA);
+
         verifyApprovedPatchScope(hashA, hashC, hashD);
 
+        assertDecisionInsertSerializesReleaseMutation(hashE);
         verifyLatestDecisionInvalidationAtCommit(hashA, hashB, hashD);
 
         assertSqlState("55000", () -> jdbcTemplate.update("""
@@ -519,8 +585,11 @@ class MigrationIntegrationTest {
                      '{}'::jsonb, ?, 'BUILDING', now(), now()),
                     ('0198f200-0000-7000-8000-000000000042',
                      '0198f1e2-0000-7000-8000-000000000001', 'other-suite', '1.0.0', 'v1',
+                     '{}'::jsonb, ?, 'BUILDING', now(), now()),
+                    ('0198f200-0000-7000-8000-000000000043',
+                     '0198f1e2-0000-7000-8000-000000000001', 'race-suite', '1.0.0', 'v1',
                      '{}'::jsonb, ?, 'BUILDING', now(), now())
-                """, hashA, hashA);
+                """, hashA, hashA, hashA);
         jdbcTemplate.update("""
                 insert into test_cases
                     (id, suite_id, case_key, case_type, partition_name, category, severity, delivery_channel,
@@ -546,30 +615,50 @@ class MigrationIntegrationTest {
                               '0198f200-0000-7000-8000-000000000042')
                 """);
         jdbcTemplate.update("""
-                insert into test_runs
-                    (id, release_id, suite_id, mode, status, baseline_pair_group_id,
-                     agent_artifact_fingerprint,
-                     release_fingerprint, config_json, fixture_version, fixture_digest,
-                     model_config_hash, random_seed, total_cases, completed_cases, completed_at,
-                     created_at, updated_at)
-                values
-                    ('0198f200-0000-7000-8000-000000000051',
-                     '0198f200-0000-7000-8000-000000000011',
-                     '0198f200-0000-7000-8000-000000000041', 'BASELINE', 'RUNNING',
-                     '0198f200-0000-7000-8000-000000000201', ?, ?, '{}'::jsonb,
-                     'v1', ?, ?, 42, 1, 0, null, now(), now()),
-                    ('0198f200-0000-7000-8000-000000000052',
-                     '0198f200-0000-7000-8000-000000000011',
-                     '0198f200-0000-7000-8000-000000000041', 'BASELINE', 'COMPLETED',
-                     '0198f200-0000-7000-8000-000000000202', ?, ?, '{}'::jsonb,
-                     'v1', ?, ?, 42, 1, 1, now(), now(), now()),
-                    ('0198f200-0000-7000-8000-000000000053',
-                     '0198f200-0000-7000-8000-000000000012',
-                     '0198f200-0000-7000-8000-000000000041', 'BASELINE', 'RUNNING',
-                     '0198f200-0000-7000-8000-000000000203', ?, ?, '{}'::jsonb,
-                     'v1', ?, ?, 42, 1, 0, null, now(), now())
-                """, hashA, hashA, hashA, hashA, hashA, hashA, hashA, hashA,
-                       hashC, hashC, hashA, hashA);
+                update test_suites set status = 'READY'
+                 where id = '0198f200-0000-7000-8000-000000000043'
+                """);
+        insertActiveRun(
+                "0198f200-0000-7000-8000-000000000052",
+                "0198f200-0000-7000-8000-000000000011",
+                "BASELINE",
+                null,
+                "0198f200-0000-7000-8000-000000000202",
+                hashA,
+                hashA,
+                42,
+                1
+        );
+        insertCaseRun("0198f200-0000-7000-8000-000000000072",
+                "0198f200-0000-7000-8000-000000000052", 0, "PASSED", hashA, true);
+        completeRun("0198f200-0000-7000-8000-000000000052", "COMPLETED", 1);
+
+        insertActiveRun(
+                "0198f200-0000-7000-8000-000000000051",
+                "0198f200-0000-7000-8000-000000000011",
+                "BASELINE",
+                null,
+                "0198f200-0000-7000-8000-000000000201",
+                hashA,
+                hashA,
+                42,
+                1
+        );
+        insertActiveRun(
+                "0198f200-0000-7000-8000-000000000053",
+                "0198f200-0000-7000-8000-000000000012",
+                "BASELINE",
+                null,
+                "0198f200-0000-7000-8000-000000000203",
+                hashC,
+                hashC,
+                42,
+                1
+        );
+        insertCaseRun("0198f200-0000-7000-8000-000000000071",
+                "0198f200-0000-7000-8000-000000000051", 0, "EXECUTING", hashA, false);
+        insertCaseRun("0198f200-0000-7000-8000-000000000073",
+                "0198f200-0000-7000-8000-000000000053", 0, "EXECUTING", hashA, false);
         jdbcTemplate.update("""
                 insert into safety_contracts
                     (id, workspace_id, release_id, contract_key, status, created_at, updated_at)
@@ -593,58 +682,114 @@ class MigrationIntegrationTest {
                        safety_contract_hash = ?, release_fingerprint = ?
                  where id = '0198f200-0000-7000-8000-000000000011'
                 """, hashC, hashB);
+        insertCompletedReplayRun(
+                "0198f200-0000-7000-8000-000000000054",
+                "0198f200-0000-7000-8000-000000000075",
+                0,
+                42,
+                hashA,
+                hashB
+        );
+        insertCompletedReplayRun(
+                "0198f200-0000-7000-8000-000000000055",
+                "0198f200-0000-7000-8000-000000000077",
+                0,
+                999,
+                hashA,
+                hashB
+        );
+        insertCompletedReplayRun(
+                "0198f200-0000-7000-8000-000000000056",
+                "0198f200-0000-7000-8000-000000000078",
+                1,
+                42,
+                hashA,
+                hashB
+        );
+    }
+
+    private void insertActiveRun(
+            String runId,
+            String releaseId,
+            String mode,
+            String contractVersionId,
+            String pairGroupId,
+            String agentFingerprint,
+            String releaseFingerprint,
+            long randomSeed,
+            int totalCases
+    ) {
         jdbcTemplate.update("""
                 insert into test_runs
                     (id, release_id, suite_id, contract_version_id, mode, status,
-                     baseline_pair_group_id,
-                     agent_artifact_fingerprint, release_fingerprint, config_json, fixture_version,
-                     fixture_digest, model_config_hash, random_seed, total_cases, completed_cases,
-                     completed_at, created_at, updated_at)
+                     baseline_pair_group_id, agent_artifact_fingerprint, release_fingerprint,
+                     config_json, fixture_version, fixture_digest, model_config_hash, random_seed,
+                     total_cases, completed_cases, created_at, updated_at)
                 values
-                    ('0198f200-0000-7000-8000-000000000054',
-                     '0198f200-0000-7000-8000-000000000011',
-                     '0198f200-0000-7000-8000-000000000041',
-                     '0198f200-0000-7000-8000-000000000035', 'SEAL_REPLAY', 'COMPLETED',
-                     '0198f200-0000-7000-8000-000000000201',
-                     ?, ?, '{}'::jsonb, 'v1', ?, ?, 42, 1, 1, now(), now(), now()),
-                    ('0198f200-0000-7000-8000-000000000055',
-                     '0198f200-0000-7000-8000-000000000011',
-                     '0198f200-0000-7000-8000-000000000041',
-                     '0198f200-0000-7000-8000-000000000035', 'SEAL_REPLAY', 'COMPLETED',
-                     '0198f200-0000-7000-8000-000000000201',
-                     ?, ?, '{}'::jsonb, 'v1', ?, ?, 999, 1, 1, now(), now(), now()),
-                    ('0198f200-0000-7000-8000-000000000056',
-                     '0198f200-0000-7000-8000-000000000011',
-                     '0198f200-0000-7000-8000-000000000041',
-                     '0198f200-0000-7000-8000-000000000035', 'SEAL_REPLAY', 'COMPLETED',
-                     '0198f200-0000-7000-8000-000000000201',
-                     ?, ?, '{}'::jsonb, 'v1', ?, ?, 42, 1, 1, now(), now(), now())
-                """, hashA, hashB, hashA, hashA, hashA, hashB, hashA, hashA,
-                       hashA, hashB, hashA, hashA);
+                    (?::uuid, ?::uuid, '0198f200-0000-7000-8000-000000000041', ?::uuid, ?,
+                     'RUNNING', ?::uuid, ?, ?, '{}'::jsonb, 'v1', ?, ?, ?, ?, 0, now(), now())
+                """,
+                runId,
+                releaseId,
+                contractVersionId == null ? null : UUID.fromString(contractVersionId),
+                mode,
+                pairGroupId,
+                agentFingerprint,
+                releaseFingerprint,
+                agentFingerprint,
+                agentFingerprint,
+                randomSeed,
+                totalCases
+        );
+    }
+
+    private void insertCaseRun(
+            String caseRunId,
+            String runId,
+            int trialIndex,
+            String status,
+            String variantHash,
+            boolean completed
+    ) {
         jdbcTemplate.update("""
                 insert into test_case_runs
                     (id, test_run_id, test_case_id, trial_index, status, variant_hash,
                      completed_at, created_at, updated_at)
                 values
-                    ('0198f200-0000-7000-8000-000000000071',
-                     '0198f200-0000-7000-8000-000000000051',
-                     '0198f200-0000-7000-8000-000000000061', 0, 'EXECUTING', ?, null, now(), now()),
-                    ('0198f200-0000-7000-8000-000000000072',
-                     '0198f200-0000-7000-8000-000000000052',
-                     '0198f200-0000-7000-8000-000000000061', 0, 'PASSED', ?, now(), now(), now()),
-                    ('0198f200-0000-7000-8000-000000000073',
-                     '0198f200-0000-7000-8000-000000000053',
-                     '0198f200-0000-7000-8000-000000000061', 0, 'EXECUTING', ?, null, now(), now()),
-                    ('0198f200-0000-7000-8000-000000000075',
-                     '0198f200-0000-7000-8000-000000000054',
-                     '0198f200-0000-7000-8000-000000000061', 0, 'PASSED', ?, now(), now(), now()),
-                    ('0198f200-0000-7000-8000-000000000077',
-                     '0198f200-0000-7000-8000-000000000055',
-                     '0198f200-0000-7000-8000-000000000061', 0, 'PASSED', ?, now(), now(), now()),
-                    ('0198f200-0000-7000-8000-000000000078',
-                     '0198f200-0000-7000-8000-000000000056',
-                     '0198f200-0000-7000-8000-000000000061', 1, 'PASSED', ?, now(), now(), now())
-                """, hashA, hashA, hashA, hashA, hashA, hashA);
+                    (?::uuid, ?::uuid, '0198f200-0000-7000-8000-000000000061', ?, ?, ?,
+                     case when ? then now() else null end, now(), now())
+                """, caseRunId, runId, trialIndex, status, variantHash, completed);
+    }
+
+    private void completeRun(String runId, String status, int completedCases) {
+        jdbcTemplate.update("""
+                update test_runs
+                   set status = ?, completed_cases = ?, completed_at = now()
+                 where id = ?::uuid
+                """, status, completedCases, runId);
+    }
+
+    private void insertCompletedReplayRun(
+            String runId,
+            String caseRunId,
+            int trialIndex,
+            long randomSeed,
+            String agentFingerprint,
+            String releaseFingerprint
+    ) {
+        insertActiveRun(
+                runId,
+                "0198f200-0000-7000-8000-000000000011",
+                "SEAL_REPLAY",
+                "0198f200-0000-7000-8000-000000000035",
+                "0198f200-0000-7000-8000-000000000201",
+                agentFingerprint,
+                releaseFingerprint,
+                randomSeed,
+                1
+        );
+        insertCaseRun(caseRunId, runId, trialIndex, "PASSED", agentFingerprint, true);
+        completeRun(runId, "COMPLETED", 1);
     }
 
     private void verifyApprovedPatchScope(String wrongHash, String baseHash, String resultHash) {
@@ -818,9 +963,209 @@ class MigrationIntegrationTest {
         }
     }
 
+    private void assertEventCommitPrecedesTerminalTransition(
+            String payloadHash,
+            String currentHead,
+            String nextHead
+    ) throws Exception {
+        CountDownLatch terminalUpdateStarted = new CountDownLatch(1);
+        try (Connection first = dataSource.getConnection(); var executor = Executors.newSingleThreadExecutor()) {
+            first.setAutoCommit(false);
+            insertEventForRun(
+                    first,
+                    "0198f200-0000-7000-8000-000000000124",
+                    "0198f200-0000-7000-8000-000000000053",
+                    "0198f200-0000-7000-8000-000000000073",
+                    2,
+                    payloadHash,
+                    currentHead,
+                    nextHead
+            );
+            Future<String> terminalUpdate = executor.submit(() -> {
+                terminalUpdateStarted.countDown();
+                try (Connection second = dataSource.getConnection();
+                        PreparedStatement statement = second.prepareStatement("""
+                                update test_runs
+                                   set status = 'FAILED', completed_cases = 1, completed_at = now()
+                                 where id = '0198f200-0000-7000-8000-000000000053'
+                                """)) {
+                    statement.executeUpdate();
+                    return "committed";
+                } catch (SQLException exception) {
+                    return exception.getSQLState();
+                }
+            });
+            assertThat(terminalUpdateStarted.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> terminalUpdate.get(200, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(java.util.concurrent.TimeoutException.class);
+
+            first.commit();
+            assertThat(terminalUpdate.get(5, TimeUnit.SECONDS)).isEqualTo("committed");
+        }
+    }
+
+    private void assertConcurrentSuiteMutationRejected(
+            String releaseFingerprint,
+            String fixtureHash,
+            String attemptedSuiteHash
+    ) throws Exception {
+        CountDownLatch suiteMutationStarted = new CountDownLatch(1);
+        try (Connection first = dataSource.getConnection(); var executor = Executors.newSingleThreadExecutor()) {
+            first.setAutoCommit(false);
+            try (PreparedStatement statement = first.prepareStatement("""
+                    insert into test_runs
+                        (id, release_id, suite_id, mode, status, baseline_pair_group_id,
+                         agent_artifact_fingerprint, release_fingerprint, config_json, fixture_version,
+                         fixture_digest, model_config_hash, random_seed, total_cases, completed_cases)
+                    values
+                        ('0198f200-0000-7000-8000-000000000126',
+                         '0198f200-0000-7000-8000-000000000013',
+                         '0198f200-0000-7000-8000-000000000043', 'BASELINE', 'QUEUED',
+                         '0198f200-0000-7000-8000-000000000206', ?, ?, '{}'::jsonb, 'v1', ?, ?,
+                         42, 0, 0)
+                    """)) {
+                statement.setString(1, releaseFingerprint);
+                statement.setString(2, releaseFingerprint);
+                statement.setString(3, fixtureHash);
+                statement.setString(4, fixtureHash);
+                statement.executeUpdate();
+            }
+            Future<String> suiteMutation = executor.submit(() -> {
+                suiteMutationStarted.countDown();
+                try (Connection second = dataSource.getConnection();
+                        PreparedStatement statement = second.prepareStatement("""
+                                update test_suites set suite_hash = ?
+                                 where id = '0198f200-0000-7000-8000-000000000043'
+                                """)) {
+                    statement.setString(1, attemptedSuiteHash);
+                    statement.executeUpdate();
+                    return "accepted";
+                } catch (SQLException exception) {
+                    return exception.getSQLState();
+                }
+            });
+            assertThat(suiteMutationStarted.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> suiteMutation.get(200, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(java.util.concurrent.TimeoutException.class);
+
+            first.commit();
+            assertThat(suiteMutation.get(5, TimeUnit.SECONDS)).isEqualTo("55000");
+        }
+    }
+
+    private void assertConcurrentApprovalFreezesProposal(String baseHash) throws Exception {
+        jdbcTemplate.update("""
+                insert into patch_proposals
+                    (id, finding_id, state, root_cause, recommended_rule_json, policy_diff_json,
+                     normal_workflow_impact_json, rollback_json, generation_model_meta_json,
+                     validation_json, created_at, updated_at)
+                values
+                    ('0198f200-0000-7000-8000-000000000119',
+                     '0198f200-0000-7000-8000-000000000090', 'PROPOSED', 'race', '{}'::jsonb,
+                     '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now(), now())
+                """);
+        CountDownLatch proposalMutationStarted = new CountDownLatch(1);
+        try (Connection first = dataSource.getConnection(); var executor = Executors.newSingleThreadExecutor()) {
+            first.setAutoCommit(false);
+            try (PreparedStatement statement = first.prepareStatement("""
+                    insert into patch_approvals
+                        (id, patch_proposal_id, decision, reviewer_actor_id, comment, base_hash,
+                         decided_at, created_at)
+                    values
+                        ('0198f200-0000-7000-8000-000000000120',
+                         '0198f200-0000-7000-8000-000000000119', 'REJECTED', 'reviewer', 'race', ?,
+                         now(), now())
+                    """)) {
+                statement.setString(1, baseHash);
+                statement.executeUpdate();
+            }
+            Future<String> proposalMutation = executor.submit(() -> {
+                proposalMutationStarted.countDown();
+                try (Connection second = dataSource.getConnection();
+                        PreparedStatement statement = second.prepareStatement("""
+                                update patch_proposals set root_cause = 'concurrent tamper'
+                                 where id = '0198f200-0000-7000-8000-000000000119'
+                                """)) {
+                    statement.executeUpdate();
+                    return "accepted";
+                } catch (SQLException exception) {
+                    return exception.getSQLState();
+                }
+            });
+            assertThat(proposalMutationStarted.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> proposalMutation.get(200, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(java.util.concurrent.TimeoutException.class);
+
+            first.commit();
+            assertThat(proposalMutation.get(5, TimeUnit.SECONDS)).isEqualTo("55000");
+        }
+    }
+
+    private void assertDecisionInsertSerializesReleaseMutation(String inputDigest) throws Exception {
+        CountDownLatch releaseMutationStarted = new CountDownLatch(1);
+        try (Connection first = dataSource.getConnection(); var executor = Executors.newSingleThreadExecutor()) {
+            first.setAutoCommit(false);
+            try (PreparedStatement statement = first.prepareStatement("""
+                    insert into release_decisions
+                        (id, release_id, decision, gate_policy_version, input_snapshot_json, input_digest,
+                         proposed_at, confirmed_by, confirmed_at, created_at)
+                    values
+                        ('0198f200-0000-7000-8000-000000000127',
+                         '0198f200-0000-7000-8000-000000000014', 'PASS', '1.0', '{}'::jsonb, ?,
+                         now() - interval '11 hours', 'reviewer', now() - interval '10 hours',
+                         now() - interval '10 hours')
+                    """)) {
+                statement.setString(1, inputDigest);
+                statement.executeUpdate();
+            }
+            Future<String> releaseMutation = executor.submit(() -> {
+                releaseMutationStarted.countDown();
+                try (Connection second = dataSource.getConnection();
+                        PreparedStatement statement = second.prepareStatement("""
+                                update agent_releases
+                                   set revalidation_reason_json = '{"serialized":true}'::jsonb
+                                 where id = '0198f200-0000-7000-8000-000000000014'
+                                """)) {
+                    statement.executeUpdate();
+                    return "committed";
+                } catch (SQLException exception) {
+                    return exception.getSQLState();
+                }
+            });
+            assertThat(releaseMutationStarted.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> releaseMutation.get(200, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(java.util.concurrent.TimeoutException.class);
+
+            first.commit();
+            assertThat(releaseMutation.get(5, TimeUnit.SECONDS)).isEqualTo("committed");
+        }
+    }
+
     private void insertEvent(
             Connection connection,
             String eventId,
+            long sequence,
+            String payloadDigest,
+            String previousHash,
+            String eventHash
+    ) throws SQLException {
+        insertEventForRun(
+                connection,
+                eventId,
+                "0198f200-0000-7000-8000-000000000051",
+                "0198f200-0000-7000-8000-000000000071",
+                sequence,
+                payloadDigest,
+                previousHash,
+                eventHash
+        );
+    }
+
+    private void insertEventForRun(
+            Connection connection,
+            String eventId,
+            String runId,
+            String caseRunId,
             long sequence,
             String payloadDigest,
             String previousHash,
@@ -832,16 +1177,17 @@ class MigrationIntegrationTest {
                      event_type, payload_digest, metadata_json, prev_event_hash, event_hash)
                 values
                     (?::uuid, '0198f1e2-0000-7000-8000-000000000001',
-                     '0198f200-0000-7000-8000-000000000051',
-                     '0198f200-0000-7000-8000-000000000071',
+                     ?::uuid, ?::uuid,
                      '0198f200-0000-7000-8000-000000000091', ?, now(),
                      'MODEL_RESPONSE', ?, '{}'::jsonb, ?, ?)
                 """)) {
             statement.setString(1, eventId);
-            statement.setLong(2, sequence);
-            statement.setString(3, payloadDigest);
-            statement.setString(4, previousHash);
-            statement.setString(5, eventHash);
+            statement.setString(2, runId);
+            statement.setString(3, caseRunId);
+            statement.setLong(4, sequence);
+            statement.setString(5, payloadDigest);
+            statement.setString(6, previousHash);
+            statement.setString(7, eventHash);
             statement.executeUpdate();
         }
     }

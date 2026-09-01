@@ -119,3 +119,26 @@
   - terminal Run의 Event append를 거부하고 `RUN_COMPLETED event commit→Run terminal` 순서를 계약화
   - 정상 RUNNING→COMPLETED positive와 terminal Run/Case mutation·late Event negative test 추가
 - Reverification: 전체 PostgreSQL 검증 후 fixed commit으로 6차 검토 요청
+
+## G1 — Sixth review
+
+- Result: rejected
+- Verified before review: fixed commit `670abed`, PostgreSQL 17.11 및 전체 Gradle test 성공
+- Passed from prior review: terminal Run/Case 자체 mutation과 순차 late Event 차단
+- Remaining P0 feedback:
+  - terminal parent 아래에 새 CaseRun을 추가하거나 active child를 사후 종료해 graph 변경 가능
+  - COMPLETED 전이가 caller가 쓴 count만 신뢰하며 실제 child 상태와 미대조
+  - Event append와 Run terminal 전이가 같은 lock을 쓰지 않아 commit 순서 경쟁 가능
+- Applied:
+  - CaseRun INSERT/UPDATE와 Event INSERT가 parent TestRun row를 lock하며 terminal parent면 거부
+  - Run terminal 전이가 실제 materialized/terminal child 수와 completed counter를 대조하고,
+    COMPLETED는 planned total까지 일치하도록 강제
+  - Event append와 terminal 전이를 같은 Run row lock으로 직렬화
+  - terminal Run 직접 INSERT 금지, terminal Case 직접 INSERT의 completedAt 강제
+  - forged completed counter, terminal parent child 추가, direct terminal insert negative 및
+    FAILED/CANCELLED 정상 전이 positive test 추가
+  - 두 connection으로 Event commit이 terminal transition보다 반드시 먼저 완료되는지 검증
+- P1 applied:
+  - TestRun 생성↔Suite mutation, Approval insert↔Proposal mutation을 두 connection race로 검증
+  - Decision insert가 Release parent row를 lock하도록 해 fingerprint 전이와 직렬화하고 race test 추가
+- Reverification: 전체 PostgreSQL 검증 후 fixed commit으로 7차 검토 요청

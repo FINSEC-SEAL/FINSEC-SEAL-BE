@@ -188,6 +188,10 @@ BEGIN
     IF release_workspace IS NULL THEN
         RAISE EXCEPTION 'run release does not exist' USING ERRCODE = '23503';
     END IF;
+    IF TG_OP = 'INSERT' AND NEW.status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN
+        RAISE EXCEPTION 'terminal test run must be reached through a sealed state transition'
+            USING ERRCODE = '23514';
+    END IF;
     IF TG_OP = 'INSERT' AND (
         NEW.agent_artifact_fingerprint <> stored_agent_fingerprint
         OR NEW.release_fingerprint <> stored_release_fingerprint
@@ -230,6 +234,9 @@ CREATE OR REPLACE FUNCTION finsec_protect_test_run_identity()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    child_count integer;
+    terminal_child_count integer;
 BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION 'test run cannot be deleted' USING ERRCODE = '55000';
@@ -254,8 +261,19 @@ BEGIN
     IF NEW.status IN ('COMPLETED', 'FAILED', 'CANCELLED') AND NEW.completed_at IS NULL THEN
         RAISE EXCEPTION 'terminal test run requires completed_at' USING ERRCODE = '23514';
     END IF;
-    IF NEW.status = 'COMPLETED' AND NEW.completed_cases <> NEW.total_cases THEN
-        RAISE EXCEPTION 'completed test run requires all cases completed' USING ERRCODE = '23514';
+    IF NEW.status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN
+        SELECT count(*), count(*) FILTER (
+            WHERE status IN ('PASSED', 'FAILED_SECURITY', 'FAILED_FUNCTIONAL', 'ERROR', 'CANCELLED')
+        ) INTO child_count, terminal_child_count
+          FROM test_case_runs WHERE test_run_id = OLD.id;
+        IF child_count <> terminal_child_count OR NEW.completed_cases <> terminal_child_count THEN
+            RAISE EXCEPTION 'terminal test run requires every materialized child sealed and counters reconciled'
+                USING ERRCODE = '23514';
+        END IF;
+        IF NEW.status = 'COMPLETED' AND child_count <> NEW.total_cases THEN
+            RAISE EXCEPTION 'completed test run requires all planned cases materialized and completed'
+                USING ERRCODE = '23514';
+        END IF;
     END IF;
     RETURN NEW;
 END;
@@ -271,9 +289,18 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     run_suite uuid;
+    run_status varchar(30);
     case_suite uuid;
 BEGIN
-    SELECT suite_id INTO run_suite FROM test_runs WHERE id = NEW.test_run_id;
+    SELECT suite_id, status INTO run_suite, run_status
+      FROM test_runs WHERE id = NEW.test_run_id FOR UPDATE;
+    IF run_status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN
+        RAISE EXCEPTION 'case-run graph is immutable after parent run termination' USING ERRCODE = '55000';
+    END IF;
+    IF NEW.status IN ('PASSED', 'FAILED_SECURITY', 'FAILED_FUNCTIONAL', 'ERROR', 'CANCELLED')
+       AND NEW.completed_at IS NULL THEN
+        RAISE EXCEPTION 'terminal test case run requires completed_at' USING ERRCODE = '23514';
+    END IF;
     SELECT suite_id INTO case_suite FROM test_cases WHERE id = NEW.test_case_id;
     IF run_suite IS NULL OR case_suite IS NULL OR run_suite <> case_suite THEN
         RAISE EXCEPTION 'case-run test case must belong to the run suite' USING ERRCODE = '23514';
@@ -509,7 +536,8 @@ DECLARE
 BEGIN
     SELECT a.workspace_id, tr.status INTO run_workspace, run_status
       FROM test_runs tr JOIN agent_releases ar ON ar.id = tr.release_id
-      JOIN agents a ON a.id = ar.agent_id WHERE tr.id = NEW.run_id;
+      JOIN agents a ON a.id = ar.agent_id WHERE tr.id = NEW.run_id
+      FOR UPDATE OF tr;
     IF run_workspace IS NULL OR run_workspace <> NEW.workspace_id THEN
         RAISE EXCEPTION 'event workspace and run workspace must match' USING ERRCODE = '23514';
     END IF;
@@ -784,6 +812,20 @@ WHEN (OLD.lifecycle_state <> 'DRAFT'
       OR NEW.safety_contract_hash IS DISTINCT FROM OLD.safety_contract_hash)
 )
 EXECUTE FUNCTION finsec_validate_release_fingerprint_transition();
+
+CREATE OR REPLACE FUNCTION finsec_lock_release_decision_parent()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM 1 FROM agent_releases WHERE id = NEW.release_id FOR UPDATE;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER release_decision_parent_lock
+BEFORE INSERT ON release_decisions
+FOR EACH ROW EXECUTE FUNCTION finsec_lock_release_decision_parent();
 
 CREATE OR REPLACE FUNCTION finsec_validate_patch_approval_scope()
 RETURNS trigger
