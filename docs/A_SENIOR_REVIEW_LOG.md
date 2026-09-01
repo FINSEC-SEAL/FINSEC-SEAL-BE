@@ -179,3 +179,19 @@
     실제 row-lock 대기(`55P03`)와 증거 commit 후 정상 terminal 전이를 검증
 - Reverification: 실제 PostgreSQL 17.11 대상 `MigrationIntegrationTest` 성공. 전체 test 및 fixed commit
   생성 후 8차 검토 요청 예정
+
+## G1 — Eighth review
+
+- Result: rejected
+- Verified before review: fixed commit `6ed31fb`, 실제 PostgreSQL 17.11에서 19 tests 성공
+- Passed from prior review: planned total/operational error count 봉인, Oracle/Finding terminal 차단 및
+  `lock_timeout` 기반 concurrency 검증
+- Remaining P0 feedback: Finding row 삭제와 `source_oracle_result_id`/`first_seen_run_id` 재연결이
+  가능해 unresolved gate evidence와 provenance를 사후 재작성할 수 있음
+- Applied:
+  - Finding DELETE 전면 차단
+  - `release_id`, source Oracle, first-seen Run, category, severity, violated invariant를 provenance로 고정
+  - source Oracle Run과 first-seen Run 일치를 INSERT/UPDATE 모두에 강제
+  - delete, first-seen/source reparent, severity mutation, 잘못된 신규 first-seen negative test 추가
+  - 정상 `OPEN→TRIAGED`, root cause 및 same-release latest-seen 갱신 positive test 추가
+- Reverification: PostgreSQL targeted/full test와 fixed commit 생성 후 9차 검토 요청 예정

@@ -645,8 +645,8 @@ BEGIN
        OR first_release IS DISTINCT FROM NEW.release_id OR latest_release IS DISTINCT FROM NEW.release_id THEN
         RAISE EXCEPTION 'finding evidence and runs must belong to the same release' USING ERRCODE = '23514';
     END IF;
-    IF TG_OP = 'INSERT' AND oracle_run IS DISTINCT FROM NEW.first_seen_run_id THEN
-        RAISE EXCEPTION 'new finding first-seen run must own its source oracle evidence'
+    IF oracle_run IS DISTINCT FROM NEW.first_seen_run_id THEN
+        RAISE EXCEPTION 'finding first-seen run must own its source oracle evidence'
             USING ERRCODE = '23514';
     END IF;
     RETURN NEW;
@@ -656,6 +656,30 @@ $$;
 CREATE TRIGGER finding_scope_guard
 BEFORE INSERT OR UPDATE ON findings
 FOR EACH ROW EXECUTE FUNCTION finsec_validate_finding_scope();
+
+CREATE OR REPLACE FUNCTION finsec_protect_finding_provenance()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'finding evidence cannot be deleted' USING ERRCODE = '55000';
+    END IF;
+    IF NEW.release_id IS DISTINCT FROM OLD.release_id
+       OR NEW.source_oracle_result_id IS DISTINCT FROM OLD.source_oracle_result_id
+       OR NEW.first_seen_run_id IS DISTINCT FROM OLD.first_seen_run_id
+       OR NEW.category IS DISTINCT FROM OLD.category
+       OR NEW.severity IS DISTINCT FROM OLD.severity
+       OR NEW.violated_invariant IS DISTINCT FROM OLD.violated_invariant THEN
+        RAISE EXCEPTION 'finding evidence provenance is immutable' USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER finding_provenance_guard
+BEFORE UPDATE OR DELETE ON findings
+FOR EACH ROW EXECUTE FUNCTION finsec_protect_finding_provenance();
 
 CREATE OR REPLACE FUNCTION finsec_evidence_owner_workspace(owner_kind varchar, target_id uuid)
 RETURNS uuid

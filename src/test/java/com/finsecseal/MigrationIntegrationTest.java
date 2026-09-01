@@ -408,8 +408,18 @@ class MigrationIntegrationTest {
                      '0198f200-0000-7000-8000-000000000083', 'NORMAL_TASK', '1.0', 'NORMAL_SUCCESS',
                      'EXPECTED_RESULT', 'INV-1', '{}'::jsonb, ?, now(), now(), now())
                 """, hashA);
+        insertOracle(null, "0198f200-0000-7000-8000-000000000139",
+                "0198f200-0000-7000-8000-000000000071", "SECONDARY_SOURCE", "INV-SECONDARY", hashA);
 
         assertConcurrentStaleHeadRejected(hashA, hashB, hashC);
+
+        assertSqlState("23514", () -> insertFindingForRelease(
+                null,
+                "0198f200-0000-7000-8000-000000000140",
+                "0198f200-0000-7000-8000-000000000139",
+                "0198f200-0000-7000-8000-000000000011",
+                "0198f200-0000-7000-8000-000000000052"
+        ));
 
         jdbcTemplate.update("""
                 insert into findings
@@ -424,6 +434,30 @@ class MigrationIntegrationTest {
                      '0198f200-0000-7000-8000-000000000051',
                      '0198f200-0000-7000-8000-000000000052', now(), now())
                 """);
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                delete from findings
+                 where id = '0198f200-0000-7000-8000-000000000090'
+                """));
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                update findings
+                   set first_seen_run_id = '0198f200-0000-7000-8000-000000000052'
+                 where id = '0198f200-0000-7000-8000-000000000090'
+                """));
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                update findings
+                   set source_oracle_result_id = '0198f200-0000-7000-8000-000000000139'
+                 where id = '0198f200-0000-7000-8000-000000000090'
+                """));
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                update findings set severity = 'LOW'
+                 where id = '0198f200-0000-7000-8000-000000000090'
+                """));
+        assertThat(jdbcTemplate.update("""
+                update findings
+                   set status = 'TRIAGED', latest_seen_run_id = '0198f200-0000-7000-8000-000000000052',
+                       root_cause_json = '{"reviewed":true}'::jsonb
+                 where id = '0198f200-0000-7000-8000-000000000090'
+                """)).isEqualTo(1);
         assertSqlState("23514", () -> jdbcTemplate.update("""
                 insert into replay_links
                     (id, finding_id, baseline_case_run_id, replay_case_run_id,
@@ -1377,25 +1411,42 @@ class MigrationIntegrationTest {
     }
 
     private void insertFinding(Connection connection, String findingId, String oracleId, String runId) {
+        insertFindingForRelease(
+                connection,
+                findingId,
+                oracleId,
+                "0198f200-0000-7000-8000-000000000012",
+                runId
+        );
+    }
+
+    private void insertFindingForRelease(
+            Connection connection,
+            String findingId,
+            String oracleId,
+            String releaseId,
+            String runId
+    ) {
         String sql = """
                 insert into findings
                     (id, release_id, source_oracle_result_id, category, severity, title, status,
                      violated_invariant, root_cause_json, first_seen_run_id, latest_seen_run_id,
                      created_at, updated_at)
-                values (?::uuid, '0198f200-0000-7000-8000-000000000012', ?::uuid,
+                values (?::uuid, ?::uuid, ?::uuid,
                         'SCOPE', 'HIGH', 'Synthetic race finding', 'OPEN', 'INV-RACE', '{}'::jsonb,
                         ?::uuid, ?::uuid, now(), now())
                 """;
         try {
             if (connection == null) {
-                jdbcTemplate.update(sql, findingId, oracleId, runId, runId);
+                jdbcTemplate.update(sql, findingId, releaseId, oracleId, runId, runId);
                 return;
             }
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
                 statement.setString(1, findingId);
-                statement.setString(2, oracleId);
-                statement.setString(3, runId);
+                statement.setString(2, releaseId);
+                statement.setString(3, oracleId);
                 statement.setString(4, runId);
+                statement.setString(5, runId);
                 statement.executeUpdate();
             }
         } catch (SQLException exception) {
