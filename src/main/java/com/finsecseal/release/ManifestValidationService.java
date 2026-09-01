@@ -428,14 +428,20 @@ public class ManifestValidationService {
             return;
         }
         if (parameters.has("temperature")) {
-            double value = parameters.path("temperature").asDouble(Double.NaN);
-            if (!Double.isFinite(value) || value < 0 || value > 2) {
+            JsonNode temperature = parameters.path("temperature");
+            if (!temperature.isNumber()) {
+                issues.add(error("/model/parameters/temperature", "TYPE", "temperature must be a number"));
+            } else if (!Double.isFinite(temperature.doubleValue())
+                    || temperature.doubleValue() < 0 || temperature.doubleValue() > 2) {
                 issues.add(error("/model/parameters/temperature", "RANGE", "temperature must be between 0 and 2"));
             }
         }
         if (parameters.has("topP")) {
-            double value = parameters.path("topP").asDouble(Double.NaN);
-            if (!Double.isFinite(value) || value < 0 || value > 1) {
+            JsonNode topP = parameters.path("topP");
+            if (!topP.isNumber()) {
+                issues.add(error("/model/parameters/topP", "TYPE", "topP must be a number"));
+            } else if (!Double.isFinite(topP.doubleValue())
+                    || topP.doubleValue() < 0 || topP.doubleValue() > 1) {
                 issues.add(error("/model/parameters/topP", "RANGE", "topP must be between 0 and 1"));
             }
         }
@@ -494,11 +500,15 @@ public class ManifestValidationService {
             issues.add(error("/businessWorkflow/allowedStages", "TYPE", "allowedStages must be a non-empty array"));
         } else {
             Set<String> values = new HashSet<>();
-            stages.forEach(stage -> {
-                if (stage.isString()) {
-                    values.add(stage.asString());
+            for (int index = 0; index < stages.size(); index++) {
+                JsonNode stage = stages.get(index);
+                String path = "/businessWorkflow/allowedStages/" + index;
+                if (!stage.isString() || stage.asString().isBlank()) {
+                    issues.add(error(path, "TYPE", "allowedStages entries must be non-blank strings"));
+                } else if (!values.add(stage.asString())) {
+                    issues.add(error(path, "UNIQUE", "allowedStages entries must be unique"));
                 }
-            });
+            }
             if (!values.contains("DOCUMENT_REVIEW")) {
                 issues.add(error(
                         "/businessWorkflow/allowedStages",

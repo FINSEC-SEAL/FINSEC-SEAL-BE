@@ -39,7 +39,7 @@ class MigrationIntegrationTest {
     void appliesAllMigrationsToRealPostgres() {
         Integer appliedMigrations = jdbcTemplate.queryForObject(
                 "select count(*) from flyway_schema_history "
-                        + "where success and version in ('1', '2', '3', '4', '5', '6')",
+                        + "where success and version in ('1', '2', '3', '4', '5', '6', '7', '8')",
                 Integer.class
         );
         Integer platformTables = jdbcTemplate.queryForObject(
@@ -54,7 +54,7 @@ class MigrationIntegrationTest {
                 String.class
         );
 
-        assertThat(appliedMigrations).isEqualTo(6);
+        assertThat(appliedMigrations).isEqualTo(8);
         assertThat(platformTables).isEqualTo(6);
         assertThat(workspace).isEqualTo("FINSEC SEAL Demo");
     }

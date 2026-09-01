@@ -3,6 +3,7 @@ package com.finsecseal.release;
 import com.finsecseal.agent.AgentEntity;
 import com.finsecseal.agent.AgentService;
 import com.finsecseal.audit.AuditService;
+import com.finsecseal.audit.PromptAccessAuditService;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.ArtifactType;
@@ -49,6 +50,7 @@ public class ReleaseService {
     private final ReleaseCatalogWriter catalogWriter;
     private final DecisionInvalidationWriter invalidationWriter;
     private final AuditService auditService;
+    private final PromptAccessAuditService promptAccessAuditService;
     private final ReleaseIntegrityVerifier integrityVerifier;
 
     public ReleaseService(
@@ -63,6 +65,7 @@ public class ReleaseService {
             ReleaseCatalogWriter catalogWriter,
             DecisionInvalidationWriter invalidationWriter,
             AuditService auditService,
+            PromptAccessAuditService promptAccessAuditService,
             ReleaseIntegrityVerifier integrityVerifier
     ) {
         this.agentService = agentService;
@@ -76,6 +79,7 @@ public class ReleaseService {
         this.catalogWriter = catalogWriter;
         this.invalidationWriter = invalidationWriter;
         this.auditService = auditService;
+        this.promptAccessAuditService = promptAccessAuditService;
         this.integrityVerifier = integrityVerifier;
     }
 
@@ -354,13 +358,10 @@ public class ReleaseService {
         auditMetadata.put("purpose", purpose);
         auditMetadata.put("artifactType", ArtifactType.SYSTEM_PROMPT.name());
         auditMetadata.put("plaintextReturned", false);
-        auditService.append(
+        promptAccessAuditService.appendRollbackSafe(
                 agent.getWorkspaceId(),
                 normalizeActor(actorId),
-                "SYSTEM_PROMPT_DECRYPTED_INTERNAL",
-                "AGENT_RELEASE",
                 release.getId(),
-                null,
                 promptArtifact.getSha256(),
                 auditMetadata
         );

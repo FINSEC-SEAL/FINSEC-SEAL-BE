@@ -68,7 +68,7 @@ public class ReleaseArtifactEntity {
         this.releaseId = releaseId;
         this.artifactType = artifactType;
         this.name = name;
-        this.contentJson = contentJson;
+        this.contentJson = contentJson == null ? null : contentJson.deepCopy();
         this.encryptedText = encryptedText;
         this.sha256 = sha256;
         this.canonicalizationVersion = CanonicalJsonService.VERSION;

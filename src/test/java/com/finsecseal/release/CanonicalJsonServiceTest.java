@@ -1,6 +1,7 @@
 package com.finsecseal.release;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -28,6 +29,19 @@ class CanonicalJsonServiceTest {
 
         assertThat(canonicalJsonService.canonicalString(input))
                 .isEqualTo("{\"a\":2,\"b\":1,\"z\":\"é\"}");
+    }
+
+    @Test
+    void normalizesObjectFieldNamesAndRejectsPostNormalizationCollisions() {
+        JsonNode decomposedKey = objectMapper.readTree("{\"e\\u0301\":1}");
+        JsonNode composedKey = objectMapper.readTree("{\"é\":1}");
+
+        assertThat(canonicalJsonService.canonicalize(decomposedKey))
+                .isEqualTo(canonicalJsonService.canonicalize(composedKey));
+        assertThatThrownBy(() -> canonicalJsonService.canonicalize(
+                objectMapper.readTree("{\"e\\u0301\":1,\"é\":2}")
+        )).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("collide");
     }
 
     @Test

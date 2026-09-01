@@ -53,6 +53,7 @@ public class RedactionService {
                     + "|\\bsk-[A-Za-z0-9_-]{16,}|\\bAKIA[0-9A-Z]{16}\\b"
                     + "|\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\b).*"
     );
+    private static final Pattern SYNTHETIC_TOKEN = Pattern.compile("\\[SYNTH_ID:[0-9a-f]{12}]");
 
     private final ObjectMapper objectMapper;
     private final CanonicalJsonService canonicalJsonService;
@@ -139,6 +140,9 @@ public class RedactionService {
             return tokens;
         }
         if (value.isNull()) {
+            return value.deepCopy();
+        }
+        if (value.isString() && SYNTHETIC_TOKEN.matcher(value.asString()).matches()) {
             return value.deepCopy();
         }
         return StringNode.valueOf("[SYNTH_ID:" + hmac(value.asString()) + "]");

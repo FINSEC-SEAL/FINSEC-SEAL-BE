@@ -74,8 +74,7 @@ public class CanonicalJsonService {
             return value;
         }
         if (value.isString()) {
-            String lineNormalized = value.stringValue().replace("\r\n", "\n").replace('\r', '\n');
-            return StringNode.valueOf(Normalizer.normalize(lineNormalized, Normalizer.Form.NFC));
+            return StringNode.valueOf(normalizeText(value.stringValue()));
         }
         if (value.isArray()) {
             ArrayNode array = objectMapper.createArrayNode();
@@ -84,10 +83,23 @@ public class CanonicalJsonService {
         }
         if (value.isObject()) {
             ObjectNode object = objectMapper.createObjectNode();
-            value.properties().forEach(entry -> object.set(entry.getKey(), normalizeStrings(entry.getValue())));
+            value.properties().forEach(entry -> {
+                String normalizedKey = normalizeText(entry.getKey());
+                if (object.has(normalizedKey)) {
+                    throw new IllegalArgumentException(
+                            "JSON object contains field names that collide after NFC normalization"
+                    );
+                }
+                object.set(normalizedKey, normalizeStrings(entry.getValue()));
+            });
             return object;
         }
         return value.deepCopy();
+    }
+
+    private String normalizeText(String value) {
+        String lineNormalized = value.replace("\r\n", "\n").replace('\r', '\n');
+        return Normalizer.normalize(lineNormalized, Normalizer.Form.NFC);
     }
 
     private void sortObjectArray(ObjectNode parent, String fieldName, List<String> stableKeys) {

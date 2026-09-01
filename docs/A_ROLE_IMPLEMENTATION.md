@@ -33,6 +33,25 @@
 - 최신 ReleaseDecision을 참조하는 append-only manual/contract-change invalidation evidence
 - 모든 mutation에 24시간 durable `Idempotency-Key` 계약. 같은 요청은 status/body/Location/trace를
   그대로 replay하고 다른 body는 409, 미완료 reservation은 fail-closed 처리
+- 만료 PROCESSING reservation의 운영자 pending 조회 및 audited `RELEASE`/`COMPLETE` 복구 계약
+- rollback-safe system prompt plaintext 접근 audit
+
+### G3 — TestRun, Trace, Evidence and Audit delivery
+
+- TestRun/TestCaseRun 저장 및 상태 전이 API(실행·판정 계산은 미포함)
+- append-only ExecutionEvent와 Run별 단조 sequence, 이전 hash 기반 tamper-evident event chain
+- transactional event outbox, publish attempt 추적, SSE resume/heartbeat와 polling history
+- HMAC 기반 synthetic ID tokenization, PII/금융/신용정보 redaction, secret-like payload 저장 거부
+- release/run/workspace closure를 검증하는 EvidenceReference와 scope-checked append-only AuditRecord
+
+### G4 — Attestation projection
+
+- D가 저장한 최신 confirmed ReleaseDecision의 exact immutable input snapshot만 사용
+- A는 metric/rule/gate/decision을 재계산하지 않고 projection·integrity·export만 담당
+- RFC 8785+NFC deterministic JSON document hash와 immutable JSON/HTML 저장
+- 한국어/영어 내부 평가 disclaimer를 DB trigger까지 고정
+- Decision invalidation 뒤 document/hash는 보존하고 응답과 HTML에 stale/NEEDS_REVALIDATION 표시
+- 현재 Release가 변경됐어도 당시 Decision snapshot으로 historical Attestation 재현
 
 ## API usage
 
@@ -58,10 +77,38 @@ curl -sS -X POST http://localhost:8080/api/v1/releases/{releaseId}:analyze \
 
 curl -sS http://localhost:8080/api/v1/releases/{releaseId}/fingerprint
 curl -sS 'http://localhost:8080/api/v1/releases/{releaseId}/diff?against={olderReleaseId}'
+
+curl -sS http://localhost:8080/api/v1/releases/{releaseId}/attestation
+curl -sS 'http://localhost:8080/api/v1/releases/{releaseId}/evidence-export?format=json' -o attestation.json
+curl -sS 'http://localhost:8080/api/v1/releases/{releaseId}/evidence-export?format=html' -o attestation.html
 ```
 
 주요 read endpoint는 `GET /api/v1/agents`, `GET /api/v1/agents/{id}`,
 `GET /api/v1/agents/{id}/releases`, `GET /api/v1/releases/{id}`다.
+
+### Idempotency operator recovery
+
+자동 만료 재실행은 원 요청이 실제로 commit됐는지 알 수 없어 금지한다. 먼저 별도 시스템/DB/업무 결과로
+원 요청 결과를 확인하고, `.env`의 `FINSEC_IDEMPOTENCY_RECOVERY_KEY`를 32 bytes 이상 random 값으로
+설정한다.
+
+```bash
+# 복구 대상 조회: 응답의 actor/method/path/key/requestDigest를 그대로 사용
+curl -sS http://localhost:8080/api/v1/platform/idempotency-recoveries/pending \
+  -H 'X-Actor-Id: operator:platform' \
+  -H "X-Operator-Recovery-Key: $FINSEC_IDEMPOTENCY_RECOVERY_KEY"
+
+# 원 작업이 실행되지 않았음을 확인한 경우에만 RELEASE
+curl -sS -X POST http://localhost:8080/api/v1/platform/idempotency-recoveries \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: recovery-command-001' \
+  -H 'X-Actor-Id: operator:platform' \
+  -H "X-Operator-Recovery-Key: $FINSEC_IDEMPOTENCY_RECOVERY_KEY" \
+  -d '{"actorId":"original-actor","httpMethod":"POST","requestPath":"/api/v1/agents","idempotencyKey":"original-key","requestDigest":"sha256:...","resolution":"RELEASE","verificationReference":"ops:incident/FINSEC-2026-0001"}'
+```
+
+이미 실행됐음을 확인한 경우에는 `resolution=COMPLETE`와 원래 status/contentType/Location/traceId 및
+response body의 Base64를 함께 보낸다. 복구 row와 audit는 불변이며 request identity와 다른 값은 거부된다.
 
 ## Run and verify
 
@@ -74,6 +121,7 @@ curl -sS 'http://localhost:8080/api/v1/releases/{releaseId}/diff?against={olderR
 ```bash
 cp .env.example .env
 # FINSEC_DATA_ENCRYPTION_KEY_BASE64에 `openssl rand -base64 32` 결과 입력
+# FINSEC_IDEMPOTENCY_RECOVERY_KEY에 32 bytes 이상의 random 운영자 키 입력
 docker compose up --build
 ```
 
@@ -94,7 +142,5 @@ docker compose up --build
 
 ## Remaining A stages
 
-- G3: TestRun persistence, ExecutionEvent, Evidence/Audit, SSE/polling
-- G4: Attestation projection
 - G5: A-owned frontend
 - G6: full verification and handoff

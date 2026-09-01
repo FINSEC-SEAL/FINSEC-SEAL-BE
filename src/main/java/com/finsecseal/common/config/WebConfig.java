@@ -25,7 +25,8 @@ public class WebConfig implements WebMvcConfigurer {
                 .allowedMethods("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
                 .allowedHeaders(
                         "Authorization", "Content-Type", "Last-Event-ID", "X-Trace-Id",
-                        "Idempotency-Key", "If-Match", "X-CSRF-Token", "X-Actor-Id"
+                        "Idempotency-Key", "If-Match", "X-CSRF-Token", "X-Actor-Id",
+                        "X-Operator-Recovery-Key"
                 )
                 .exposedHeaders("X-Trace-Id", "ETag", "Location", "Idempotent-Replayed")
                 .allowCredentials(true);

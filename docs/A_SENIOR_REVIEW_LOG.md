@@ -260,3 +260,49 @@
 - Reverification: `git diff --check` 성공, PostgreSQL `17.11-alpine` 기반
   `./gradlew clean test --warning-mode all --rerun-tasks` 전체 45 tests, 실패 0건
 - Gate: fixed commit 생성 후 G2 재검토 요청
+
+## G2 — Second review
+
+- Result: rejected
+- Reviewed fixed commit: `a23d17ad57695990dbc5918222f5cf12f9c33faf`
+- Independent verification: 선임의 clean detached worktree와 실제 PostgreSQL `17.11-alpine`에서
+  `git diff --check` 및 전체 45 tests 성공
+- Confirmed closed:
+  - 이전 P0 4건(Tool 고정 registry, derived integrity, idempotency connection 고갈, analyze TOCTOU)
+  - Agent archive/create race, mutable JSON defensive copy, B/C/D 역할 경계
+- Remaining P1 feedback:
+  - `temperature`/`topP` 문자열 숫자와 `allowedStages` 비문자·중복을 strict manifest가 수용
+  - system prompt 복호화 뒤 integrity failure가 발생하면 동일 transaction의 접근 audit도 rollback
+  - 만료 `PROCESSING` idempotency reservation에 실제 operator recovery 계약 부재
+- P2 feedback:
+  - Tool/RAG definition-first 및 analyze-first actual concurrency test 추가 권고
+  - JSON object field name NFC 정규화 누락
+  - `ReleaseArtifactEntity` constructor의 JsonNode defensive copy 권고
+- Gate: G2 FAIL. P1 수정 후 재검토 필요
+
+## G2 — Second review feedback applied
+
+- Strict manifest:
+  - `temperature`/`topP`에 실제 JSON number 타입을 요구하고 문자열 숫자를 `TYPE` 오류로 거부
+  - `allowedStages` 원소의 non-blank string 타입과 중복 금지를 index별 오류로 검증
+- Rollback-safe prompt access audit:
+  - 복호화 접근 audit를 현재 transaction에 기록하되, 이미 commit된 Release에 대한 호출이 rollback되면
+    transaction completion callback에서 독립 transaction으로 동일 접근 증적을 복원
+  - derived artifact tamper로 integrity 검증이 실패한 실제 rollback 경로에서 audit 보존 통합 테스트 추가
+- Operator idempotency recovery:
+  - 별도 32-byte 이상 운영자 키와 `operator:` actor를 모두 요구
+  - 만료된 `PROCESSING`만 exact actor/method/path/key/requestDigest로 row-lock 후 복구
+  - 미처리 확인 시 `RELEASE`, 이미 처리 확인 시 검증된 status/body/Location/trace를 등록하는 `COMPLETE`
+  - pending 조회 API, 불변 recovery row, scope-checked audit, DB identity/transition/delete guard 추가
+  - 잘못된 운영자 키, RELEASE 후 원 요청 실행, COMPLETE 후 정확한 응답 replay를 real HTTP로 검증
+- P2 also applied:
+  - Tool/RAG 각각 definition-first 및 analyze-first 양방향 two-connection concurrency test 추가
+  - JSON value와 object field name 모두 NFC/LF 정규화하고 normalization collision 거부
+  - `ReleaseArtifactEntity` constructor defensive copy 추가
+- Additional Attestation hardening during G4:
+  - 이미 tokenized synthetic ID의 재-HMAC 방지
+  - Decision 무효화 후 현재 Release fingerprint/contract가 달라져도 당시 immutable snapshot으로
+    stale Attestation을 생성하는 회귀 테스트 추가
+- Reverification: `git diff --check` 성공. 실제 PostgreSQL `17.11-alpine` 대상
+  `./gradlew clean test --warning-mode all --rerun-tasks` 전체 55 tests, 실패/오류/skip 0건.
+  fixed commit 후 동일 선임에게 G2 third review 요청 예정

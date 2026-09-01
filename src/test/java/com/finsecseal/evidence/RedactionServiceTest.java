@@ -60,6 +60,15 @@ class RedactionServiceTest {
     }
 
     @Test
+    void preservesAlreadyTokenizedSyntheticIds() {
+        ObjectNode alreadyRedacted = objectMapper.createObjectNode()
+                .put("customerId", "[SYNTH_ID:012345abcdef]");
+
+        assertThat(redactionService.redact(alreadyRedacted).redacted())
+                .isEqualTo(alreadyRedacted);
+    }
+
+    @Test
     void rejectsSecretFieldsAndSecretLikeValuesBeforePersistence() {
         ObjectNode secretField = objectMapper.createObjectNode().put("clientSecret", "canary-value");
         ObjectNode secretValue = objectMapper.createObjectNode()

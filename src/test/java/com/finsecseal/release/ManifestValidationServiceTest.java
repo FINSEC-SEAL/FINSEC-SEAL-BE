@@ -92,4 +92,29 @@ class ManifestValidationServiceTest {
         assertThat(result.issues()).extracting(ManifestValidationService.Issue::code)
                 .contains("TYPE", "PROVIDER_HOST_SCOPE");
     }
+
+    @Test
+    void rejectsStringModelNumbersAndInvalidOrDuplicateWorkflowStages() {
+        ObjectNode invalid = (ObjectNode) validManifest.deepCopy();
+        ((ObjectNode) invalid.at("/model/parameters"))
+                .put("temperature", "1")
+                .put("topP", "0.9");
+        ((ObjectNode) invalid.path("businessWorkflow")).putArray("allowedStages")
+                .add("DOCUMENT_REVIEW")
+                .add(7)
+                .add("DOCUMENT_REVIEW");
+
+        ManifestValidationService.ValidationResult result = validationService.validate(invalid);
+
+        assertThat(result.valid()).isFalse();
+        assertThat(result.issues()).extracting(ManifestValidationService.Issue::path)
+                .contains(
+                        "/model/parameters/temperature",
+                        "/model/parameters/topP",
+                        "/businessWorkflow/allowedStages/1",
+                        "/businessWorkflow/allowedStages/2"
+                );
+        assertThat(result.issues()).extracting(ManifestValidationService.Issue::code)
+                .contains("TYPE", "UNIQUE");
+    }
 }

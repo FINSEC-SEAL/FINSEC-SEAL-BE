@@ -41,6 +41,7 @@ finsec:
     key-base64: ${FINSEC_DATA_ENCRYPTION_KEY_BASE64}
   idempotency:
     ttl: ${FINSEC_IDEMPOTENCY_TTL:24h}
+    recovery-key: ${FINSEC_IDEMPOTENCY_RECOVERY_KEY:}
   sse:
     timeout: 30m
     heartbeat: 15s
