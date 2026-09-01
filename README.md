@@ -62,6 +62,7 @@ docker compose up --build
 
 - Health: `GET http://localhost:8080/actuator/health`
 - Role A 구현/사용법: [docs/A_ROLE_IMPLEMENTATION.md](docs/A_ROLE_IMPLEMENTATION.md)
+- Role A 레포별 인계: [docs/A_REPOSITORY_HANDOFF.md](docs/A_REPOSITORY_HANDOFF.md)
 - 선임 검증 기록: [docs/A_SENIOR_REVIEW_LOG.md](docs/A_SENIOR_REVIEW_LOG.md)
 
 ## Disclaimer

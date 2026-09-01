@@ -453,3 +453,17 @@
 - Reverification: targeted upgrade test PASS; `./gradlew clean test --warning-mode all --rerun-tasks`
   전체 67 tests, 실패/오류/skip 0건; `git diff --check` PASS; V9 바이트 일치 PASS
 - Gate: fixed commit 생성 후 seventh review 요청
+
+## G2 — Seventh review
+
+- Result: approved
+- Reviewed fixed commit: `793dcbbd97ef8a057e280f9f1c1e04d3bcab0a58`
+- Independent verification:
+  - `V9`이 `089cfcdc` 기준과 byte-for-byte 동일하고 SHA-256
+    `09e79ccfb30a6a68fdc44be96700c10692cb17e2cba3f27d1a7645f41e14fc05` 일치
+  - owner proof/monotonic-time guard가 새 `V10` migration으로 적용됨
+  - upgrade test가 빈 PostgreSQL DB에 V1–V9 9건을 우선 적용하고 V10 한 건만
+    추가 적용한 뒤 Flyway history와 proof 없는 lease update의 SQLSTATE `23514`를 검증
+  - targeted upgrade test PASS, 전체 67 tests / failure 0 / error 0
+- Remaining findings: none
+- Gate: G2 PASS
