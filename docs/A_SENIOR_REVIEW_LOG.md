@@ -82,3 +82,24 @@
 - Reverification: `./gradlew clean test --warning-mode all` 성공. 실제 PostgreSQL 17.11에서
   silent-gap, Replay flag 위조, 최신 Decision invalidation 및 commit-boundary 전이를 포함한 전체 검증 후
   fixed commit으로 4차 검토 요청
+
+## G1 — Fourth review
+
+- Result: rejected
+- Verified before review: fixed commit `7060144`, PostgreSQL 17.11 및 전체 Gradle test 성공
+- Passed from prior review: exact event `+1`, 최신 Decision invalidation/effective status, 실제 Replay
+  snapshot flag 대조, used definition/reviewed proposal update 차단
+- Additional P0 feedback:
+  - 사용된 Suite에 새 TestCase를 추가하거나 미실행 Case를 변경해 suite 구성을 사후 변조 가능
+  - 미완료 Run/CaseRun도 Replay evidence로 봉인되고 trial/random seed 동일성 미검증
+- Applied:
+  - TestSuite를 `BUILDING→READY`로 동결하고 READY/사용된 Suite의 Case insert/update/delete 차단
+  - Suite/Case mutation과 TestRun 생성이 동일 Suite row lock으로 직렬화되도록 보강
+  - Replay는 양쪽 Run `COMPLETED`, Case terminal/completed, 동일 trial/random seed/non-null pair group을 강제
+  - incomplete Replay, random seed mismatch, trial mismatch, used Suite case 추가, 미실행 Case mutation
+    PostgreSQL negative test 추가
+- P1 applied:
+  - DRAFT fingerprint 재계산은 deferred approved-contract guard에서 제외하고 positive test 추가
+  - PatchApproval이 Proposal row를 lock하며 APPROVED base/result hash positive/forged test 추가
+  - `08_SYSTEM_ARCHITECTURE.md`의 현재 구조를 Spring Core/PostgreSQL 17/stateless AI로 정정
+- Reverification: 전체 PostgreSQL 검증 후 fixed commit으로 5차 검토 요청

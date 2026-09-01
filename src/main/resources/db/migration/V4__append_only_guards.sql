@@ -179,6 +179,7 @@ DECLARE
     contract_state varchar(30);
     stored_agent_fingerprint sha256_digest;
     stored_release_fingerprint sha256_digest;
+    suite_status varchar(30);
 BEGIN
     SELECT a.workspace_id, ar.agent_artifact_fingerprint, ar.release_fingerprint
       INTO release_workspace, stored_agent_fingerprint, stored_release_fingerprint
@@ -187,14 +188,20 @@ BEGIN
     IF release_workspace IS NULL THEN
         RAISE EXCEPTION 'run release does not exist' USING ERRCODE = '23503';
     END IF;
-    IF NEW.agent_artifact_fingerprint <> stored_agent_fingerprint
-       OR NEW.release_fingerprint <> stored_release_fingerprint THEN
+    IF TG_OP = 'INSERT' AND (
+        NEW.agent_artifact_fingerprint <> stored_agent_fingerprint
+        OR NEW.release_fingerprint <> stored_release_fingerprint
+    ) THEN
         RAISE EXCEPTION 'run fingerprints must match release snapshot' USING ERRCODE = '23514';
     END IF;
     IF NEW.suite_id IS NOT NULL THEN
-        SELECT workspace_id INTO suite_workspace FROM test_suites WHERE id = NEW.suite_id;
+        SELECT workspace_id, status INTO suite_workspace, suite_status
+          FROM test_suites WHERE id = NEW.suite_id FOR UPDATE;
         IF suite_workspace IS NULL OR suite_workspace <> release_workspace THEN
             RAISE EXCEPTION 'run suite and release workspace must match' USING ERRCODE = '23514';
+        END IF;
+        IF suite_status <> 'READY' THEN
+            RAISE EXCEPTION 'test run requires an immutable READY suite' USING ERRCODE = '23514';
         END IF;
     END IF;
     IF NEW.contract_version_id IS NOT NULL THEN
@@ -299,11 +306,7 @@ AS $$
 DECLARE
     is_used boolean;
 BEGIN
-    IF TG_TABLE_NAME = 'test_suites' THEN
-        SELECT EXISTS (SELECT 1 FROM test_runs WHERE suite_id = OLD.id) INTO is_used;
-    ELSE
-        SELECT EXISTS (SELECT 1 FROM test_case_runs WHERE test_case_id = OLD.id) INTO is_used;
-    END IF;
+    SELECT EXISTS (SELECT 1 FROM test_runs WHERE suite_id = OLD.id) INTO is_used;
     IF is_used THEN
         RAISE EXCEPTION 'test definition referenced by a run is immutable' USING ERRCODE = '55000';
     END IF;
@@ -315,9 +318,36 @@ CREATE TRIGGER used_test_suite_guard
 BEFORE UPDATE OR DELETE ON test_suites
 FOR EACH ROW EXECUTE FUNCTION finsec_guard_used_test_definition();
 
+CREATE OR REPLACE FUNCTION finsec_guard_frozen_test_case()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    old_suite uuid;
+    new_suite uuid;
+    suite_status varchar(30);
+    suite_used boolean;
+BEGIN
+    old_suite := CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE OLD.suite_id END;
+    new_suite := CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE NEW.suite_id END;
+    FOR suite_status, suite_used IN
+        SELECT suite.status, EXISTS (SELECT 1 FROM test_runs run WHERE run.suite_id = suite.id)
+          FROM test_suites suite
+         WHERE suite.id = old_suite OR suite.id = new_suite
+         ORDER BY suite.id
+         FOR UPDATE OF suite
+    LOOP
+        IF suite_status = 'READY' OR suite_used THEN
+            RAISE EXCEPTION 'test cases in a READY or used suite are immutable' USING ERRCODE = '55000';
+        END IF;
+    END LOOP;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END;
+$$;
+
 CREATE TRIGGER used_test_case_guard
-BEFORE UPDATE OR DELETE ON test_cases
-FOR EACH ROW EXECUTE FUNCTION finsec_guard_used_test_definition();
+BEFORE INSERT OR UPDATE OR DELETE ON test_cases
+FOR EACH ROW EXECUTE FUNCTION finsec_guard_frozen_test_case();
 
 CREATE OR REPLACE FUNCTION finsec_validate_replay_link_scope()
 RETURNS trigger
@@ -344,6 +374,20 @@ DECLARE
     replay_mode varchar(30);
     baseline_contract uuid;
     replay_contract uuid;
+    baseline_run_status varchar(30);
+    replay_run_status varchar(30);
+    baseline_case_status varchar(30);
+    replay_case_status varchar(30);
+    baseline_trial_index integer;
+    replay_trial_index integer;
+    baseline_random_seed bigint;
+    replay_random_seed bigint;
+    baseline_pair_group uuid;
+    replay_pair_group uuid;
+    baseline_run_completed_at timestamptz;
+    replay_run_completed_at timestamptz;
+    baseline_case_completed_at timestamptz;
+    replay_case_completed_at timestamptz;
     actual_same_agent boolean;
     actual_same_fixture boolean;
     actual_same_model boolean;
@@ -357,18 +401,26 @@ BEGIN
      WHERE finding.id = NEW.finding_id;
     SELECT tr.release_id, tcr.test_case_id, tcr.variant_hash,
            tr.agent_artifact_fingerprint, tr.release_fingerprint, tr.fixture_digest,
-           tr.model_config_hash, tr.mode, tr.contract_version_id
+           tr.model_config_hash, tr.mode, tr.contract_version_id,
+           tr.status, tcr.status, tcr.trial_index, tr.random_seed, tr.baseline_pair_group_id,
+           tr.completed_at, tcr.completed_at
       INTO baseline_release, baseline_case, baseline_variant,
            baseline_agent_fingerprint, baseline_release_fingerprint, baseline_fixture_digest,
-           baseline_model_hash, baseline_mode, baseline_contract
+           baseline_model_hash, baseline_mode, baseline_contract,
+           baseline_run_status, baseline_case_status, baseline_trial_index, baseline_random_seed,
+           baseline_pair_group, baseline_run_completed_at, baseline_case_completed_at
       FROM test_case_runs tcr JOIN test_runs tr ON tr.id = tcr.test_run_id
      WHERE tcr.id = NEW.baseline_case_run_id;
     SELECT tr.release_id, tcr.test_case_id, tcr.variant_hash,
            tr.agent_artifact_fingerprint, tr.release_fingerprint, tr.fixture_digest,
-           tr.model_config_hash, tr.mode, tr.contract_version_id
+           tr.model_config_hash, tr.mode, tr.contract_version_id,
+           tr.status, tcr.status, tcr.trial_index, tr.random_seed, tr.baseline_pair_group_id,
+           tr.completed_at, tcr.completed_at
       INTO replay_release, replay_case, replay_variant,
            replay_agent_fingerprint, replay_release_fingerprint, replay_fixture_digest,
-           replay_model_hash, replay_mode, replay_contract
+           replay_model_hash, replay_mode, replay_contract,
+           replay_run_status, replay_case_status, replay_trial_index, replay_random_seed,
+           replay_pair_group, replay_run_completed_at, replay_case_completed_at
       FROM test_case_runs tcr JOIN test_runs tr ON tr.id = tcr.test_run_id
      WHERE tcr.id = NEW.replay_case_run_id;
     IF finding_release IS NULL OR baseline_release IS NULL OR replay_release IS NULL
@@ -402,6 +454,21 @@ BEGIN
     IF NOT actual_same_agent OR NOT actual_same_fixture OR NOT actual_same_model
        OR NOT actual_same_variant OR NOT actual_policy_difference THEN
         RAISE EXCEPTION 'replay must be a controlled baseline to SEAL replay comparison'
+            USING ERRCODE = '23514';
+    END IF;
+    IF baseline_run_status <> 'COMPLETED' OR replay_run_status <> 'COMPLETED'
+       OR baseline_run_completed_at IS NULL OR replay_run_completed_at IS NULL
+       OR baseline_case_status NOT IN ('PASSED', 'FAILED_SECURITY', 'FAILED_FUNCTIONAL')
+       OR replay_case_status NOT IN ('PASSED', 'FAILED_SECURITY', 'FAILED_FUNCTIONAL')
+       OR baseline_case_completed_at IS NULL OR replay_case_completed_at IS NULL THEN
+        RAISE EXCEPTION 'replay comparison requires completed runs and terminal case results'
+            USING ERRCODE = '23514';
+    END IF;
+    IF baseline_trial_index <> replay_trial_index
+       OR baseline_random_seed IS DISTINCT FROM replay_random_seed
+       OR baseline_pair_group IS NULL
+       OR baseline_pair_group IS DISTINCT FROM replay_pair_group THEN
+        RAISE EXCEPTION 'replay comparison requires the same trial, random seed, and pair group'
             USING ERRCODE = '23514';
     END IF;
     RETURN NEW;
@@ -692,8 +759,10 @@ CREATE CONSTRAINT TRIGGER release_fingerprint_transition_guard
 AFTER UPDATE ON agent_releases
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW
-WHEN (NEW.release_fingerprint IS DISTINCT FROM OLD.release_fingerprint
+WHEN (OLD.lifecycle_state <> 'DRAFT'
+      AND (NEW.release_fingerprint IS DISTINCT FROM OLD.release_fingerprint
       OR NEW.safety_contract_hash IS DISTINCT FROM OLD.safety_contract_hash)
+)
 EXECUTE FUNCTION finsec_validate_release_fingerprint_transition();
 
 CREATE OR REPLACE FUNCTION finsec_validate_patch_approval_scope()
@@ -708,6 +777,7 @@ DECLARE
     result_state varchar(30);
     result_policy_hash sha256_digest;
 BEGIN
+    PERFORM 1 FROM patch_proposals WHERE id = NEW.patch_proposal_id FOR UPDATE;
     SELECT finding.release_id INTO finding_release
       FROM patch_proposals proposal JOIN findings finding ON finding.id = proposal.finding_id
      WHERE proposal.id = NEW.patch_proposal_id;
