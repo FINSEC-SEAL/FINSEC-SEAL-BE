@@ -63,7 +63,8 @@ class MigrationIntegrationTest {
         String hashB = "sha256:" + "b".repeat(64);
         String hashC = "sha256:" + "c".repeat(64);
         String hashD = "sha256:" + "d".repeat(64);
-        seedIntegrityGraph(hashA, hashB, hashC, hashD);
+        String hashE = "sha256:" + "e".repeat(64);
+        seedIntegrityGraph(hashA, hashB, hashC, hashD, hashE);
 
         assertSqlState("55000", () -> jdbcTemplate.update("""
                 insert into release_artifacts
@@ -81,7 +82,7 @@ class MigrationIntegrationTest {
         assertSqlState("55000", () -> jdbcTemplate.update("""
                 update agent_releases set release_fingerprint = ?
                  where id = '0198f200-0000-7000-8000-000000000011'
-                """, hashB));
+                """, hashC));
         assertSqlState("55000", () -> jdbcTemplate.update("""
                 update agent_releases set safety_contract_hash = ?
                  where id = '0198f200-0000-7000-8000-000000000014'
@@ -116,6 +117,14 @@ class MigrationIntegrationTest {
                 update test_case_runs
                    set test_run_id = '0198f200-0000-7000-8000-000000000052'
                  where id = '0198f200-0000-7000-8000-000000000071'
+                """));
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                update test_suites set status = 'TAMPERED'
+                 where id = '0198f200-0000-7000-8000-000000000041'
+                """));
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                update test_cases set expected_invariant = 'TAMPERED'
+                 where id = '0198f200-0000-7000-8000-000000000061'
                 """));
         assertSqlState("23514", () -> jdbcTemplate.update("""
                 insert into test_suites
@@ -159,6 +168,18 @@ class MigrationIntegrationTest {
                      '0198f200-0000-7000-8000-000000000091', 1, now(),
                      'RUN_STARTED', ?, '{}'::jsonb, ?)
                 """, hashA, hashB);
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                insert into execution_events
+                    (id, workspace_id, run_id, test_case_run_id, trace_id, sequence, occurred_at,
+                     event_type, payload_digest, metadata_json, prev_event_hash, event_hash)
+                values
+                    ('0198f200-0000-7000-8000-000000000088',
+                     '0198f1e2-0000-7000-8000-000000000001',
+                     '0198f200-0000-7000-8000-000000000051',
+                     '0198f200-0000-7000-8000-000000000071',
+                     '0198f200-0000-7000-8000-000000000091', 3, now(),
+                     'MODEL_RESPONSE', ?, '{}'::jsonb, ?, ?)
+                """, hashA, hashB, hashD));
         jdbcTemplate.update("""
                 insert into execution_events
                     (id, workspace_id, run_id, test_case_run_id, trace_id, sequence, occurred_at,
@@ -228,6 +249,18 @@ class MigrationIntegrationTest {
                      '0198f200-0000-7000-8000-000000000073',
                      true, true, true, true, true, '{}'::jsonb)
                 """));
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                insert into replay_links
+                    (id, finding_id, baseline_case_run_id, replay_case_run_id,
+                     same_agent_artifact_fingerprint, same_fixture_digest, same_model_config,
+                     same_variant_hash, expected_policy_difference, comparison_json)
+                values
+                    ('0198f200-0000-7000-8000-000000000093',
+                     '0198f200-0000-7000-8000-000000000090',
+                     '0198f200-0000-7000-8000-000000000071',
+                     '0198f200-0000-7000-8000-000000000075',
+                     true, true, false, true, true, '{}'::jsonb)
+                """));
         jdbcTemplate.update("""
                 insert into replay_links
                     (id, finding_id, baseline_case_run_id, replay_case_run_id,
@@ -237,7 +270,7 @@ class MigrationIntegrationTest {
                     ('0198f200-0000-7000-8000-000000000095',
                      '0198f200-0000-7000-8000-000000000090',
                      '0198f200-0000-7000-8000-000000000071',
-                     '0198f200-0000-7000-8000-000000000072',
+                     '0198f200-0000-7000-8000-000000000075',
                      true, true, true, true, true, '{}'::jsonb)
                 """);
         jdbcTemplate.update("""
@@ -259,6 +292,12 @@ class MigrationIntegrationTest {
                      '0198f200-0000-7000-8000-000000000096', 'REJECTED', 'reviewer', 'test', ?,
                      now(), now())
                 """, hashA);
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                update patch_proposals set policy_diff_json = '{"tampered":true}'::jsonb
+                 where id = '0198f200-0000-7000-8000-000000000096'
+                """));
+
+        verifyLatestDecisionInvalidationAtCommit(hashA, hashB, hashD);
 
         assertConcurrentStaleHeadRejected(hashA, hashB, hashC);
 
@@ -287,7 +326,7 @@ class MigrationIntegrationTest {
                 """));
     }
 
-    private void seedIntegrityGraph(String hashA, String hashB, String hashC, String hashD) {
+    private void seedIntegrityGraph(String hashA, String hashB, String hashC, String hashD, String hashE) {
         jdbcTemplate.update("""
                 insert into workspaces (id, name, mode)
                 values ('0198f200-0000-7000-8000-000000000002', 'Other workspace', 'DEMO')
@@ -309,7 +348,7 @@ class MigrationIntegrationTest {
                     ('0198f200-0000-7000-8000-000000000011',
                      '0198f200-0000-7000-8000-000000000003', '1.0.0',
                      'LOAN_DOCUMENT_COMPLETENESS_REVIEW', '1.0', '{}'::jsonb, ?, ?,
-                     'ANALYZED', 'ANALYZED', now(), now()),
+                     'REMEDIATION', 'REMEDIATION', now(), now()),
                     ('0198f200-0000-7000-8000-000000000012',
                      '0198f200-0000-7000-8000-000000000003', '1.0.1',
                      'LOAN_DOCUMENT_COMPLETENESS_REVIEW', '1.0', '{}'::jsonb, ?, ?,
@@ -322,7 +361,7 @@ class MigrationIntegrationTest {
                      '0198f200-0000-7000-8000-000000000003', '1.0.3',
                      'LOAN_DOCUMENT_COMPLETENESS_REVIEW', '1.0', '{}'::jsonb, ?, ?,
                      'PASS', 'PASS', now(), now())
-                """, hashA, hashA, hashB, hashB, hashC, hashC, hashD, hashD);
+                """, hashA, hashA, hashC, hashC, hashD, hashD, hashE, hashE);
         jdbcTemplate.update("""
                 insert into tool_definitions
                     (id, tool_key, version, operation, input_schema_json, output_schema_json, description,
@@ -405,7 +444,42 @@ class MigrationIntegrationTest {
                      '0198f200-0000-7000-8000-000000000041', 'BASELINE', 'COMPLETED', ?, ?, '{}'::jsonb,
                      'v1', ?, ?, 1, 1, now(), now())
                 """, hashA, hashA, hashA, hashA, hashA, hashA, hashA, hashA,
-                       hashB, hashB, hashA, hashA);
+                       hashC, hashC, hashA, hashA);
+        jdbcTemplate.update("""
+                insert into safety_contracts
+                    (id, workspace_id, release_id, contract_key, status, created_at, updated_at)
+                values
+                    ('0198f200-0000-7000-8000-000000000034',
+                     '0198f1e2-0000-7000-8000-000000000001',
+                     '0198f200-0000-7000-8000-000000000011', 'seal-policy', 'APPROVED', now(), now())
+                """);
+        jdbcTemplate.update("""
+                insert into safety_contract_versions
+                    (id, contract_id, version, state, policy_json, policy_hash, validator_version,
+                     validation_json, created_by, approved_by, approved_at, created_at, updated_at)
+                values
+                    ('0198f200-0000-7000-8000-000000000035',
+                     '0198f200-0000-7000-8000-000000000034', 1, 'APPROVED', '{}'::jsonb, ?, '1.0',
+                     '{}'::jsonb, 'reviewer', 'reviewer', now(), now(), now())
+                """, hashC);
+        jdbcTemplate.update("""
+                update agent_releases
+                   set lifecycle_state = 'VERIFYING', effective_status = 'VERIFYING',
+                       safety_contract_hash = ?, release_fingerprint = ?
+                 where id = '0198f200-0000-7000-8000-000000000011'
+                """, hashC, hashB);
+        jdbcTemplate.update("""
+                insert into test_runs
+                    (id, release_id, suite_id, contract_version_id, mode, status,
+                     agent_artifact_fingerprint, release_fingerprint, config_json, fixture_version,
+                     fixture_digest, model_config_hash, total_cases, completed_cases, created_at, updated_at)
+                values
+                    ('0198f200-0000-7000-8000-000000000054',
+                     '0198f200-0000-7000-8000-000000000011',
+                     '0198f200-0000-7000-8000-000000000041',
+                     '0198f200-0000-7000-8000-000000000035', 'SEAL_REPLAY', 'COMPLETED',
+                     ?, ?, '{}'::jsonb, 'v1', ?, ?, 1, 1, now(), now())
+                """, hashA, hashB, hashA, hashA);
         jdbcTemplate.update("""
                 insert into test_case_runs
                     (id, test_run_id, test_case_id, trial_index, status, variant_hash,
@@ -419,8 +493,86 @@ class MigrationIntegrationTest {
                      '0198f200-0000-7000-8000-000000000061', 0, 'PASSED', ?, now(), now()),
                     ('0198f200-0000-7000-8000-000000000073',
                      '0198f200-0000-7000-8000-000000000053',
+                     '0198f200-0000-7000-8000-000000000061', 0, 'PASSED', ?, now(), now()),
+                    ('0198f200-0000-7000-8000-000000000075',
+                     '0198f200-0000-7000-8000-000000000054',
                      '0198f200-0000-7000-8000-000000000061', 0, 'PASSED', ?, now(), now())
-                """, hashA, hashA, hashA);
+                """, hashA, hashA, hashA, hashA);
+    }
+
+    private void verifyLatestDecisionInvalidationAtCommit(String hashA, String hashB, String policyHash) {
+        jdbcTemplate.update("""
+                insert into safety_contracts
+                    (id, workspace_id, release_id, contract_key, status, created_at, updated_at)
+                values
+                    ('0198f200-0000-7000-8000-000000000036',
+                     '0198f1e2-0000-7000-8000-000000000001',
+                     '0198f200-0000-7000-8000-000000000014', 'terminal-policy', 'APPROVED', now(), now())
+                """);
+        jdbcTemplate.update("""
+                insert into safety_contract_versions
+                    (id, contract_id, version, state, policy_json, policy_hash, validation_json,
+                     created_by, approved_by, approved_at, created_at, updated_at)
+                values
+                    ('0198f200-0000-7000-8000-000000000037',
+                     '0198f200-0000-7000-8000-000000000036', 1, 'APPROVED', '{}'::jsonb, ?, '{}'::jsonb,
+                     'reviewer', 'reviewer', now(), now(), now())
+                """, policyHash);
+        jdbcTemplate.update("""
+                insert into release_decisions
+                    (id, release_id, decision, gate_policy_version, input_snapshot_json, input_digest,
+                     proposed_at, confirmed_by, confirmed_at, created_at)
+                values
+                    ('0198f200-0000-7000-8000-000000000106',
+                     '0198f200-0000-7000-8000-000000000014', 'PASS', '1.0', '{}'::jsonb, ?,
+                     now() - interval '2 hours', 'reviewer', now() - interval '1 hour', now() - interval '1 hour'),
+                    ('0198f200-0000-7000-8000-000000000107',
+                     '0198f200-0000-7000-8000-000000000014', 'PASS', '1.0', '{}'::jsonb, ?,
+                     now() - interval '1 hour', 'reviewer', now(), now())
+                """, hashA, hashB);
+        jdbcTemplate.update("""
+                insert into decision_invalidations
+                    (id, release_decision_id, reasons_json, invalidated_by, invalidated_at, created_at)
+                values
+                    ('0198f200-0000-7000-8000-000000000108',
+                     '0198f200-0000-7000-8000-000000000106', '{}'::jsonb, 'reviewer', now(), now())
+                """);
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                update agent_releases
+                   set lifecycle_state = 'NEEDS_REVALIDATION', effective_status = 'NEEDS_REVALIDATION',
+                       safety_contract_hash = ?, release_fingerprint = ?
+                 where id = '0198f200-0000-7000-8000-000000000014'
+                """, policyHash, hashA));
+        jdbcTemplate.update("""
+                insert into decision_invalidations
+                    (id, release_decision_id, reasons_json, invalidated_by, invalidated_at, created_at)
+                values
+                    ('0198f200-0000-7000-8000-000000000109',
+                     '0198f200-0000-7000-8000-000000000107', '{}'::jsonb, 'reviewer', now(), now())
+                """);
+        assertSqlState("23505", () -> jdbcTemplate.update("""
+                insert into decision_invalidations
+                    (id, release_decision_id, reasons_json, invalidated_by, invalidated_at, created_at)
+                values
+                    ('0198f200-0000-7000-8000-000000000110',
+                     '0198f200-0000-7000-8000-000000000107', '{}'::jsonb, 'reviewer', now(), now())
+                """));
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                update agent_releases
+                   set lifecycle_state = 'NEEDS_REVALIDATION', effective_status = 'PASS',
+                       safety_contract_hash = ?, release_fingerprint = ?
+                 where id = '0198f200-0000-7000-8000-000000000014'
+                """, policyHash, hashA));
+        assertThat(jdbcTemplate.update("""
+                update agent_releases
+                   set lifecycle_state = 'NEEDS_REVALIDATION', effective_status = 'NEEDS_REVALIDATION',
+                       safety_contract_hash = ?, release_fingerprint = ?
+                 where id = '0198f200-0000-7000-8000-000000000014'
+                """, policyHash, hashA)).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject("""
+                select effective_status from agent_releases
+                 where id = '0198f200-0000-7000-8000-000000000014'
+                """, String.class)).isEqualTo("NEEDS_REVALIDATION");
     }
 
     private void assertConcurrentStaleHeadRejected(String payloadHash, String currentHead, String nextHead)

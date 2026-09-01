@@ -58,4 +58,27 @@
   - PatchApproval/ReplayLink append-only 및 approval scope guard 추가
   - Sandbox fixture snapshot과 owning TestRun 일치 guard 추가
   - 두 DB connection으로 stale head concurrent append가 block 후 실패하는 테스트 추가
-- Reverification: PostgreSQL negative/concurrency tests 성공 후 fix commit으로 재검토 예정
+- Reverification: PostgreSQL negative/concurrency tests 성공, fixed commit `6153479`로 재검토
+
+## G1 — Third review
+
+- Result: rejected
+- Verified before review: fixed commit만 checkout한 별도 worktree에서 PostgreSQL 17.11 및 전체 Gradle
+  test 성공
+- Additional P0 feedback:
+  - 올바른 이전 hash를 사용한 sequence gap 허용
+  - terminal fingerprint 변경 시 과거 Decision invalidation도 인정하고 effective status 강제가 없음
+  - Replay 비교 boolean을 실제 Run snapshot과 대조하지 않아 위조 가능
+  - 실행에 사용된 TestSuite/TestCase 및 검토 완료 PatchProposal 사후 변경 가능
+- Applied:
+  - event sequence를 현재 head의 정확한 `+1`로 강제하고 silent-gap negative test 추가
+  - 최신 confirmed Decision에 대한 단일 invalidation만 인정하며 terminal 변경 시
+    lifecycle/effective status 모두 `NEEDS_REVALIDATION` 강제
+  - Replay의 finding source, mode, contract, agent/release fingerprint, fixture/model/variant snapshot을
+    DB에서 다시 계산해 전달된 비교 flag와 대조
+  - 사용된 TestSuite/TestCase와 검토 완료 PatchProposal에 update/delete guard 추가
+  - 과거 invalidation 거부·최신 invalidation 성공·잘못된 effective status 거부를 실제 transaction
+    commit 경계에서 검증
+- Reverification: `./gradlew clean test --warning-mode all` 성공. 실제 PostgreSQL 17.11에서
+  silent-gap, Replay flag 위조, 최신 Decision invalidation 및 commit-boundary 전이를 포함한 전체 검증 후
+  fixed commit으로 4차 검토 요청

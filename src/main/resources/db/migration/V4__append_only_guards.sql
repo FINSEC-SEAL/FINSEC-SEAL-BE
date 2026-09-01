@@ -46,9 +46,11 @@ BEGIN
        AND (NEW.release_fingerprint IS DISTINCT FROM OLD.release_fingerprint
             OR NEW.safety_contract_hash IS DISTINCT FROM OLD.safety_contract_hash)
        AND NOT (
-           (OLD.lifecycle_state = 'REMEDIATION' AND NEW.lifecycle_state = 'VERIFYING') OR
+           (OLD.lifecycle_state = 'REMEDIATION' AND NEW.lifecycle_state = 'VERIFYING'
+                AND NEW.effective_status = 'VERIFYING') OR
            (OLD.lifecycle_state IN ('PASS', 'REVIEW', 'BLOCKED')
-                AND NEW.lifecycle_state = 'NEEDS_REVALIDATION')
+                AND NEW.lifecycle_state = 'NEEDS_REVALIDATION'
+                AND NEW.effective_status = 'NEEDS_REVALIDATION')
        ) THEN
         RAISE EXCEPTION 'release fingerprint change requires VERIFYING or NEEDS_REVALIDATION transition'
             USING ERRCODE = '55000';
@@ -290,26 +292,83 @@ CREATE TRIGGER test_case_run_identity_guard
 BEFORE UPDATE OR DELETE ON test_case_runs
 FOR EACH ROW EXECUTE FUNCTION finsec_protect_test_case_run_identity();
 
+CREATE OR REPLACE FUNCTION finsec_guard_used_test_definition()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    is_used boolean;
+BEGIN
+    IF TG_TABLE_NAME = 'test_suites' THEN
+        SELECT EXISTS (SELECT 1 FROM test_runs WHERE suite_id = OLD.id) INTO is_used;
+    ELSE
+        SELECT EXISTS (SELECT 1 FROM test_case_runs WHERE test_case_id = OLD.id) INTO is_used;
+    END IF;
+    IF is_used THEN
+        RAISE EXCEPTION 'test definition referenced by a run is immutable' USING ERRCODE = '55000';
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END;
+$$;
+
+CREATE TRIGGER used_test_suite_guard
+BEFORE UPDATE OR DELETE ON test_suites
+FOR EACH ROW EXECUTE FUNCTION finsec_guard_used_test_definition();
+
+CREATE TRIGGER used_test_case_guard
+BEFORE UPDATE OR DELETE ON test_cases
+FOR EACH ROW EXECUTE FUNCTION finsec_guard_used_test_definition();
+
 CREATE OR REPLACE FUNCTION finsec_validate_replay_link_scope()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 DECLARE
     finding_release uuid;
+    finding_source_case_run uuid;
     baseline_release uuid;
     replay_release uuid;
     baseline_case uuid;
     replay_case uuid;
     baseline_variant sha256_digest;
     replay_variant sha256_digest;
+    baseline_agent_fingerprint sha256_digest;
+    replay_agent_fingerprint sha256_digest;
+    baseline_release_fingerprint sha256_digest;
+    replay_release_fingerprint sha256_digest;
+    baseline_fixture_digest sha256_digest;
+    replay_fixture_digest sha256_digest;
+    baseline_model_hash sha256_digest;
+    replay_model_hash sha256_digest;
+    baseline_mode varchar(30);
+    replay_mode varchar(30);
+    baseline_contract uuid;
+    replay_contract uuid;
+    actual_same_agent boolean;
+    actual_same_fixture boolean;
+    actual_same_model boolean;
+    actual_same_variant boolean;
+    actual_policy_difference boolean;
 BEGIN
-    SELECT release_id INTO finding_release FROM findings WHERE id = NEW.finding_id;
-    SELECT tr.release_id, tcr.test_case_id, tcr.variant_hash
-      INTO baseline_release, baseline_case, baseline_variant
+    SELECT finding.release_id, oracle.test_case_run_id
+      INTO finding_release, finding_source_case_run
+      FROM findings finding
+      JOIN oracle_results oracle ON oracle.id = finding.source_oracle_result_id
+     WHERE finding.id = NEW.finding_id;
+    SELECT tr.release_id, tcr.test_case_id, tcr.variant_hash,
+           tr.agent_artifact_fingerprint, tr.release_fingerprint, tr.fixture_digest,
+           tr.model_config_hash, tr.mode, tr.contract_version_id
+      INTO baseline_release, baseline_case, baseline_variant,
+           baseline_agent_fingerprint, baseline_release_fingerprint, baseline_fixture_digest,
+           baseline_model_hash, baseline_mode, baseline_contract
       FROM test_case_runs tcr JOIN test_runs tr ON tr.id = tcr.test_run_id
      WHERE tcr.id = NEW.baseline_case_run_id;
-    SELECT tr.release_id, tcr.test_case_id, tcr.variant_hash
-      INTO replay_release, replay_case, replay_variant
+    SELECT tr.release_id, tcr.test_case_id, tcr.variant_hash,
+           tr.agent_artifact_fingerprint, tr.release_fingerprint, tr.fixture_digest,
+           tr.model_config_hash, tr.mode, tr.contract_version_id
+      INTO replay_release, replay_case, replay_variant,
+           replay_agent_fingerprint, replay_release_fingerprint, replay_fixture_digest,
+           replay_model_hash, replay_mode, replay_contract
       FROM test_case_runs tcr JOIN test_runs tr ON tr.id = tcr.test_run_id
      WHERE tcr.id = NEW.replay_case_run_id;
     IF finding_release IS NULL OR baseline_release IS NULL OR replay_release IS NULL
@@ -318,9 +377,32 @@ BEGIN
             USING ERRCODE = '23514';
     END IF;
     IF NEW.baseline_case_run_id = NEW.replay_case_run_id
-       OR baseline_case <> replay_case OR baseline_variant <> replay_variant
-       OR NOT NEW.same_variant_hash THEN
-        RAISE EXCEPTION 'replay must preserve test case and variant identity' USING ERRCODE = '23514';
+       OR finding_source_case_run IS DISTINCT FROM NEW.baseline_case_run_id THEN
+        RAISE EXCEPTION 'replay baseline must be the finding source case-run' USING ERRCODE = '23514';
+    END IF;
+
+    actual_same_agent := baseline_agent_fingerprint = replay_agent_fingerprint;
+    actual_same_fixture := baseline_fixture_digest = replay_fixture_digest;
+    actual_same_model := baseline_model_hash = replay_model_hash;
+    actual_same_variant := baseline_case = replay_case AND baseline_variant = replay_variant;
+    actual_policy_difference := baseline_mode = 'BASELINE'
+        AND baseline_contract IS NULL
+        AND replay_mode = 'SEAL_REPLAY'
+        AND replay_contract IS NOT NULL
+        AND baseline_release_fingerprint <> replay_release_fingerprint;
+
+    IF NEW.same_agent_artifact_fingerprint IS DISTINCT FROM actual_same_agent
+       OR NEW.same_fixture_digest IS DISTINCT FROM actual_same_fixture
+       OR NEW.same_model_config IS DISTINCT FROM actual_same_model
+       OR NEW.same_variant_hash IS DISTINCT FROM actual_same_variant
+       OR NEW.expected_policy_difference IS DISTINCT FROM actual_policy_difference THEN
+        RAISE EXCEPTION 'replay comparison flags must match immutable run snapshots'
+            USING ERRCODE = '23514';
+    END IF;
+    IF NOT actual_same_agent OR NOT actual_same_fixture OR NOT actual_same_model
+       OR NOT actual_same_variant OR NOT actual_policy_difference THEN
+        RAISE EXCEPTION 'replay must be a controlled baseline to SEAL replay comparison'
+            USING ERRCODE = '23514';
     END IF;
     RETURN NEW;
 END;
@@ -366,7 +448,7 @@ BEGIN
         IF NEW.sequence <> 1 OR NEW.prev_event_hash IS NOT NULL THEN
             RAISE EXCEPTION 'first run event must have sequence 1 and no previous hash' USING ERRCODE = '23514';
         END IF;
-    ELSIF NEW.sequence <= latest_sequence OR NEW.prev_event_hash IS DISTINCT FROM latest_hash THEN
+    ELSIF NEW.sequence <> latest_sequence + 1 OR NEW.prev_event_hash IS DISTINCT FROM latest_hash THEN
         RAISE EXCEPTION 'event sequence or previous hash does not extend current head' USING ERRCODE = '23514';
     END IF;
     UPDATE run_event_counters SET last_sequence = NEW.sequence WHERE run_id = NEW.run_id;
@@ -574,6 +656,7 @@ AS $$
 DECLARE
     approved_contract_exists boolean;
     invalidation_exists boolean;
+    latest_decision_id uuid;
 BEGIN
     SELECT EXISTS (
         SELECT 1 FROM safety_contract_versions version
@@ -587,14 +670,17 @@ BEGIN
             USING ERRCODE = '23514';
     END IF;
     IF OLD.lifecycle_state IN ('PASS', 'REVIEW', 'BLOCKED') THEN
+        SELECT decision.id INTO latest_decision_id
+          FROM release_decisions decision
+         WHERE decision.release_id = NEW.id
+         ORDER BY decision.confirmed_at DESC, decision.created_at DESC, decision.id DESC
+         LIMIT 1;
         SELECT EXISTS (
-            SELECT 1 FROM release_decisions decision
-            JOIN decision_invalidations invalidation
-              ON invalidation.release_decision_id = decision.id
-            WHERE decision.release_id = NEW.id
+            SELECT 1 FROM decision_invalidations invalidation
+            WHERE invalidation.release_decision_id = latest_decision_id
         ) INTO invalidation_exists;
-        IF NOT invalidation_exists THEN
-            RAISE EXCEPTION 'terminal fingerprint transition requires decision invalidation evidence'
+        IF latest_decision_id IS NULL OR NOT invalidation_exists THEN
+            RAISE EXCEPTION 'terminal fingerprint transition requires latest decision invalidation evidence'
                 USING ERRCODE = '23514';
         END IF;
     END IF;
@@ -653,6 +739,22 @@ $$;
 CREATE TRIGGER patch_approval_scope_guard
 BEFORE INSERT ON patch_approvals
 FOR EACH ROW EXECUTE FUNCTION finsec_validate_patch_approval_scope();
+
+CREATE OR REPLACE FUNCTION finsec_guard_reviewed_patch_proposal()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM patch_approvals WHERE patch_proposal_id = OLD.id) THEN
+        RAISE EXCEPTION 'reviewed patch proposal is immutable' USING ERRCODE = '55000';
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END;
+$$;
+
+CREATE TRIGGER reviewed_patch_proposal_guard
+BEFORE UPDATE OR DELETE ON patch_proposals
+FOR EACH ROW EXECUTE FUNCTION finsec_guard_reviewed_patch_proposal();
 
 CREATE OR REPLACE FUNCTION finsec_validate_sandbox_snapshot()
 RETURNS trigger

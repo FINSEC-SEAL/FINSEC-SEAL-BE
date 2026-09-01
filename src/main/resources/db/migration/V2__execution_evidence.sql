@@ -284,7 +284,7 @@ CREATE INDEX ix_evidence_owner ON evidence_references(owner_type, owner_id);
 
 CREATE TABLE decision_invalidations (
     id uuid PRIMARY KEY,
-    release_decision_id uuid NOT NULL REFERENCES release_decisions(id) ON DELETE RESTRICT,
+    release_decision_id uuid NOT NULL UNIQUE REFERENCES release_decisions(id) ON DELETE RESTRICT,
     reasons_json jsonb NOT NULL,
     invalidated_by varchar(120) NOT NULL,
     invalidated_at timestamptz NOT NULL,
