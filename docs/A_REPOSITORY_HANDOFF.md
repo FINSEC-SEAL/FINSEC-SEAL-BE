@@ -11,10 +11,10 @@ Frontend만 소유한다. Attack/Agent 실행, Policy/Approval 판단, Oracle/Fi
 
 | Repository | A가 수정한 내용 | 사용/검증 | Branch |
 |---|---|---|---|
-| `FINSEC-SEAL-BE` | Spring/PostgreSQL 기반, Agent/Release, manifest/fingerprint, Run/Event/Evidence/Audit 저장, Attestation, fail-closed idempotency recovery | `.env` 설정 후 `docker compose up --build`; `./gradlew clean test --warning-mode all --rerun-tasks` | `codex/role-a-foundation` |
-| `FINSEC-SEAL-FE` | A 운영 콘솔: Agent/Release/Fingerprint/Evidence/Audit/Recovery | `.env` 설정 후 `pnpm install --frozen-lockfile && pnpm dev`; `pnpm typecheck && pnpm test:coverage && pnpm build && pnpm audit --prod` | `codex/role-a-console` |
-| `FINSEC-SEAL-AI` | A 실행 코드 없음. Run/Event/Evidence identity, digest, redaction, append 계약만 문서화 | AI worker 담당이 코드를 추가할 때 `docs/A_ROLE_IMPLEMENTATION.md`를 contract test 기준으로 사용 | `codex/role-a-boundary-docs` |
-| `FINSEC-SEAL-MOCK` | A 실행 코드 없음. fixture version/digest, deterministic reset, synthetic-only, no-egress 계약만 문서화 | Mock 담당이 fixture를 구현할 때 `docs/A_ROLE_IMPLEMENTATION.md`를 증거 snapshot 기준으로 사용 | `codex/role-a-boundary-docs` |
+| `FINSEC-SEAL-BE` | Spring/PostgreSQL 기반, Agent/Release, manifest/fingerprint, Run/Event/Evidence/Audit 저장, Attestation, fail-closed idempotency recovery | `.env` 설정 후 `docker compose up --build`; `./gradlew clean test --warning-mode all --rerun-tasks` | `feat/role-a-foundation` |
+| `FINSEC-SEAL-FE` | A 운영 콘솔: Agent/Release/Fingerprint/Evidence/Audit/Recovery | `.env` 설정 후 `pnpm install --frozen-lockfile && pnpm dev`; `pnpm typecheck && pnpm test:coverage && pnpm build && pnpm audit --prod` | `feat/role-a-console` |
+| `FINSEC-SEAL-AI` | A 실행 코드 없음. Run/Event/Evidence identity, digest, redaction, append 계약만 문서화 | AI worker 담당이 코드를 추가할 때 `docs/A_ROLE_IMPLEMENTATION.md`를 contract test 기준으로 사용 | `feat/role-a-ai-contract` |
+| `FINSEC-SEAL-MOCK` | A 실행 코드 없음. fixture version/digest, deterministic reset, synthetic-only, no-egress 계약만 문서화 | Mock 담당이 fixture를 구현할 때 `docs/A_ROLE_IMPLEMENTATION.md`를 증거 snapshot 기준으로 사용 | `feat/role-a-mock-contract` |
 
 검증에 사용한 고정 기준 SHA는 Backend `793dcbbd`, Frontend `8b14e8a5`,
 AI `cc5b194`, Mock `987c69b`다. 추가 문서 커밋은 실행 코드 기준을 바꾸지 않는다.
