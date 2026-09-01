@@ -142,3 +142,19 @@
   - TestRun 생성↔Suite mutation, Approval insert↔Proposal mutation을 두 connection race로 검증
   - Decision insert가 Release parent row를 lock하도록 해 fingerprint 전이와 직렬화하고 race test 추가
 - Reverification: 전체 PostgreSQL 검증 후 fixed commit으로 7차 검토 요청
+
+## G2 — Agent/Release/Manifest/Fingerprint implementation review
+
+- Scope: Role A의 Agent CRUD/archive, strict Manifest validation, artifact encryption/catalog storage,
+  JCS/NFC fingerprint/diff/integrity, latest Decision invalidation evidence, durable API idempotency
+- Boundary check: Runtime/Attack 실행, Contract/Policy 판단, Oracle/Finding/Metric/Decision 계산은 미구현
+- Security checks:
+  - prompt plaintext가 Release manifest/DB JSON에 남지 않고 AES-256-GCM artifact로만 저장
+  - Manifest remote schema reference, regex lookaround, unknown field, arbitrary adapter, external egress,
+    RAG digest 누락 및 spoofed SafetyContractRef 거부
+  - Tool/RAG name-version catalog drift 거부와 DRAFT 이후 DB immutability 결합
+  - idempotency reservation을 mutation보다 먼저 저장해 response 저장 실패 시 재실행을 fail-closed 처리
+- Reverification: 실제 PostgreSQL 17.11에서 Release lifecycle/catalog/encryption/manual invalidation 및
+  real HTTP idempotent replay/body conflict/missing key/processing reservation 테스트 포함
+  `./gradlew clean test --warning-mode all` 성공
+- Review status: fixed commit을 생성해 선임 G2 리뷰 요청 예정

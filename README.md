@@ -6,7 +6,8 @@ FINSEC SEAL은 합성 금융 Sandbox에서 공격을 실행하고, 금융 업무
 
 ## 현재 상태
 
-Role A(Platform / Data / Evidence)의 공통 Spring Boot 기반과 PostgreSQL 저장 스키마를 구현하고 있습니다.
+Role A(Platform / Data / Evidence)의 공통 Spring Boot 기반, PostgreSQL 저장 무결성,
+Agent/Release/Manifest/Fingerprint API를 구현했습니다.
 현재 코드 기준 Architecture는 [A Architecture Baseline](docs/A_ARCHITECTURE_BASELINE.md)이며,
 기존 `docs/predev` 문서는 요구사항 참고자료로 사용합니다.
 

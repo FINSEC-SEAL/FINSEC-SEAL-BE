@@ -1,0 +1,501 @@
+package com.finsecseal.release;
+
+import tools.jackson.databind.JsonNode;
+import java.nio.charset.StandardCharsets;
+import java.text.Normalizer;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.regex.Pattern;
+import org.springframework.stereotype.Service;
+
+@Service
+public class ManifestValidationService {
+
+    private static final Pattern SEMVER = Pattern.compile("^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?$");
+    private static final Pattern DIGEST = Pattern.compile("^sha256:[0-9a-f]{64}$");
+    private static final Pattern IDENTIFIER = Pattern.compile("^[A-Z][A-Z0-9_]{1,99}$");
+    private static final Pattern BUSINESS_KEY = Pattern.compile("^[a-z0-9][a-z0-9-]{2,79}$");
+    private static final Pattern HOST_LABEL = Pattern.compile("^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$");
+    private static final Set<String> REQUIRED_TOOLS = Set.of(
+            "CASE_CONTEXT_READ",
+            "DOCUMENT_READER",
+            "CUSTOMER_DATA_READ",
+            "LOAN_POLICY_SEARCH",
+            "REVIEW_NOTE_WRITE"
+    );
+    private static final Set<String> REQUIRED_RUNTIME_CONTEXT = Set.of(
+            "caseId", "currentApplicantId", "workflowStage", "allowedDocumentIds"
+    );
+    private static final Set<String> ALLOWED_ADAPTERS = Set.of(
+            "case_context_read",
+            "document_reader",
+            "customer_data_read",
+            "loan_policy_search",
+            "review_note_write",
+            "loan_decision_update",
+            "mock_exfil_collector"
+    );
+    private static final Set<String> TOP_LEVEL_FIELDS = Set.of(
+            "schemaVersion", "agent", "release", "businessPurpose", "model", "systemPrompt", "tools",
+            "ragSources", "networkRequirements", "businessWorkflow", "humanApprovalBoundaries",
+            "runtimeContextRequirements", "safetyContractRef"
+    );
+    private static final Set<String> TOOL_FIELDS = Set.of(
+            "name", "version", "operation", "description", "inputSchema", "outputSchema", "trustLevel",
+            "riskLevel", "dataClassifications", "sideEffectType", "adapterKey"
+    );
+
+    private final DigestService digestService;
+
+    public ManifestValidationService(DigestService digestService) {
+        this.digestService = digestService;
+    }
+
+    public ValidationResult validate(JsonNode manifest) {
+        List<Issue> issues = new ArrayList<>();
+        if (manifest == null || !manifest.isObject()) {
+            return new ValidationResult(false, List.of(error("/", "TYPE", "Manifest must be a JSON object")));
+        }
+        if (manifest.toString().getBytes(StandardCharsets.UTF_8).length > 2 * 1024 * 1024) {
+            issues.add(error("/", "SIZE", "Manifest must not exceed 2 MB"));
+        }
+        rejectUnknown(manifest, "/", TOP_LEVEL_FIELDS, issues);
+        rejectUnknown(manifest.path("agent"), "/agent", Set.of("id", "name"), issues);
+        rejectUnknown(manifest.path("release"), "/release", Set.of("version"), issues);
+        rejectUnknown(manifest.path("businessPurpose"), "/businessPurpose", Set.of("code", "description"), issues);
+        rejectUnknown(manifest.path("model"), "/model", Set.of("provider", "name", "parameters"), issues);
+        rejectUnknown(
+                manifest.path("model").path("parameters"),
+                "/model/parameters",
+                Set.of("temperature", "topP", "maxTokens", "seed"),
+                issues
+        );
+        rejectUnknown(manifest.path("systemPrompt"), "/systemPrompt", Set.of("text", "declaredSha256"), issues);
+        rejectUnknown(
+                manifest.path("networkRequirements"),
+                "/networkRequirements",
+                Set.of("modelProvider", "agentExternalEgress", "allowedHosts"),
+                issues
+        );
+        rejectUnknown(
+                manifest.path("businessWorkflow"),
+                "/businessWorkflow",
+                Set.of("allowedStages", "contextSourceTool", "orderedSteps"),
+                issues
+        );
+        requireText(manifest, "/schemaVersion", "1.0", issues);
+        String agentId = text(manifest, "/agent/id");
+        if (agentId == null || !BUSINESS_KEY.matcher(agentId).matches()) {
+            issues.add(error("/agent/id", "FORMAT", "Agent id must be a lowercase stable business key"));
+        }
+        requireBoundedText(manifest, "/agent/name", 100, issues);
+        String version = text(manifest, "/release/version");
+        if (version == null || !SEMVER.matcher(version).matches()) {
+            issues.add(error("/release/version", "SEMVER", "Release version must be semantic versioning"));
+        }
+        requireText(manifest, "/businessPurpose/code", "LOAN_DOCUMENT_COMPLETENESS_REVIEW", issues);
+        requireBoundedText(manifest, "/businessPurpose/description", 500, issues);
+        requireBoundedText(manifest, "/model/provider", 100, issues);
+        requireBoundedText(manifest, "/model/name", 200, issues);
+        requireObject(manifest, "/model/parameters", issues);
+        validateModelParameters(manifest.path("model").path("parameters"), issues);
+        String prompt = text(manifest, "/systemPrompt/text");
+        if (prompt == null || prompt.isBlank() || prompt.length() > 100_000) {
+            issues.add(error("/systemPrompt/text", "LENGTH", "System prompt must contain 1 to 100,000 characters"));
+        }
+        String declared = text(manifest, "/systemPrompt/declaredSha256");
+        String normalizedPrompt = prompt == null ? "" : Normalizer.normalize(
+                prompt.replace("\r\n", "\n").replace('\r', '\n'),
+                Normalizer.Form.NFC
+        );
+        if (declared != null && (!DIGEST.matcher(declared).matches()
+                || !declared.equals(digestService.sha256(normalizedPrompt)))) {
+            issues.add(error("/systemPrompt/declaredSha256", "DIGEST_MISMATCH", "Declared prompt digest does not match"));
+        }
+        validateTools(manifest.path("tools"), issues);
+        if (!manifest.path("ragSources").isArray()) {
+            issues.add(error("/ragSources", "TYPE", "ragSources must be an array"));
+        } else {
+            validateRagSources(manifest.path("ragSources"), issues);
+        }
+        requireObject(manifest, "/networkRequirements", issues);
+        JsonNode modelProvider = manifest.at("/networkRequirements/modelProvider");
+        if (!modelProvider.isBoolean() || !modelProvider.booleanValue()) {
+            issues.add(error(
+                    "/networkRequirements/modelProvider",
+                    "PROVIDER_REQUIRED",
+                    "P0 requires the configured model provider route"
+            ));
+        }
+        JsonNode externalEgress = manifest.at("/networkRequirements/agentExternalEgress");
+        if (!externalEgress.isBoolean() || externalEgress.booleanValue()) {
+            issues.add(error("/networkRequirements/agentExternalEgress", "EGRESS", "Agent external egress must be false"));
+        }
+        JsonNode allowedHosts = manifest.at("/networkRequirements/allowedHosts");
+        if (!allowedHosts.isArray() || allowedHosts.isEmpty()) {
+            issues.add(error(
+                    "/networkRequirements/allowedHosts",
+                    "TYPE",
+                    "allowedHosts must contain at least one configured provider host label"
+            ));
+        } else {
+            for (int index = 0; index < allowedHosts.size(); index++) {
+                JsonNode host = allowedHosts.get(index);
+                if (!host.isString() || !HOST_LABEL.matcher(host.asString()).matches()
+                        || host.asString().contains("://")) {
+                    issues.add(error(
+                            "/networkRequirements/allowedHosts/" + index,
+                            "HOST_LABEL_ONLY",
+                            "allowedHosts accepts configured host labels, not URLs"
+                    ));
+                }
+            }
+        }
+        requireObject(manifest, "/businessWorkflow", issues);
+        validateBusinessWorkflow(manifest.path("businessWorkflow"), issues);
+        validateHumanBoundary(manifest.path("humanApprovalBoundaries"), issues);
+        JsonNode contexts = manifest.path("runtimeContextRequirements");
+        if (!contexts.isArray() || contexts.isEmpty()) {
+            issues.add(error("/runtimeContextRequirements", "REQUIRED", "Runtime context requirements are required"));
+        } else {
+            Set<String> actual = new HashSet<>();
+            for (int index = 0; index < contexts.size(); index++) {
+                JsonNode context = contexts.get(index);
+                if (!context.isString() || context.asString().isBlank() || !actual.add(context.asString())) {
+                    issues.add(error(
+                            "/runtimeContextRequirements/" + index,
+                            "UNIQUE_TEXT",
+                            "Runtime context entries must be unique non-blank strings"
+                    ));
+                }
+            }
+            Set<String> missing = new HashSet<>(REQUIRED_RUNTIME_CONTEXT);
+            missing.removeAll(actual);
+            if (!missing.isEmpty()) {
+                issues.add(error(
+                        "/runtimeContextRequirements",
+                        "REQUIRED_CONTEXT",
+                        "Required runtime context is missing: " + missing
+                ));
+            }
+        }
+        if (!manifest.path("safetyContractRef").isMissingNode()
+                && !manifest.path("safetyContractRef").isNull()) {
+            issues.add(error(
+                    "/safetyContractRef",
+                    "SERVER_OWNED",
+                    "Safety Contract references are attached by the approval workflow, not by uploaded manifests"
+            ));
+        }
+        return new ValidationResult(issues.stream().noneMatch(issue -> issue.severity() == Severity.ERROR), issues);
+    }
+
+    private void validateTools(JsonNode tools, List<Issue> issues) {
+        if (!tools.isArray() || tools.isEmpty() || tools.size() > 50) {
+            issues.add(error("/tools", "SIZE", "tools must contain 1 to 50 entries"));
+            return;
+        }
+        Set<String> names = new HashSet<>();
+        for (int index = 0; index < tools.size(); index++) {
+            JsonNode tool = tools.get(index);
+            String prefix = "/tools/" + index;
+            if (!tool.isObject()) {
+                issues.add(error(prefix, "TYPE", "Tool entry must be an object"));
+                continue;
+            }
+            rejectUnknown(tool, prefix, TOOL_FIELDS, issues);
+            String name = text(tool, "/name");
+            if (name == null || !IDENTIFIER.matcher(name).matches() || !names.add(name)) {
+                issues.add(error(prefix + "/name", "UNIQUE", "Tool name is required and must be unique"));
+            }
+            String toolVersion = text(tool, "/version");
+            if (toolVersion == null || !SEMVER.matcher(toolVersion).matches()) {
+                issues.add(error(prefix + "/version", "SEMVER", "Tool version must be semantic versioning"));
+            }
+            requireEnum(
+                    tool,
+                    "/operation",
+                    Set.of("READ", "SEARCH", "CREATE", "WRITE", "UPDATE", "POST"),
+                    issues,
+                    prefix
+            );
+            String description = text(tool, "/description");
+            if (description == null || description.isBlank() || description.length() > 1_000) {
+                issues.add(error(prefix + "/description", "LENGTH", "Description must contain 1 to 1,000 characters"));
+            }
+            requireObject(tool, "/inputSchema", issues, prefix);
+            requireObject(tool, "/outputSchema", issues, prefix);
+            validateJsonSchema(tool.path("inputSchema"), prefix + "/inputSchema", issues);
+            validateJsonSchema(tool.path("outputSchema"), prefix + "/outputSchema", issues);
+            requireEnum(tool, "/trustLevel", Set.of("TRUSTED_INTERNAL", "MIXED", "SANDBOXED"), issues, prefix);
+            requireEnum(tool, "/riskLevel", Set.of("LOW", "MEDIUM", "HIGH", "CRITICAL"), issues, prefix);
+            requireEnum(
+                    tool,
+                    "/sideEffectType",
+                    Set.of("NONE", "INTERNAL_WRITE", "HIGH_IMPACT_WRITE", "MOCK_EXTERNAL_WRITE"),
+                    issues,
+                    prefix
+            );
+            if (!tool.path("dataClassifications").isArray() || tool.path("dataClassifications").isEmpty()) {
+                issues.add(error(prefix + "/dataClassifications", "TYPE", "dataClassifications must be an array"));
+            } else {
+                Set<String> classifications = new HashSet<>();
+                for (int classificationIndex = 0;
+                        classificationIndex < tool.path("dataClassifications").size();
+                        classificationIndex++) {
+                    JsonNode classification = tool.path("dataClassifications").get(classificationIndex);
+                    if (!classification.isString()
+                            || !Set.of("NORMAL", "PII", "SENSITIVE_PII", "FINANCIAL", "CREDIT")
+                                    .contains(classification.asString())
+                            || !classifications.add(classification.asString())) {
+                        issues.add(error(
+                                prefix + "/dataClassifications/" + classificationIndex,
+                                "CLASSIFICATION",
+                                "Classification must be allowed and unique"
+                        ));
+                    }
+                }
+            }
+            String adapter = text(tool, "/adapterKey");
+            if (adapter == null || !ALLOWED_ADAPTERS.contains(adapter)) {
+                issues.add(error(prefix + "/adapterKey", "ADAPTER_ALLOWLIST", "adapterKey is not allowlisted"));
+            }
+            if ("EXTERNAL_HTTP".equals(name) && !"mock_exfil_collector".equals(adapter)) {
+                issues.add(error(prefix + "/adapterKey", "MOCK_ONLY", "EXTERNAL_HTTP must use the mock collector"));
+            }
+        }
+        Set<String> missing = new HashSet<>(REQUIRED_TOOLS);
+        missing.removeAll(names);
+        if (!missing.isEmpty()) {
+            issues.add(error("/tools", "REQUIRED_TOOL", "Required tools are missing: " + missing));
+        }
+    }
+
+    private void validateHumanBoundary(JsonNode boundaries, List<Issue> issues) {
+        if (!boundaries.isArray()) {
+            issues.add(error("/humanApprovalBoundaries", "TYPE", "Human approval boundaries must be an array"));
+            return;
+        }
+        boolean loanDecisionBoundary = false;
+        for (JsonNode boundary : boundaries) {
+            if (!boundary.isObject()) {
+                issues.add(error("/humanApprovalBoundaries", "TYPE", "Boundary entry must be an object"));
+                continue;
+            }
+            rejectUnknown(boundary, "/humanApprovalBoundaries", Set.of("resource", "operations", "mode"), issues);
+            Set<String> operations = new HashSet<>();
+            if (boundary.path("operations").isArray()) {
+                boundary.path("operations").forEach(operation -> {
+                    if (operation.isString()) {
+                        operations.add(operation.asString());
+                    }
+                });
+            } else {
+                issues.add(error("/humanApprovalBoundaries/operations", "TYPE", "operations must be an array"));
+            }
+            if ("LoanDecision".equals(boundary.path("resource").asString(""))
+                    && "HUMAN_ONLY".equals(boundary.path("mode").asString(""))
+                    && operations.containsAll(Set.of("APPROVED", "REJECTED"))) {
+                loanDecisionBoundary = true;
+            }
+        }
+        if (!loanDecisionBoundary) {
+            issues.add(error("/humanApprovalBoundaries", "HUMAN_BOUNDARY", "LoanDecision must be HUMAN_ONLY"));
+        }
+    }
+
+    private void requireText(JsonNode root, String pointer, String expected, List<Issue> issues) {
+        requireText(root, pointer, expected, issues, "");
+    }
+
+    private void requireText(JsonNode root, String pointer, String expected, List<Issue> issues, String prefix) {
+        String value = text(root, pointer);
+        if (value == null || value.isBlank() || (expected != null && !expected.equals(value))) {
+            issues.add(error(prefix + pointer, "REQUIRED", expected == null ? "Required text field" : "Must equal " + expected));
+        }
+    }
+
+    private void requireObject(JsonNode root, String pointer, List<Issue> issues) {
+        requireObject(root, pointer, issues, "");
+    }
+
+    private void requireObject(JsonNode root, String pointer, List<Issue> issues, String prefix) {
+        if (!root.at(pointer).isObject()) {
+            issues.add(error(prefix + pointer, "TYPE", "Required object field"));
+        }
+    }
+
+    private void requireBoundedText(JsonNode root, String pointer, int maximum, List<Issue> issues) {
+        String value = text(root, pointer);
+        if (value == null || value.isBlank() || value.length() > maximum) {
+            issues.add(error(pointer, "LENGTH", "Text must contain 1 to " + maximum + " characters"));
+        }
+    }
+
+    private void requireEnum(
+            JsonNode root,
+            String pointer,
+            Set<String> allowed,
+            List<Issue> issues,
+            String prefix
+    ) {
+        String value = text(root, pointer);
+        if (value == null || !allowed.contains(value)) {
+            issues.add(error(prefix + pointer, "ENUM", "Value must be one of " + allowed));
+        }
+    }
+
+    private String text(JsonNode root, String pointer) {
+        JsonNode node = root.at(pointer);
+        return node.isString() ? node.stringValue() : null;
+    }
+
+    private Issue error(String path, String code, String message) {
+        return new Issue(path, code, Severity.ERROR, message);
+    }
+
+    private void rejectUnknown(JsonNode node, String path, Set<String> allowed, List<Issue> issues) {
+        if (!node.isObject()) {
+            return;
+        }
+        node.propertyNames().stream()
+                .filter(field -> !allowed.contains(field))
+                .sorted()
+                .forEach(field -> issues.add(error(
+                        ("/".equals(path) ? "" : path) + "/" + field,
+                        "UNKNOWN_FIELD",
+                        "Unknown field is not allowed"
+                )));
+    }
+
+    private void validateModelParameters(JsonNode parameters, List<Issue> issues) {
+        if (!parameters.isObject()) {
+            return;
+        }
+        if (parameters.has("temperature")) {
+            double value = parameters.path("temperature").asDouble(Double.NaN);
+            if (!Double.isFinite(value) || value < 0 || value > 2) {
+                issues.add(error("/model/parameters/temperature", "RANGE", "temperature must be between 0 and 2"));
+            }
+        }
+        if (parameters.has("topP")) {
+            double value = parameters.path("topP").asDouble(Double.NaN);
+            if (!Double.isFinite(value) || value < 0 || value > 1) {
+                issues.add(error("/model/parameters/topP", "RANGE", "topP must be between 0 and 1"));
+            }
+        }
+        if (!parameters.path("maxTokens").isInt()
+                || parameters.path("maxTokens").intValue() <= 0
+                || parameters.path("maxTokens").intValue() > 1_000_000) {
+            issues.add(error("/model/parameters/maxTokens", "RANGE", "maxTokens must be positive"));
+        }
+        if (parameters.has("seed") && !parameters.path("seed").isIntegralNumber()) {
+            issues.add(error("/model/parameters/seed", "TYPE", "seed must be an integer"));
+        }
+    }
+
+    private void validateRagSources(JsonNode sources, List<Issue> issues) {
+        if (sources.size() > 20) {
+            issues.add(error("/ragSources", "SIZE", "ragSources must contain at most 20 entries"));
+        }
+        Set<String> identities = new HashSet<>();
+        for (int index = 0; index < sources.size(); index++) {
+            JsonNode source = sources.get(index);
+            String path = "/ragSources/" + index;
+            if (!source.isObject()) {
+                issues.add(error(path, "TYPE", "RAG source entry must be an object"));
+                continue;
+            }
+            rejectUnknown(
+                    source,
+                    path,
+                    Set.of("sourceId", "version", "trustLevel", "retrievalConfig", "contentDigest"),
+                    issues
+            );
+            String sourceId = text(source, "/sourceId");
+            String version = text(source, "/version");
+            if (sourceId == null || !BUSINESS_KEY.matcher(sourceId).matches()
+                    || version == null || version.isBlank() || version.length() > 50
+                    || !identities.add(sourceId + "@" + version)) {
+                issues.add(error(path, "UNIQUE", "RAG sourceId/version must be present and unique"));
+            }
+            if (!"TRUSTED_INTERNAL".equals(text(source, "/trustLevel"))) {
+                issues.add(error(path + "/trustLevel", "TRUST", "P0 RAG sources must be TRUSTED_INTERNAL"));
+            }
+            requireObject(source, "/retrievalConfig", issues, path);
+            String digest = text(source, "/contentDigest");
+            if (digest == null || !DIGEST.matcher(digest).matches()) {
+                issues.add(error(path + "/contentDigest", "DIGEST", "contentDigest must be sha256"));
+            }
+        }
+    }
+
+    private void validateBusinessWorkflow(JsonNode workflow, List<Issue> issues) {
+        if (!workflow.isObject()) {
+            return;
+        }
+        JsonNode stages = workflow.path("allowedStages");
+        if (!stages.isArray() || stages.isEmpty()) {
+            issues.add(error("/businessWorkflow/allowedStages", "TYPE", "allowedStages must be a non-empty array"));
+        } else {
+            Set<String> values = new HashSet<>();
+            stages.forEach(stage -> {
+                if (stage.isString()) {
+                    values.add(stage.asString());
+                }
+            });
+            if (!values.contains("DOCUMENT_REVIEW")) {
+                issues.add(error(
+                        "/businessWorkflow/allowedStages",
+                        "WORKFLOW_SCOPE",
+                        "P0 workflow must include DOCUMENT_REVIEW"
+                ));
+            }
+        }
+        if (!"CASE_CONTEXT_READ".equals(text(workflow, "/contextSourceTool"))) {
+            issues.add(error(
+                    "/businessWorkflow/contextSourceTool",
+                    "WORKFLOW_CONTEXT",
+                    "contextSourceTool must be CASE_CONTEXT_READ"
+            ));
+        }
+        JsonNode orderedSteps = workflow.path("orderedSteps");
+        if (!orderedSteps.isMissingNode() && !orderedSteps.isArray()) {
+            issues.add(error("/businessWorkflow/orderedSteps", "TYPE", "orderedSteps must be an array"));
+        }
+    }
+
+    private void validateJsonSchema(JsonNode schema, String path, List<Issue> issues) {
+        if (schema.isObject()) {
+            schema.properties().forEach(entry -> {
+                String field = entry.getKey();
+                JsonNode value = entry.getValue();
+                if ("$ref".equals(field) && (!value.isString() || !value.asString("").startsWith("#"))) {
+                    issues.add(error(path + "/$ref", "REMOTE_REF", "Only local JSON Schema references are allowed"));
+                }
+                if ("pattern".equals(field) && value.isString()
+                        && (value.asString().contains("(?=") || value.asString().contains("(?<"))) {
+                    issues.add(error(path + "/pattern", "REGEX_LOOKAROUND", "Regex lookaround is not allowed"));
+                }
+                validateJsonSchema(value, path + "/" + field, issues);
+            });
+        } else if (schema.isArray()) {
+            for (int index = 0; index < schema.size(); index++) {
+                validateJsonSchema(schema.get(index), path + "/" + index, issues);
+            }
+        }
+    }
+
+    public enum Severity {
+        ERROR,
+        WARNING
+    }
+
+    public record Issue(String path, String code, Severity severity, String message) {
+    }
+
+    public record ValidationResult(boolean valid, List<Issue> issues) {
+    }
+}

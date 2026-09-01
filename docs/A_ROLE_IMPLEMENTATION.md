@@ -19,6 +19,49 @@
 - cross-workspace/run/release evidence scope guards
 - ExecutionEvent/Oracle/Evidence/Audit/Decision/Attestation append-only guards
 - 별도 append-only `decision_invalidations`
+- terminal Run/Case child graph 및 Event commit 순서 DB row-lock 봉인
+
+### G2 — Agent, Release, Manifest and Fingerprint
+
+- Agent 생성/조회/수정/archive API
+- 2 MB strict Manifest validation: unknown field, semantic version, digest, Tool adapter allowlist,
+  JSON Schema remote ref/regex 제한, trusted RAG, no-egress, human-only boundary 검사
+- RFC 8785 JCS + UTF-8 NFC/LF 정규화와 deterministic component/agent/release fingerprint
+- system prompt AES-256-GCM 암호화 저장; Release row에는 redacted manifest만 저장
+- derived ReleaseArtifact와 immutable Tool/RAG catalog/link를 같은 transaction에 저장
+- component digest 기반 redacted semantic diff와 저장 artifact integrity 재검증
+- 최신 ReleaseDecision을 참조하는 append-only manual/contract-change invalidation evidence
+- 모든 mutation에 24시간 durable `Idempotency-Key` 계약. 같은 요청은 status/body/Location/trace를
+  그대로 replay하고 다른 body는 409, 미완료 reservation은 fail-closed 처리
+
+## API usage
+
+모든 POST/PUT/DELETE 요청은 `Idempotency-Key`가 필요하다. 현재 인증 구현 전 actor scope는
+`X-Actor-Id`이며 생략하면 `demo-user`를 사용한다.
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/agents \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: agent-create-001' \
+  -d '{"agentKey":"loan-document-review-agent","name":"Loan Review Agent","purposeSummary":"Document completeness only"}'
+
+curl -sS -X POST http://localhost:8080/api/v1/agents/{agentId}/releases \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: release-create-001' \
+  --data-binary @src/test/resources/fixtures/valid-release-manifest.json
+
+curl -sS -X POST http://localhost:8080/api/v1/releases/{releaseId}:validate \
+  -H 'Idempotency-Key: release-validate-001' -d '{}'
+
+curl -sS -X POST http://localhost:8080/api/v1/releases/{releaseId}:analyze \
+  -H 'Idempotency-Key: release-analyze-001' -d '{}'
+
+curl -sS http://localhost:8080/api/v1/releases/{releaseId}/fingerprint
+curl -sS 'http://localhost:8080/api/v1/releases/{releaseId}/diff?against={olderReleaseId}'
+```
+
+주요 read endpoint는 `GET /api/v1/agents`, `GET /api/v1/agents/{id}`,
+`GET /api/v1/agents/{id}/releases`, `GET /api/v1/releases/{id}`다.
 
 ## Run and verify
 
@@ -51,7 +94,6 @@ docker compose up --build
 
 ## Remaining A stages
 
-- G2: Agent/Release/Manifest/Fingerprint API
 - G3: TestRun persistence, ExecutionEvent, Evidence/Audit, SSE/polling
 - G4: Attestation projection
 - G5: A-owned frontend
