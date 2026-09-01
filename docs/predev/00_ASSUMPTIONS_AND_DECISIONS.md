@@ -18,7 +18,7 @@
 
 | ADR | 상태 | 결정 | 근거·결과 |
 |---|---|---|---|
-| ADR-001 | ACCEPTED | React+TypeScript SPA, FastAPI 모듈러 모놀리스, PostgreSQL 단일 배포를 사용한다. | 팀·기간 대비 운영 단순성. 도메인 모듈 경계는 유지하되 마이크로서비스는 보류한다. |
+| ADR-001 | SUPERSEDED | React+TypeScript SPA, Spring Boot Core state owner, stateless FastAPI AI service, PostgreSQL을 사용한다. | 구현 기준은 `docs/A_ARCHITECTURE_BASELINE.md`. 데이터·Release·Evidence는 Spring Core만 소유한다. |
 | ADR-002 | ACCEPTED | Policy Gateway는 FastAPI 내부 독립 모듈이며 모든 Tool adapter가 우회 불가능하게 하나의 dispatcher를 통과한다. | enforcement reference monitor를 하나로 만든다. 직접 Mock API 호출 경로는 테스트와 코드 규칙으로 금지한다. |
 | ADR-003 | ACCEPTED | Policy 평가는 고정 순서의 custom deterministic evaluator로 구현한다. | 정책 설명 가능성과 낮은 지연. OPA/Cedar는 P2 확장이다. |
 | ADR-004 | ACCEPTED | Sandbox는 `sandbox_namespace=run_id`와 immutable fixture clone을 사용한다. | transaction 장기 유지보다 장애 복구가 쉽고, fixture reset보다 병렬 실행 격리가 명확하다. Run 종료 후 TTL 삭제한다. |

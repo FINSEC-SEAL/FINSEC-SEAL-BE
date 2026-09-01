@@ -42,6 +42,17 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'analyzed release manifest and agent fingerprint are immutable' USING ERRCODE = '55000';
     END IF;
+    IF OLD.lifecycle_state <> 'DRAFT'
+       AND (NEW.release_fingerprint IS DISTINCT FROM OLD.release_fingerprint
+            OR NEW.safety_contract_hash IS DISTINCT FROM OLD.safety_contract_hash)
+       AND NOT (
+           (OLD.lifecycle_state = 'REMEDIATION' AND NEW.lifecycle_state = 'VERIFYING') OR
+           (OLD.lifecycle_state IN ('PASS', 'REVIEW', 'BLOCKED')
+                AND NEW.lifecycle_state = 'NEEDS_REVALIDATION')
+       ) THEN
+        RAISE EXCEPTION 'release fingerprint change requires VERIFYING or NEEDS_REVALIDATION transition'
+            USING ERRCODE = '55000';
+    END IF;
     RETURN NEW;
 END;
 $$;
@@ -77,6 +88,29 @@ FOR EACH ROW EXECUTE FUNCTION finsec_guard_release_child();
 CREATE TRIGGER release_rag_lifecycle_guard
 BEFORE INSERT OR UPDATE OR DELETE ON release_rag_sources
 FOR EACH ROW EXECUTE FUNCTION finsec_guard_release_child();
+
+CREATE OR REPLACE FUNCTION finsec_validate_release_rag_scope()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    release_workspace uuid;
+    source_workspace uuid;
+BEGIN
+    SELECT a.workspace_id INTO release_workspace
+      FROM agent_releases ar JOIN agents a ON a.id = ar.agent_id
+     WHERE ar.id = NEW.release_id;
+    SELECT workspace_id INTO source_workspace FROM rag_sources WHERE id = NEW.rag_source_id;
+    IF release_workspace IS NULL OR source_workspace IS NULL OR release_workspace <> source_workspace THEN
+        RAISE EXCEPTION 'release and RAG source workspace must match' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER release_rag_scope_guard
+BEFORE INSERT OR UPDATE ON release_rag_sources
+FOR EACH ROW EXECUTE FUNCTION finsec_validate_release_rag_scope();
 
 CREATE OR REPLACE FUNCTION finsec_guard_referenced_definition()
 RETURNS trigger
@@ -183,6 +217,119 @@ CREATE TRIGGER test_run_scope_guard
 BEFORE INSERT OR UPDATE ON test_runs
 FOR EACH ROW EXECUTE FUNCTION finsec_validate_test_run_scope();
 
+CREATE OR REPLACE FUNCTION finsec_protect_test_run_identity()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'test run cannot be deleted' USING ERRCODE = '55000';
+    END IF;
+    IF NEW.release_id IS DISTINCT FROM OLD.release_id
+       OR NEW.suite_id IS DISTINCT FROM OLD.suite_id
+       OR NEW.contract_version_id IS DISTINCT FROM OLD.contract_version_id
+       OR NEW.mode IS DISTINCT FROM OLD.mode
+       OR NEW.baseline_pair_group_id IS DISTINCT FROM OLD.baseline_pair_group_id
+       OR NEW.agent_artifact_fingerprint IS DISTINCT FROM OLD.agent_artifact_fingerprint
+       OR NEW.release_fingerprint IS DISTINCT FROM OLD.release_fingerprint
+       OR NEW.config_json IS DISTINCT FROM OLD.config_json
+       OR NEW.fixture_version IS DISTINCT FROM OLD.fixture_version
+       OR NEW.fixture_digest IS DISTINCT FROM OLD.fixture_digest
+       OR NEW.model_config_hash IS DISTINCT FROM OLD.model_config_hash
+       OR NEW.random_seed IS DISTINCT FROM OLD.random_seed THEN
+        RAISE EXCEPTION 'test run identity snapshot is immutable' USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER test_run_identity_guard
+BEFORE UPDATE OR DELETE ON test_runs
+FOR EACH ROW EXECUTE FUNCTION finsec_protect_test_run_identity();
+
+CREATE OR REPLACE FUNCTION finsec_validate_test_case_run_scope()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    run_suite uuid;
+    case_suite uuid;
+BEGIN
+    SELECT suite_id INTO run_suite FROM test_runs WHERE id = NEW.test_run_id;
+    SELECT suite_id INTO case_suite FROM test_cases WHERE id = NEW.test_case_id;
+    IF run_suite IS NULL OR case_suite IS NULL OR run_suite <> case_suite THEN
+        RAISE EXCEPTION 'case-run test case must belong to the run suite' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER test_case_run_scope_guard
+BEFORE INSERT OR UPDATE ON test_case_runs
+FOR EACH ROW EXECUTE FUNCTION finsec_validate_test_case_run_scope();
+
+CREATE OR REPLACE FUNCTION finsec_protect_test_case_run_identity()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'test case run cannot be deleted' USING ERRCODE = '55000';
+    END IF;
+    IF NEW.test_run_id IS DISTINCT FROM OLD.test_run_id
+       OR NEW.test_case_id IS DISTINCT FROM OLD.test_case_id
+       OR NEW.trial_index IS DISTINCT FROM OLD.trial_index
+       OR NEW.variant_hash IS DISTINCT FROM OLD.variant_hash THEN
+        RAISE EXCEPTION 'test case run identity snapshot is immutable' USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER test_case_run_identity_guard
+BEFORE UPDATE OR DELETE ON test_case_runs
+FOR EACH ROW EXECUTE FUNCTION finsec_protect_test_case_run_identity();
+
+CREATE OR REPLACE FUNCTION finsec_validate_replay_link_scope()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    finding_release uuid;
+    baseline_release uuid;
+    replay_release uuid;
+    baseline_case uuid;
+    replay_case uuid;
+    baseline_variant sha256_digest;
+    replay_variant sha256_digest;
+BEGIN
+    SELECT release_id INTO finding_release FROM findings WHERE id = NEW.finding_id;
+    SELECT tr.release_id, tcr.test_case_id, tcr.variant_hash
+      INTO baseline_release, baseline_case, baseline_variant
+      FROM test_case_runs tcr JOIN test_runs tr ON tr.id = tcr.test_run_id
+     WHERE tcr.id = NEW.baseline_case_run_id;
+    SELECT tr.release_id, tcr.test_case_id, tcr.variant_hash
+      INTO replay_release, replay_case, replay_variant
+      FROM test_case_runs tcr JOIN test_runs tr ON tr.id = tcr.test_run_id
+     WHERE tcr.id = NEW.replay_case_run_id;
+    IF finding_release IS NULL OR baseline_release IS NULL OR replay_release IS NULL
+       OR finding_release <> baseline_release OR finding_release <> replay_release THEN
+        RAISE EXCEPTION 'replay finding and both case-runs must belong to the same release'
+            USING ERRCODE = '23514';
+    END IF;
+    IF NEW.baseline_case_run_id = NEW.replay_case_run_id
+       OR baseline_case <> replay_case OR baseline_variant <> replay_variant
+       OR NOT NEW.same_variant_hash THEN
+        RAISE EXCEPTION 'replay must preserve test case and variant identity' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER replay_link_scope_guard
+BEFORE INSERT ON replay_links
+FOR EACH ROW EXECUTE FUNCTION finsec_validate_replay_link_scope();
+
 CREATE OR REPLACE FUNCTION finsec_validate_execution_event()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -192,6 +339,7 @@ DECLARE
     owning_run uuid;
     latest_sequence bigint;
     latest_hash sha256_digest;
+    counter_sequence bigint;
 BEGIN
     SELECT a.workspace_id INTO run_workspace
       FROM test_runs tr JOIN agent_releases ar ON ar.id = tr.release_id
@@ -205,15 +353,23 @@ BEGIN
             RAISE EXCEPTION 'event case-run must belong to event run' USING ERRCODE = '23514';
         END IF;
     END IF;
+    INSERT INTO run_event_counters (run_id, last_sequence)
+    VALUES (NEW.run_id, 0)
+    ON CONFLICT (run_id) DO NOTHING;
+    SELECT last_sequence INTO counter_sequence
+      FROM run_event_counters WHERE run_id = NEW.run_id FOR UPDATE;
     SELECT sequence, event_hash INTO latest_sequence, latest_hash
       FROM execution_events WHERE run_id = NEW.run_id ORDER BY sequence DESC LIMIT 1;
-    IF latest_sequence IS NULL THEN
+    IF counter_sequence IS DISTINCT FROM COALESCE(latest_sequence, 0) THEN
+        RAISE EXCEPTION 'run event counter does not match persisted event head' USING ERRCODE = '23514';
+    ELSIF latest_sequence IS NULL THEN
         IF NEW.sequence <> 1 OR NEW.prev_event_hash IS NOT NULL THEN
             RAISE EXCEPTION 'first run event must have sequence 1 and no previous hash' USING ERRCODE = '23514';
         END IF;
     ELSIF NEW.sequence <= latest_sequence OR NEW.prev_event_hash IS DISTINCT FROM latest_hash THEN
         RAISE EXCEPTION 'event sequence or previous hash does not extend current head' USING ERRCODE = '23514';
     END IF;
+    UPDATE run_event_counters SET last_sequence = NEW.sequence WHERE run_id = NEW.run_id;
     RETURN NEW;
 END;
 $$;
@@ -333,16 +489,58 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     owner_workspace uuid;
+    owner_run uuid;
+    owner_release uuid;
     event_workspace uuid;
+    event_run uuid;
+    event_release uuid;
 BEGIN
     owner_workspace := finsec_evidence_owner_workspace(NEW.owner_type, NEW.owner_id);
     IF owner_workspace <> NEW.workspace_id THEN
         RAISE EXCEPTION 'evidence owner and workspace must match' USING ERRCODE = '23514';
     END IF;
     IF NEW.source_event_id IS NOT NULL THEN
-        SELECT workspace_id INTO event_workspace FROM execution_events WHERE id = NEW.source_event_id;
+        SELECT event.workspace_id, event.run_id, run.release_id
+          INTO event_workspace, event_run, event_release
+          FROM execution_events event JOIN test_runs run ON run.id = event.run_id
+         WHERE event.id = NEW.source_event_id;
         IF event_workspace IS NULL OR event_workspace <> NEW.workspace_id THEN
             RAISE EXCEPTION 'evidence source event and workspace must match' USING ERRCODE = '23514';
+        END IF;
+        CASE NEW.owner_type
+            WHEN 'EXECUTION_EVENT' THEN
+                SELECT run_id, tr.release_id INTO owner_run, owner_release
+                  FROM execution_events event JOIN test_runs tr ON tr.id = event.run_id
+                 WHERE event.id = NEW.owner_id;
+            WHEN 'ORACLE_RESULT' THEN
+                SELECT tcr.test_run_id, tr.release_id INTO owner_run, owner_release
+                  FROM oracle_results result JOIN test_case_runs tcr ON tcr.id = result.test_case_run_id
+                  JOIN test_runs tr ON tr.id = tcr.test_run_id WHERE result.id = NEW.owner_id;
+            WHEN 'TEST_RUN' THEN
+                SELECT id, release_id INTO owner_run, owner_release FROM test_runs WHERE id = NEW.owner_id;
+            WHEN 'TEST_CASE_RUN' THEN
+                SELECT tr.id, tr.release_id INTO owner_run, owner_release
+                  FROM test_case_runs tcr JOIN test_runs tr ON tr.id = tcr.test_run_id
+                 WHERE tcr.id = NEW.owner_id;
+            WHEN 'FINDING' THEN
+                SELECT release_id INTO owner_release FROM findings WHERE id = NEW.owner_id;
+            WHEN 'RELEASE_DECISION' THEN
+                SELECT release_id INTO owner_release FROM release_decisions WHERE id = NEW.owner_id;
+            WHEN 'RELEASE_ATTESTATION' THEN
+                SELECT decision.release_id INTO owner_release
+                  FROM release_attestations attestation
+                  JOIN release_decisions decision ON decision.id = attestation.release_decision_id
+                 WHERE attestation.id = NEW.owner_id;
+            WHEN 'CONTRACT_VERSION' THEN
+                SELECT contract.release_id INTO owner_release
+                  FROM safety_contract_versions version
+                  JOIN safety_contracts contract ON contract.id = version.contract_id
+                 WHERE version.id = NEW.owner_id;
+        END CASE;
+        IF owner_run IS NOT NULL AND owner_run <> event_run THEN
+            RAISE EXCEPTION 'run-scoped evidence owner and source event run must match' USING ERRCODE = '23514';
+        ELSIF owner_run IS NULL AND owner_release <> event_release THEN
+            RAISE EXCEPTION 'release-scoped evidence owner and source event release must match' USING ERRCODE = '23514';
         END IF;
     END IF;
     RETURN NEW;
@@ -369,6 +567,115 @@ CREATE TRIGGER approved_contract_version_guard
 BEFORE UPDATE OR DELETE ON safety_contract_versions
 FOR EACH ROW EXECUTE FUNCTION finsec_guard_approved_contract_version();
 
+CREATE OR REPLACE FUNCTION finsec_validate_release_fingerprint_transition()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    approved_contract_exists boolean;
+    invalidation_exists boolean;
+BEGIN
+    SELECT EXISTS (
+        SELECT 1 FROM safety_contract_versions version
+        JOIN safety_contracts contract ON contract.id = version.contract_id
+        WHERE contract.release_id = NEW.id
+          AND version.state = 'APPROVED'
+          AND version.policy_hash = NEW.safety_contract_hash
+    ) INTO approved_contract_exists;
+    IF NOT approved_contract_exists THEN
+        RAISE EXCEPTION 'release fingerprint transition requires matching approved contract'
+            USING ERRCODE = '23514';
+    END IF;
+    IF OLD.lifecycle_state IN ('PASS', 'REVIEW', 'BLOCKED') THEN
+        SELECT EXISTS (
+            SELECT 1 FROM release_decisions decision
+            JOIN decision_invalidations invalidation
+              ON invalidation.release_decision_id = decision.id
+            WHERE decision.release_id = NEW.id
+        ) INTO invalidation_exists;
+        IF NOT invalidation_exists THEN
+            RAISE EXCEPTION 'terminal fingerprint transition requires decision invalidation evidence'
+                USING ERRCODE = '23514';
+        END IF;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER release_fingerprint_transition_guard
+AFTER UPDATE ON agent_releases
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+WHEN (NEW.release_fingerprint IS DISTINCT FROM OLD.release_fingerprint
+      OR NEW.safety_contract_hash IS DISTINCT FROM OLD.safety_contract_hash)
+EXECUTE FUNCTION finsec_validate_release_fingerprint_transition();
+
+CREATE OR REPLACE FUNCTION finsec_validate_patch_approval_scope()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    finding_release uuid;
+    base_release uuid;
+    base_policy_hash sha256_digest;
+    result_release uuid;
+    result_state varchar(30);
+    result_policy_hash sha256_digest;
+BEGIN
+    SELECT finding.release_id INTO finding_release
+      FROM patch_proposals proposal JOIN findings finding ON finding.id = proposal.finding_id
+     WHERE proposal.id = NEW.patch_proposal_id;
+    SELECT contract.release_id, version.policy_hash INTO base_release, base_policy_hash
+      FROM patch_proposals proposal
+      JOIN safety_contract_versions version ON version.id = proposal.base_contract_version_id
+      JOIN safety_contracts contract ON contract.id = version.contract_id
+     WHERE proposal.id = NEW.patch_proposal_id;
+    IF base_release IS NOT NULL AND (base_release <> finding_release OR NEW.base_hash <> base_policy_hash) THEN
+        RAISE EXCEPTION 'approval base contract must match proposal release and hash' USING ERRCODE = '23514';
+    END IF;
+    IF NEW.decision = 'APPROVED' THEN
+        SELECT contract.release_id, version.state, version.policy_hash
+          INTO result_release, result_state, result_policy_hash
+          FROM safety_contract_versions version JOIN safety_contracts contract ON contract.id = version.contract_id
+         WHERE version.id = NEW.resulting_contract_version_id;
+        IF result_release IS NULL OR result_release <> finding_release OR result_state <> 'APPROVED'
+           OR NEW.result_hash IS DISTINCT FROM result_policy_hash THEN
+            RAISE EXCEPTION 'approved review requires matching approved result contract and hash'
+                USING ERRCODE = '23514';
+        END IF;
+    ELSIF NEW.resulting_contract_version_id IS NOT NULL OR NEW.result_hash IS NOT NULL THEN
+        RAISE EXCEPTION 'rejected review cannot reference a resulting contract' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER patch_approval_scope_guard
+BEFORE INSERT ON patch_approvals
+FOR EACH ROW EXECUTE FUNCTION finsec_validate_patch_approval_scope();
+
+CREATE OR REPLACE FUNCTION finsec_validate_sandbox_snapshot()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    run_fixture_version varchar(50);
+    run_fixture_digest sha256_digest;
+BEGIN
+    SELECT fixture_version, fixture_digest INTO run_fixture_version, run_fixture_digest
+      FROM test_runs WHERE id = NEW.id;
+    IF run_fixture_version IS NULL OR NEW.fixture_version <> run_fixture_version
+       OR NEW.fixture_digest <> run_fixture_digest THEN
+        RAISE EXCEPTION 'sandbox namespace must match owning run fixture snapshot' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER sandbox_namespace_snapshot_guard
+BEFORE INSERT OR UPDATE ON sandbox_namespaces
+FOR EACH ROW EXECUTE FUNCTION finsec_validate_sandbox_snapshot();
+
 CREATE TRIGGER execution_events_append_only BEFORE UPDATE OR DELETE ON execution_events
 FOR EACH ROW EXECUTE FUNCTION finsec_forbid_mutation();
 CREATE TRIGGER oracle_results_append_only BEFORE UPDATE OR DELETE ON oracle_results
@@ -382,4 +689,8 @@ FOR EACH ROW EXECUTE FUNCTION finsec_forbid_mutation();
 CREATE TRIGGER decision_invalidations_append_only BEFORE UPDATE OR DELETE ON decision_invalidations
 FOR EACH ROW EXECUTE FUNCTION finsec_forbid_mutation();
 CREATE TRIGGER release_attestations_append_only BEFORE UPDATE OR DELETE ON release_attestations
+FOR EACH ROW EXECUTE FUNCTION finsec_forbid_mutation();
+CREATE TRIGGER patch_approvals_append_only BEFORE UPDATE OR DELETE ON patch_approvals
+FOR EACH ROW EXECUTE FUNCTION finsec_forbid_mutation();
+CREATE TRIGGER replay_links_append_only BEFORE UPDATE OR DELETE ON replay_links
 FOR EACH ROW EXECUTE FUNCTION finsec_forbid_mutation();

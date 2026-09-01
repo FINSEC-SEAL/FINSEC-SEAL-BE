@@ -1,5 +1,8 @@
 # Deployment and Operations Plan
 
+> Backend runtime과 버전은 `docs/A_ARCHITECTURE_BASELINE.md`를 우선한다. FastAPI는 stateless AI
+> service이며 Core API와 PostgreSQL migration은 Spring Boot가 소유한다.
+
 ## 1. 목표 architecture
 
 | Layer | Local | Competition |
@@ -111,4 +114,3 @@ README 구현 단계에서 copy-paste command를 추가하되 지금 문서는 �
 - mock adapter network spy test.
 - Demo load/reset/live runs, report disclaimer.
 - monitoring contact와 recorded fallback.
-

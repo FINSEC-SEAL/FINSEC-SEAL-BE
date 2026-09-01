@@ -38,3 +38,24 @@
   - 변조/교차 연결/잘못된 digest를 시도하는 PostgreSQL negative tests 추가
 - Reverification: `./gradlew clean test --warning-mode all` 성공. 실제 PostgreSQL 17.11에서
   migration 4개와 negative invariant test를 통과했으며 재검토를 요청했다.
+
+## G1 — Second review
+
+- Result: rejected
+- Additional P0 feedback:
+  - terminal Release fingerprint/hash 변경 보호 및 Decision invalidation 결합 부족
+  - RAG, TestCaseRun, ReplayLink, EvidenceReference에 cross-release/run 연결 가능
+  - TestRun/TestCaseRun identity snapshot 사후 변경 가능
+  - event head 조회가 row lock을 사용하지 않아 concurrent hash-chain fork 가능
+  - PatchApproval/ReplayLink mutation 가능
+- Applied:
+  - fingerprint/hash 변경은 `REMEDIATION→VERIFYING` 또는 terminal→`NEEDS_REVALIDATION`만 허용하고,
+    matching APPROVED Contract 및 terminal DecisionInvalidation을 deferred constraint로 확인
+  - Release↔RAG workspace, Run↔Case suite, Replay finding/case/release/variant,
+    Evidence owner↔source event run/release scope guard 추가
+  - TestRun 및 TestCaseRun identity snapshot reparent/mutation/delete 금지
+  - `run_event_counters FOR UPDATE`로 append 직렬화, contiguous sequence와 head hash 확인
+  - PatchApproval/ReplayLink append-only 및 approval scope guard 추가
+  - Sandbox fixture snapshot과 owning TestRun 일치 guard 추가
+  - 두 DB connection으로 stale head concurrent append가 block 후 실패하는 테스트 추가
+- Reverification: PostgreSQL negative/concurrency tests 성공 후 fix commit으로 재검토 예정

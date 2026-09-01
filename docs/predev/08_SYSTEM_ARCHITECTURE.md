@@ -1,5 +1,8 @@
 # System Architecture
 
+> 구현 기술 기준은 `docs/A_ARCHITECTURE_BASELINE.md`가 우선한다. 아래 FastAPI API/worker 단일
+> Backend 서술은 초기 설계 기록이며, 현재 FastAPI는 stateless AI service로 한정한다.
+
 ## 1. Architecture style
 
 MVP는 **모듈러 모놀리스**다. React SPA, FastAPI API/worker, PostgreSQL을 배포한다. API 프로세스와 worker 프로세스는 같은 Python package를 사용하지만 별도 process type으로 실행한다. Redis/Kafka 없이 PostgreSQL job lease와 LISTEN/NOTIFY(optional)를 사용한다.
