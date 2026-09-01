@@ -37,7 +37,8 @@ class MigrationIntegrationTest {
     @Test
     void appliesAllMigrationsToRealPostgres() {
         Integer appliedMigrations = jdbcTemplate.queryForObject(
-                "select count(*) from flyway_schema_history where success",
+                "select count(*) from flyway_schema_history "
+                        + "where success and version in ('1', '2', '3', '4')",
                 Integer.class
         );
         Integer platformTables = jdbcTemplate.queryForObject(
@@ -126,6 +127,26 @@ class MigrationIntegrationTest {
                  where id = '0198f200-0000-7000-8000-000000000071'
                 """));
         assertSqlState("55000", () -> jdbcTemplate.update("""
+                update test_runs set summary_json = '{"tampered":true}'::jsonb
+                 where id = '0198f200-0000-7000-8000-000000000052'
+                """));
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                update test_case_runs set result_json = '{"tampered":true}'::jsonb
+                 where id = '0198f200-0000-7000-8000-000000000072'
+                """));
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                insert into execution_events
+                    (id, workspace_id, run_id, test_case_run_id, trace_id, sequence, occurred_at,
+                     event_type, payload_digest, metadata_json, event_hash)
+                values
+                    ('0198f200-0000-7000-8000-000000000080',
+                     '0198f1e2-0000-7000-8000-000000000001',
+                     '0198f200-0000-7000-8000-000000000052',
+                     '0198f200-0000-7000-8000-000000000072',
+                     '0198f200-0000-7000-8000-000000000092', 1, now(),
+                     'RUN_STARTED', ?, '{}'::jsonb, ?)
+                """, hashA, hashC));
+        assertSqlState("55000", () -> jdbcTemplate.update("""
                 update test_suites set status = 'TAMPERED'
                  where id = '0198f200-0000-7000-8000-000000000041'
                 """));
@@ -209,8 +230,8 @@ class MigrationIntegrationTest {
                 values
                     ('0198f200-0000-7000-8000-000000000086',
                      '0198f1e2-0000-7000-8000-000000000001',
-                     '0198f200-0000-7000-8000-000000000052',
-                     '0198f200-0000-7000-8000-000000000072',
+                     '0198f200-0000-7000-8000-000000000053',
+                     '0198f200-0000-7000-8000-000000000073',
                      '0198f200-0000-7000-8000-000000000092', 1, now(),
                      'RUN_STARTED', ?, '{}'::jsonb, ?)
                 """, hashA, hashC);
@@ -278,11 +299,31 @@ class MigrationIntegrationTest {
                    set status = 'FAILED_SECURITY', completed_at = now()
                  where id = '0198f200-0000-7000-8000-000000000071'
                 """);
-        jdbcTemplate.update("""
+        assertThat(jdbcTemplate.update("""
                 update test_runs
                    set status = 'COMPLETED', completed_cases = 1, completed_at = now()
                  where id = '0198f200-0000-7000-8000-000000000051'
-                """);
+                """)).isEqualTo(1);
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                update test_runs set completed_cases = 0
+                 where id = '0198f200-0000-7000-8000-000000000051'
+                """));
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                update test_case_runs set security_outcome = 'TAMPERED'
+                 where id = '0198f200-0000-7000-8000-000000000071'
+                """));
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                insert into execution_events
+                    (id, workspace_id, run_id, test_case_run_id, trace_id, sequence, occurred_at,
+                     event_type, payload_digest, metadata_json, prev_event_hash, event_hash)
+                values
+                    ('0198f200-0000-7000-8000-000000000118',
+                     '0198f1e2-0000-7000-8000-000000000001',
+                     '0198f200-0000-7000-8000-000000000051',
+                     '0198f200-0000-7000-8000-000000000071',
+                     '0198f200-0000-7000-8000-000000000091', 3, now(),
+                     'RUN_COMPLETED', ?, '{}'::jsonb, ?, ?)
+                """, hashA, hashC, hashD));
         assertSqlState("23514", () -> jdbcTemplate.update("""
                 insert into replay_links
                     (id, finding_id, baseline_case_run_id, replay_case_run_id,
@@ -524,9 +565,9 @@ class MigrationIntegrationTest {
                      'v1', ?, ?, 42, 1, 1, now(), now(), now()),
                     ('0198f200-0000-7000-8000-000000000053',
                      '0198f200-0000-7000-8000-000000000012',
-                     '0198f200-0000-7000-8000-000000000041', 'BASELINE', 'COMPLETED',
+                     '0198f200-0000-7000-8000-000000000041', 'BASELINE', 'RUNNING',
                      '0198f200-0000-7000-8000-000000000203', ?, ?, '{}'::jsonb,
-                     'v1', ?, ?, 42, 1, 1, now(), now(), now())
+                     'v1', ?, ?, 42, 1, 0, null, now(), now())
                 """, hashA, hashA, hashA, hashA, hashA, hashA, hashA, hashA,
                        hashC, hashC, hashA, hashA);
         jdbcTemplate.update("""
@@ -593,7 +634,7 @@ class MigrationIntegrationTest {
                      '0198f200-0000-7000-8000-000000000061', 0, 'PASSED', ?, now(), now(), now()),
                     ('0198f200-0000-7000-8000-000000000073',
                      '0198f200-0000-7000-8000-000000000053',
-                     '0198f200-0000-7000-8000-000000000061', 0, 'PASSED', ?, now(), now(), now()),
+                     '0198f200-0000-7000-8000-000000000061', 0, 'EXECUTING', ?, null, now(), now()),
                     ('0198f200-0000-7000-8000-000000000075',
                      '0198f200-0000-7000-8000-000000000054',
                      '0198f200-0000-7000-8000-000000000061', 0, 'PASSED', ?, now(), now(), now()),

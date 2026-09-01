@@ -103,3 +103,19 @@
   - PatchApproval이 Proposal row를 lock하며 APPROVED base/result hash positive/forged test 추가
   - `08_SYSTEM_ARCHITECTURE.md`의 현재 구조를 Spring Core/PostgreSQL 17/stateless AI로 정정
 - Reverification: 전체 PostgreSQL 검증 후 fixed commit으로 5차 검토 요청
+
+## G1 — Fifth review
+
+- Result: rejected
+- Verified before review: fixed commit `2c4e87c`, PostgreSQL 17.11 및 전체 Gradle test 성공
+- Passed from prior review: READY/used Suite 동결, DRAFT recompute, completed Replay와 동일
+  trial/seed/pair, APPROVED Patch scope 및 architecture 정정
+- Remaining P0 feedback: terminal TestRun/TestCaseRun 결과가 사후 변경 가능하고 terminal Run에도
+  ExecutionEvent append 가능
+- Applied:
+  - active→terminal 전이는 허용하되 terminal TestRun은 status/count/summary/timestamp를 포함한 모든
+    update/delete를 거부하고, `COMPLETED`는 completedAt 및 전체 case 완료를 강제
+  - terminal TestCaseRun은 outcome/result/timestamp를 포함한 모든 update/delete를 거부
+  - terminal Run의 Event append를 거부하고 `RUN_COMPLETED event commit→Run terminal` 순서를 계약화
+  - 정상 RUNNING→COMPLETED positive와 terminal Run/Case mutation·late Event negative test 추가
+- Reverification: 전체 PostgreSQL 검증 후 fixed commit으로 6차 검토 요청

@@ -248,6 +248,15 @@ BEGIN
        OR NEW.random_seed IS DISTINCT FROM OLD.random_seed THEN
         RAISE EXCEPTION 'test run identity snapshot is immutable' USING ERRCODE = '55000';
     END IF;
+    IF OLD.status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN
+        RAISE EXCEPTION 'terminal test run result is immutable' USING ERRCODE = '55000';
+    END IF;
+    IF NEW.status IN ('COMPLETED', 'FAILED', 'CANCELLED') AND NEW.completed_at IS NULL THEN
+        RAISE EXCEPTION 'terminal test run requires completed_at' USING ERRCODE = '23514';
+    END IF;
+    IF NEW.status = 'COMPLETED' AND NEW.completed_cases <> NEW.total_cases THEN
+        RAISE EXCEPTION 'completed test run requires all cases completed' USING ERRCODE = '23514';
+    END IF;
     RETURN NEW;
 END;
 $$;
@@ -290,6 +299,13 @@ BEGIN
        OR NEW.trial_index IS DISTINCT FROM OLD.trial_index
        OR NEW.variant_hash IS DISTINCT FROM OLD.variant_hash THEN
         RAISE EXCEPTION 'test case run identity snapshot is immutable' USING ERRCODE = '55000';
+    END IF;
+    IF OLD.status IN ('PASSED', 'FAILED_SECURITY', 'FAILED_FUNCTIONAL', 'ERROR', 'CANCELLED') THEN
+        RAISE EXCEPTION 'terminal test case run result is immutable' USING ERRCODE = '55000';
+    END IF;
+    IF NEW.status IN ('PASSED', 'FAILED_SECURITY', 'FAILED_FUNCTIONAL', 'ERROR', 'CANCELLED')
+       AND NEW.completed_at IS NULL THEN
+        RAISE EXCEPTION 'terminal test case run requires completed_at' USING ERRCODE = '23514';
     END IF;
     RETURN NEW;
 END;
@@ -485,16 +501,20 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     run_workspace uuid;
+    run_status varchar(30);
     owning_run uuid;
     latest_sequence bigint;
     latest_hash sha256_digest;
     counter_sequence bigint;
 BEGIN
-    SELECT a.workspace_id INTO run_workspace
+    SELECT a.workspace_id, tr.status INTO run_workspace, run_status
       FROM test_runs tr JOIN agent_releases ar ON ar.id = tr.release_id
       JOIN agents a ON a.id = ar.agent_id WHERE tr.id = NEW.run_id;
     IF run_workspace IS NULL OR run_workspace <> NEW.workspace_id THEN
         RAISE EXCEPTION 'event workspace and run workspace must match' USING ERRCODE = '23514';
+    END IF;
+    IF run_status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN
+        RAISE EXCEPTION 'execution events cannot be appended after run termination' USING ERRCODE = '55000';
     END IF;
     IF NEW.test_case_run_id IS NOT NULL THEN
         SELECT test_run_id INTO owning_run FROM test_case_runs WHERE id = NEW.test_case_run_id;
