@@ -428,3 +428,28 @@
 - Hygiene: `RollbackAuditWriter.java` EOF 공백 제거, `git diff --check` 성공
 - Reverification: PostgreSQL `17.11-alpine` 전체 66 tests,
   실패/오류/skip 0건. fixed commit 후 sixth review 요청 예정
+
+## G2 — Sixth review
+
+- Result: rejected
+- Reviewed fixed commit: `2b6de5df190aa28fa04975232ac6ba693aaace08`
+- Independent verification: lease owner proof/monotonic time, heartbeat ↔ reconciler lock 순서는 일관되고
+  PostgreSQL 17.11 전체 66 tests가 통과함
+- Remaining P1 feedback:
+  - 이미 배포됐을 수 있는 Flyway `V9__idempotency_execution_lease.sql`을 수정해,
+    기존 V9 DB가 startup validation checksum mismatch로 중단될 수 있음
+  - clean-database 테스트만으로는 이 upgrade 경로가 검증되지 않음
+- Gate: G2 FAIL
+
+## G2 — Sixth review feedback applied
+
+- `V9` 파일을 부모 commit `089cfcdc` 바이트와 동일하게 복원하고
+  SHA-256 `09e79ccfb30a6a68fdc44be96700c10692cb17e2cba3f27d1a7645f41e14fc05`를 테스트에 고정
+- lease owner proof/monotonic update 함수 교체를 새
+  `V10__application_instance_lease_owner_guard.sql`로 이동
+- 실제 PostgreSQL 17.11에 V1–V9만 우선 적용한 뒤 현재 Flyway로 V10 1건을
+  upgrade하고 checksum validation과 proof 없는 lease update 거부를 확인하는 통합 테스트 추가
+- `MigrationIntegrationTest`의 clean-database migration expectation을 V1–V10으로 갱신
+- Reverification: targeted upgrade test PASS; `./gradlew clean test --warning-mode all --rerun-tasks`
+  전체 67 tests, 실패/오류/skip 0건; `git diff --check` PASS; V9 바이트 일치 PASS
+- Gate: fixed commit 생성 후 seventh review 요청

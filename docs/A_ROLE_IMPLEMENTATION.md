@@ -37,6 +37,8 @@
   fail-closed 멱등성 상태 머신과 audited `RELEASE`/`COMPLETE` 운영자 복구
 - 인스턴스 메모리의 256-bit secret/DB hash proof로 request completion과 lease heartbeat를
   소유자에게 귀속시키고, stale reconciliation은 locked lease를 건너뛰어 heartbeat와 경합하지 않음
+- 이미 적용된 Flyway migration은 불변으로 유지하고 lease owner guard 보강은
+  `V10`으로 분리; `V9 적용 DB → V10` 실제 upgrade 통합 테스트로 checksum/동작 검증
 - 잘못된 복구 인증을 멱등성 예약 전에 거부하고, 복구 응답의 status/content type/
   Location/trace/body digest 전체를 하나의 canonical response digest로 봉인
 - transaction rollback 후 메인 pool과 분리된 전용 2-connection audit pool에서 동기 commit하는
@@ -134,6 +136,7 @@ response body의 Base64를 함께 보낸다. 복구 row와 audit는 불변이며
 ```
 
 이 테스트는 실제 `postgres:17.11-alpine`을 시작하므로 Docker가 필요하다. H2로 대체하지 않는다.
+깨끗한 DB migration과 이미 V9이 적용된 DB의 V10 upgrade 경로를 둘 다 검증한다.
 
 ```bash
 cp .env.example .env
@@ -157,7 +160,8 @@ docker compose up --build
 - Contract validator 및 Gateway
 - Oracle/Finding/Gate/Decision 계산
 
-## Remaining A stages
+## Handoff state
 
-- G5: A-owned frontend
-- G6: full verification and handoff
+- G1–G4 Backend A 범위 구현 완료
+- G5 Frontend A 운영 콘솔 구현 완료
+- 레포별 작업/사용/연동 순서는 `docs/A_REPOSITORY_HANDOFF.md` 참조
