@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.finsecseal.agent.AgentService;
+import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -54,6 +55,12 @@ class IdempotencyRecoveryIntegrationTest {
     @Autowired
     DigestService digestService;
 
+    @Autowired
+    CanonicalJsonService canonicalJsonService;
+
+    @Autowired
+    IdempotencyInstanceLease instanceLease;
+
     private final HttpClient client = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
             .build();
@@ -65,7 +72,7 @@ class IdempotencyRecoveryIntegrationTest {
         String originalBody = """
                 {"agentKey":"recovered-agent-%s","name":"Recovered","purposeSummary":"test"}
                 """.formatted(suffix);
-        UUID recordId = seedExpired(originalKey, originalBody);
+        UUID recordId = seedRecoveryRequired(originalKey, originalBody);
         ObjectNode recovery = recoveryRequest(originalKey, originalBody, "RELEASE", null);
 
         HttpResponse<String> pending = getPending();
@@ -74,17 +81,23 @@ class IdempotencyRecoveryIntegrationTest {
                 .anySatisfy(item -> assertThat(item.path("idempotencyRecordId").asString())
                         .isEqualTo(recordId.toString()));
 
+        String recoveryCommandKey = "recovery-release-command-" + suffix;
         HttpResponse<String> unauthorized = postRecovery(
                 recovery,
-                "recovery-auth-fail-" + suffix,
+                recoveryCommandKey,
                 "wrong-operator-recovery-key-value"
         );
         assertThat(unauthorized.statusCode()).isEqualTo(403);
         assertThat(recordCount(recordId)).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from api_idempotency_records
+                 where request_path = '/api/v1/platform/idempotency-recoveries'
+                   and idempotency_key = ?
+                """, Integer.class, recoveryCommandKey)).isZero();
 
         HttpResponse<String> recovered = postRecovery(
                 recovery,
-                "recovery-release-command-" + suffix,
+                recoveryCommandKey,
                 RECOVERY_KEY
         );
         assertThat(recovered.statusCode()).isEqualTo(201);
@@ -121,7 +134,7 @@ class IdempotencyRecoveryIntegrationTest {
         String originalBody = """
                 {"agentKey":"already-created-%s","name":"Already Created","purposeSummary":"test"}
                 """.formatted(suffix);
-        UUID recordId = seedExpired(originalKey, originalBody);
+        UUID recordId = seedRecoveryRequired(originalKey, originalBody);
         UUID responseTraceId = UUID.randomUUID();
         String verifiedBody = "{\"operatorVerified\":true}";
         ObjectNode completion = objectMapper.createObjectNode()
@@ -140,8 +153,26 @@ class IdempotencyRecoveryIntegrationTest {
                 RECOVERY_KEY
         );
         assertThat(recovered.statusCode()).isEqualTo(201);
-        assertThat(objectMapper.readTree(recovered.body()).at("/data/stateAfterRecovery").asString())
+        JsonNode recoveryResponse = objectMapper.readTree(recovered.body());
+        assertThat(recoveryResponse.at("/data/stateAfterRecovery").asString())
                 .isEqualTo("COMPLETED");
+        ObjectNode responseEnvelope = objectMapper.createObjectNode()
+                .put("status", 201)
+                .put("contentType", "application/json")
+                .put("location", "/api/v1/agents/operator-confirmed")
+                .put("traceId", responseTraceId.toString())
+                .put("bodyDigest", digestService.sha256(verifiedBody.getBytes(StandardCharsets.UTF_8)));
+        String expectedResponseDigest = digestService.sha256(
+                canonicalJsonService.canonicalize(responseEnvelope)
+        );
+        assertThat(recoveryResponse.at("/data/responseDigest").asString())
+                .isEqualTo(expectedResponseDigest)
+                .isNotEqualTo(digestService.sha256(verifiedBody.getBytes(StandardCharsets.UTF_8)));
+        assertThat(jdbcTemplate.queryForObject(
+                "select response_digest from idempotency_recoveries where idempotency_record_id = ?",
+                String.class,
+                recordId
+        )).isEqualTo(expectedResponseDigest);
         assertThat(jdbcTemplate.queryForObject(
                 "select state from api_idempotency_records where id = ?",
                 String.class,
@@ -162,21 +193,151 @@ class IdempotencyRecoveryIntegrationTest {
         )).isZero();
     }
 
-    private UUID seedExpired(String key, String body) {
+    @Test
+    void databaseRejectsForgedRecoveryForActiveOrMismatchedReservation() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String body = "{\"active\":true}";
+        UUID activeId = seedProcessing("active-" + suffix, body, instanceLease.instanceId(), false);
+
+        assertSqlState("23514", () -> insertRecovery(
+                activeId,
+                "active-" + suffix,
+                semanticRequestDigest(body),
+                Instant.now().plusSeconds(60),
+                "role-a-test"
+        ));
+        assertSqlState("55000", () -> jdbcTemplate.update(
+                "delete from api_idempotency_records where id = ?",
+                activeId
+        ));
+
+        UUID readyId = seedRecoveryRequired("mismatch-" + suffix, body);
+        Instant expiresAt = jdbcTemplate.queryForObject(
+                "select expires_at from api_idempotency_records where id = ?",
+                java.sql.Timestamp.class,
+                readyId
+        ).toInstant();
+        assertSqlState("23514", () -> insertRecovery(
+                readyId,
+                "different-key-" + suffix,
+                semanticRequestDigest(body),
+                expiresAt,
+                "role-a-test"
+        ));
+    }
+
+    @Test
+    void operatorCannotRecoverExpiredReservationWhileOwningInstanceIsStillActive() throws Exception {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String key = "still-active-" + suffix;
+        String body = "{\"active\":true}";
+        UUID recordId = seedProcessing(key, body, instanceLease.instanceId(), true);
+        ObjectNode request = recoveryRequest(key, body, "RELEASE", null);
+
+        HttpResponse<String> response = postRecovery(
+                request,
+                "active-recovery-command-" + suffix,
+                RECOVERY_KEY
+        );
+
+        assertThat(response.statusCode()).isEqualTo(409);
+        assertThat(objectMapper.readTree(response.body()).path("code").asString())
+                .isEqualTo("IDEMPOTENCY_IN_PROGRESS");
+        assertThat(jdbcTemplate.queryForObject(
+                "select state from api_idempotency_records where id = ?",
+                String.class,
+                recordId
+        )).isEqualTo("PROCESSING");
+    }
+
+    @Test
+    void staleOwnerLeaseTransitionsExpiredProcessingToRecoveryRequired() {
+        UUID staleInstance = UUID.randomUUID();
+        Instant stale = Instant.now().minusSeconds(120);
+        jdbcTemplate.update("""
+                insert into application_instance_leases (id, started_at, heartbeat_at)
+                values (?, ?, ?)
+                """, staleInstance, java.sql.Timestamp.from(stale), java.sql.Timestamp.from(stale));
+        UUID recordId = seedProcessing(
+                "stale-owner-" + UUID.randomUUID().toString().substring(0, 8),
+                "{\"orphan\":true}",
+                staleInstance,
+                true
+        );
+
+        instanceLease.heartbeatAndReconcile();
+
+        assertThat(jdbcTemplate.queryForMap("""
+                select state, recovery_reason from api_idempotency_records where id = ?
+                """, recordId)).containsEntry("state", "RECOVERY_REQUIRED")
+                .containsEntry("recovery_reason", "OWNER_LEASE_EXPIRED");
+    }
+
+    private UUID seedRecoveryRequired(String key, String body) {
         UUID id = UUID.randomUUID();
+        Instant finishedAt = Instant.now().minusSeconds(30);
         jdbcTemplate.update("""
                 insert into api_idempotency_records
                     (id, workspace_id, actor_id, http_method, request_path, idempotency_key,
-                     request_digest, state, expires_at)
-                values (?, ?, 'role-a-test', 'POST', '/api/v1/agents', ?, ?, 'PROCESSING', ?)
+                     request_digest, state, expires_at, owner_instance_id,
+                     execution_finished_at, recovery_reason)
+                values (?, ?, 'role-a-test', 'POST', '/api/v1/agents', ?, ?,
+                        'RECOVERY_REQUIRED', ?, ?, ?, 'HTTP_5XX_RESPONSE')
                 """,
                 id,
                 AgentService.DEMO_WORKSPACE_ID,
                 key,
                 semanticRequestDigest(body),
-                java.sql.Timestamp.from(Instant.now().minusSeconds(60))
+                java.sql.Timestamp.from(Instant.now().minusSeconds(60)),
+                instanceLease.instanceId(),
+                java.sql.Timestamp.from(finishedAt)
         );
         return id;
+    }
+
+    private UUID seedProcessing(String key, String body, UUID owner, boolean expired) {
+        UUID id = UUID.randomUUID();
+        jdbcTemplate.update("""
+                insert into api_idempotency_records
+                    (id, workspace_id, actor_id, http_method, request_path, idempotency_key,
+                     request_digest, state, expires_at, owner_instance_id)
+                values (?, ?, 'role-a-test', 'POST', '/api/v1/agents', ?, ?, 'PROCESSING', ?, ?)
+                """,
+                id,
+                AgentService.DEMO_WORKSPACE_ID,
+                key,
+                semanticRequestDigest(body),
+                java.sql.Timestamp.from(expired
+                        ? Instant.now().minusSeconds(60)
+                        : Instant.now().plusSeconds(60)),
+                owner
+        );
+        return id;
+    }
+
+    private void insertRecovery(
+            UUID recordId,
+            String key,
+            String digest,
+            Instant originalExpiry,
+            String originalActor
+    ) {
+        jdbcTemplate.update("""
+                insert into idempotency_recoveries
+                    (id, workspace_id, idempotency_record_id, actor_id, http_method, request_path,
+                     idempotency_key, request_digest, resolution, verification_reference,
+                     recovered_by, original_expires_at, recovered_at)
+                values (?, ?, ?, ?, 'POST', '/api/v1/agents', ?, ?, 'RELEASE',
+                        'ops:incident/FORGED-0001', 'operator:forged', ?, now())
+                """,
+                UUID.randomUUID(),
+                AgentService.DEMO_WORKSPACE_ID,
+                recordId,
+                originalActor,
+                key,
+                digest,
+                java.sql.Timestamp.from(originalExpiry)
+        );
     }
 
     private ObjectNode recoveryRequest(

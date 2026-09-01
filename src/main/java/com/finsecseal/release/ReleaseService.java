@@ -99,7 +99,15 @@ public class ReleaseService {
             throw new BusinessException(ErrorCode.MANIFEST_INVALID, "Manifest agent.id must match Agent agentKey");
         }
 
-        FingerprintService.Result fingerprint = fingerprintService.fingerprint(manifest, null);
+        FingerprintService.Result fingerprint;
+        try {
+            fingerprint = fingerprintService.fingerprint(manifest, null);
+        } catch (IllegalArgumentException exception) {
+            throw new BusinessException(
+                    ErrorCode.MANIFEST_INVALID,
+                    "Manifest canonicalization failed: " + exception.getMessage()
+            );
+        }
         JsonNode storedManifest = redactPrompt(fingerprint.normalizedManifest());
         AgentReleaseEntity release = new AgentReleaseEntity(
                 agentId,

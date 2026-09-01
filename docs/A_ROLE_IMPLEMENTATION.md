@@ -33,8 +33,12 @@
 - 최신 ReleaseDecision을 참조하는 append-only manual/contract-change invalidation evidence
 - 모든 mutation에 24시간 durable `Idempotency-Key` 계약. 같은 요청은 status/body/Location/trace를
   그대로 replay하고 다른 body는 409, 미완료 reservation은 fail-closed 처리
-- 만료 PROCESSING reservation의 운영자 pending 조회 및 audited `RELEASE`/`COMPLETE` 복구 계약
-- rollback-safe system prompt plaintext 접근 audit
+- 인스턴스 lease/heartbeat로 실행 주체를 추적하는 `PROCESSING → RECOVERY_REQUIRED`
+  fail-closed 멱등성 상태 머신과 audited `RELEASE`/`COMPLETE` 운영자 복구
+- 잘못된 복구 인증을 멱등성 예약 전에 거부하고, 복구 응답의 status/content type/
+  Location/trace/body digest 전체를 하나의 canonical response digest로 봉인
+- transaction rollback 후 bounded async worker의 새 transaction으로 복원하는 system prompt
+  plaintext 접근 audit
 
 ### G3 — TestRun, Trace, Evidence and Audit delivery
 
@@ -51,7 +55,10 @@
 - RFC 8785+NFC deterministic JSON document hash와 immutable JSON/HTML 저장
 - 한국어/영어 내부 평가 disclaimer를 DB trigger까지 고정
 - Decision invalidation 뒤 document/hash는 보존하고 응답과 HTML에 stale/NEEDS_REVALIDATION 표시
-- 현재 Release가 변경됐어도 당시 Decision snapshot으로 historical Attestation 재현
+- 현재 Release lifecycle이 `VERIFYING` 등으로 다시 이동해도 불변 Decision snapshot과
+  append-only invalidation이 있으면 historical Attestation을 재현
+- Release row lock과 DB latest-decision guard로 Decision/Invalidation 경합을 직렬화하고,
+  TestSuite/Run/Finding 출처 closure와 저장된 JSON/hash/HTML의 기대 projection 일치를 매번 재검증
 
 ## API usage
 
@@ -88,9 +95,15 @@ curl -sS 'http://localhost:8080/api/v1/releases/{releaseId}/evidence-export?form
 
 ### Idempotency operator recovery
 
-자동 만료 재실행은 원 요청이 실제로 commit됐는지 알 수 없어 금지한다. 먼저 별도 시스템/DB/업무 결과로
-원 요청 결과를 확인하고, `.env`의 `FINSEC_IDEMPOTENCY_RECOVERY_KEY`를 32 bytes 이상 random 값으로
-설정한다.
+시간만 지났다고 원 요청을 자동 재실행하면 commit 여부를 알 수 없으므로 금지한다.
+정상 응답은 `COMPLETED`, 5xx/예외이 발생한 실행은 즉시 `RECOVERY_REQUIRED`,
+응답 전 인스턴스가 죽은 경우는 reservation TTL과 owner lease stale 시간이 모두 지난 후에만
+`RECOVERY_REQUIRED`로 전환한다. 이 상태만 pending API에 노출된다.
+
+복구 전에 반드시 별도 시스템/DB/업무 결과로 원 요청 결과를 확인하고,
+`.env`의 `FINSEC_IDEMPOTENCY_RECOVERY_KEY`를 32 bytes 이상 random 값으로 설정한다.
+`FINSEC_IDEMPOTENCY_INSTANCE_HEARTBEAT_MS`는 `FINSEC_IDEMPOTENCY_INSTANCE_STALE_AFTER`보다
+충분히 짧게 유지한다(기본 5초/30초).
 
 ```bash
 # 복구 대상 조회: 응답의 actor/method/path/key/requestDigest를 그대로 사용
@@ -109,6 +122,8 @@ curl -sS -X POST http://localhost:8080/api/v1/platform/idempotency-recoveries \
 
 이미 실행됐음을 확인한 경우에는 `resolution=COMPLETE`와 원래 status/contentType/Location/traceId 및
 response body의 Base64를 함께 보낸다. 복구 row와 audit는 불변이며 request identity와 다른 값은 거부된다.
+잘못된 운영자 키는 명령용 `Idempotency-Key`를 예약하기 전에 403으로 종료되므로,
+같은 명령 키로 올바른 인증을 재시도할 수 있다.
 
 ## Run and verify
 

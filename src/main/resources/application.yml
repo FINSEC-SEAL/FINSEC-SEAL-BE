@@ -42,6 +42,8 @@ finsec:
   idempotency:
     ttl: ${FINSEC_IDEMPOTENCY_TTL:24h}
     recovery-key: ${FINSEC_IDEMPOTENCY_RECOVERY_KEY:}
+    instance-stale-after: ${FINSEC_IDEMPOTENCY_INSTANCE_STALE_AFTER:30s}
+    instance-heartbeat-ms: ${FINSEC_IDEMPOTENCY_INSTANCE_HEARTBEAT_MS:5000}
   sse:
     timeout: 30m
     heartbeat: 15s

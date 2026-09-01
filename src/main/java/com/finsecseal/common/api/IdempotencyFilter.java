@@ -44,17 +44,20 @@ public class IdempotencyFilter extends OncePerRequestFilter {
     private final JdbcTemplate jdbcTemplate;
     private final DigestService digestService;
     private final ObjectMapper objectMapper;
+    private final IdempotencyInstanceLease instanceLease;
     private final Duration ttl;
 
     public IdempotencyFilter(
             JdbcTemplate jdbcTemplate,
             DigestService digestService,
             ObjectMapper objectMapper,
+            IdempotencyInstanceLease instanceLease,
             @Value("${finsec.idempotency.ttl:24h}") Duration ttl
     ) {
         this.jdbcTemplate = jdbcTemplate;
         this.digestService = digestService;
         this.objectMapper = objectMapper;
+        this.instanceLease = instanceLease;
         this.ttl = ttl;
     }
 
@@ -130,7 +133,14 @@ public class IdempotencyFilter extends OncePerRequestFilter {
 
         CachedBodyRequest cachedRequest = new CachedBodyRequest(request, body);
         ContentCachingResponseWrapper cachedResponse = new ContentCachingResponseWrapper(response);
-        filterChain.doFilter(cachedRequest, cachedResponse);
+        try {
+            filterChain.doFilter(cachedRequest, cachedResponse);
+        } catch (ServletException | IOException | RuntimeException | Error exception) {
+            markRecoveryRequired(
+                    actor, request.getMethod(), path, key, requestDigest, "REQUEST_CHAIN_FAILED"
+            );
+            throw exception;
+        }
         byte[] responseBody = cachedResponse.getContentAsByteArray();
         if (cachedResponse.getStatus() < 500) {
             store(
@@ -144,6 +154,10 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                     cachedResponse.getHeader(HttpHeaders.LOCATION),
                     cachedResponse.getHeader("X-Trace-Id"),
                     responseBody
+            );
+        } else {
+            markRecoveryRequired(
+                    actor, request.getMethod(), path, key, requestDigest, "HTTP_5XX_RESPONSE"
             );
         }
         cachedResponse.copyBodyToResponse();
@@ -175,8 +189,8 @@ public class IdempotencyFilter extends OncePerRequestFilter {
         return jdbcTemplate.update("""
                 insert into api_idempotency_records
                     (id, workspace_id, actor_id, http_method, request_path, idempotency_key,
-                     request_digest, state, expires_at)
-                values (?, ?, ?, ?, ?, ?, ?, 'PROCESSING', ?)
+                     request_digest, state, expires_at, owner_instance_id)
+                values (?, ?, ?, ?, ?, ?, ?, 'PROCESSING', ?, ?)
                 on conflict (workspace_id, actor_id, http_method, request_path, idempotency_key)
                 do nothing
                 """,
@@ -187,7 +201,8 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                 path,
                 key,
                 requestDigest,
-                Timestamp.from(now.plus(ttl))
+                Timestamp.from(now.plus(ttl)),
+                instanceLease.instanceId()
         ) == 1;
     }
 
@@ -217,7 +232,8 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                 update api_idempotency_records
                    set state = 'COMPLETED', response_status = ?, response_content_type = ?,
                        response_location = ?, response_trace_id = ?::uuid, response_body = ?,
-                       completed_at = ?, expires_at = ?
+                       completed_at = ?, execution_finished_at = ?, recovery_reason = null,
+                       expires_at = ?
                  where workspace_id = ? and actor_id = ? and http_method = ? and request_path = ?
                    and idempotency_key = ? and request_digest = ? and state = 'PROCESSING'
                 """,
@@ -226,6 +242,7 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                 location,
                 traceId,
                 body,
+                Timestamp.from(now),
                 Timestamp.from(now),
                 Timestamp.from(now.plus(ttl)),
                 AgentService.DEMO_WORKSPACE_ID,
@@ -237,6 +254,37 @@ public class IdempotencyFilter extends OncePerRequestFilter {
         );
         if (updated != 1) {
             throw new IllegalStateException("Idempotency reservation was not completed exactly once");
+        }
+    }
+
+    private void markRecoveryRequired(
+            String actor,
+            String method,
+            String path,
+            String key,
+            String requestDigest,
+            String reason
+    ) {
+        Instant now = Instant.now();
+        int updated = jdbcTemplate.update("""
+                update api_idempotency_records
+                   set state = 'RECOVERY_REQUIRED', execution_finished_at = ?, recovery_reason = ?
+                 where workspace_id = ? and actor_id = ? and http_method = ? and request_path = ?
+                   and idempotency_key = ? and request_digest = ? and state = 'PROCESSING'
+                   and owner_instance_id = ?
+                """,
+                Timestamp.from(now),
+                reason,
+                AgentService.DEMO_WORKSPACE_ID,
+                actor,
+                method,
+                path,
+                key,
+                requestDigest,
+                instanceLease.instanceId()
+        );
+        if (updated != 1) {
+            throw new IllegalStateException("Idempotency execution completion was not recorded exactly once");
         }
     }
 

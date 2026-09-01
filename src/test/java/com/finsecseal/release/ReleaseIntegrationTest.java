@@ -21,6 +21,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ObjectNode;
 
 @Testcontainers
 @SpringBootTest
@@ -152,6 +153,25 @@ class ReleaseIntegrationTest {
         assertThatThrownBy(() -> releaseService.create(agent.id(), drifted))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("immutable catalog definition");
+    }
+
+    @Test
+    void mapsNfcFieldNameCollisionToManifestInvalid() {
+        AgentDto.Response agent = agentService.create(new AgentDto.CreateRequest(
+                "loan-document-review-agent",
+                "Loan Review Agent",
+                "Document completeness only"
+        ));
+        JsonNode collision = manifest.deepCopy();
+        ObjectNode schema = (ObjectNode) collision.at("/tools/0/inputSchema");
+        schema.put("cafe\u0301", "first");
+        schema.put("café", "second");
+
+        assertThatThrownBy(() -> releaseService.create(agent.id(), collision))
+                .isInstanceOfSatisfying(BusinessException.class, exception ->
+                        assertThat(exception.errorCode()).isEqualTo(
+                                com.finsecseal.common.api.ErrorCode.MANIFEST_INVALID
+                        ));
     }
 
     @Test

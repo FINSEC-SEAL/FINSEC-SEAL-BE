@@ -3,15 +3,13 @@ package com.finsecseal.common.api;
 import com.finsecseal.agent.AgentService;
 import com.finsecseal.audit.AuditService;
 import com.finsecseal.common.persistence.UuidV7;
+import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -27,23 +25,23 @@ public class IdempotencyRecoveryService {
     private final DigestService digestService;
     private final AuditService auditService;
     private final ObjectMapper objectMapper;
-    private final byte[] recoveryKey;
+    private final CanonicalJsonService canonicalJsonService;
+    private final OperatorRecoveryCredentialVerifier credentialVerifier;
 
     public IdempotencyRecoveryService(
             JdbcTemplate jdbcTemplate,
             DigestService digestService,
             AuditService auditService,
             ObjectMapper objectMapper,
-            @Value("${finsec.idempotency.recovery-key:}") String recoveryKey
+            CanonicalJsonService canonicalJsonService,
+            OperatorRecoveryCredentialVerifier credentialVerifier
     ) {
         this.jdbcTemplate = jdbcTemplate;
         this.digestService = digestService;
         this.auditService = auditService;
         this.objectMapper = objectMapper;
-        this.recoveryKey = recoveryKey.getBytes(StandardCharsets.UTF_8);
-        if (this.recoveryKey.length > 0 && this.recoveryKey.length < 32) {
-            throw new IllegalStateException("FINSEC_IDEMPOTENCY_RECOVERY_KEY must contain at least 32 bytes");
-        }
+        this.canonicalJsonService = canonicalJsonService;
+        this.credentialVerifier = credentialVerifier;
     }
 
     @Transactional
@@ -52,8 +50,7 @@ public class IdempotencyRecoveryService {
             String suppliedRecoveryKey,
             String operatorActorId
     ) {
-        authorize(suppliedRecoveryKey);
-        String operator = normalizeOperator(operatorActorId);
+        String operator = credentialVerifier.verify(suppliedRecoveryKey, operatorActorId);
         StoredRecord stored = lock(request);
         if (!stored.requestDigest().equals(request.requestDigest())) {
             throw new BusinessException(
@@ -61,34 +58,16 @@ public class IdempotencyRecoveryService {
                     "Recovery requestDigest does not match the original reservation"
             );
         }
-        if (!"PROCESSING".equals(stored.state())) {
-            throw new BusinessException(ErrorCode.IDEMPOTENCY_CONFLICT, "Only PROCESSING reservations can be recovered");
-        }
-        if (stored.expiresAt().isAfter(Instant.now())) {
+        if (!"RECOVERY_REQUIRED".equals(stored.state()) || stored.executionFinishedAt() == null) {
             throw new BusinessException(
                     ErrorCode.IDEMPOTENCY_IN_PROGRESS,
-                    "The original reservation has not expired; recovery could race an active request"
+                    "The original execution has not produced DB-verifiable recovery-ready evidence"
             );
         }
 
         Completion completion = resolve(request);
         Instant recoveredAt = Instant.now();
         UUID recoveryId = UuidV7.generate();
-        if (request.resolution() == IdempotencyRecoveryDto.Resolution.COMPLETE) {
-            int updated = jdbcTemplate.update("""
-                    update api_idempotency_records
-                       set state = 'COMPLETED', response_status = ?, response_content_type = ?,
-                           response_location = ?, response_trace_id = ?, response_body = ?,
-                           completed_at = ?, expires_at = ?
-                     where id = ? and state = 'PROCESSING'
-                    """,
-                    completion.status(), completion.contentType(), completion.location(),
-                    completion.traceId(), completion.body(), Timestamp.from(recoveredAt),
-                    Timestamp.from(recoveredAt.plusSeconds(86_400)), stored.id()
-            );
-            requireSingleTransition(updated);
-        }
-
         jdbcTemplate.update("""
                 insert into idempotency_recoveries
                     (id, workspace_id, idempotency_record_id, actor_id, http_method, request_path,
@@ -111,9 +90,22 @@ public class IdempotencyRecoveryService {
                 Timestamp.from(stored.expiresAt()),
                 Timestamp.from(recoveredAt)
         );
-        if (request.resolution() == IdempotencyRecoveryDto.Resolution.RELEASE) {
+        if (request.resolution() == IdempotencyRecoveryDto.Resolution.COMPLETE) {
+            int updated = jdbcTemplate.update("""
+                    update api_idempotency_records
+                       set state = 'COMPLETED', response_status = ?, response_content_type = ?,
+                           response_location = ?, response_trace_id = ?, response_body = ?,
+                           completed_at = ?, recovery_reason = null, expires_at = ?
+                     where id = ? and state = 'RECOVERY_REQUIRED'
+                    """,
+                    completion.status(), completion.contentType(), completion.location(),
+                    completion.traceId(), completion.body(), Timestamp.from(recoveredAt),
+                    Timestamp.from(recoveredAt.plusSeconds(86_400)), stored.id()
+            );
+            requireSingleTransition(updated);
+        } else {
             requireSingleTransition(jdbcTemplate.update(
-                    "delete from api_idempotency_records where id = ? and state = 'PROCESSING'",
+                    "delete from api_idempotency_records where id = ? and state = 'RECOVERY_REQUIRED'",
                     stored.id()
             ));
         }
@@ -155,16 +147,15 @@ public class IdempotencyRecoveryService {
             String operatorActorId,
             int limit
     ) {
-        authorize(suppliedRecoveryKey);
-        normalizeOperator(operatorActorId);
+        credentialVerifier.verify(suppliedRecoveryKey, operatorActorId);
         if (limit < 1 || limit > 100) {
             throw new BusinessException(ErrorCode.VALIDATION_ERROR, "limit must be between 1 and 100");
         }
         return jdbcTemplate.query("""
                 select id, actor_id, http_method, request_path, idempotency_key,
-                       request_digest, expires_at, created_at
+                       request_digest, expires_at, execution_finished_at, recovery_reason, created_at
                   from api_idempotency_records
-                 where workspace_id = ? and state = 'PROCESSING' and expires_at <= now()
+                 where workspace_id = ? and state = 'RECOVERY_REQUIRED'
                  order by expires_at, created_at, id
                  limit ?
                 """, (resultSet, rowNumber) -> new IdempotencyRecoveryDto.Pending(
@@ -175,28 +166,15 @@ public class IdempotencyRecoveryService {
                         resultSet.getString("idempotency_key"),
                         resultSet.getString("request_digest"),
                         resultSet.getTimestamp("expires_at").toInstant(),
+                        resultSet.getTimestamp("execution_finished_at").toInstant(),
+                        resultSet.getString("recovery_reason"),
                         resultSet.getTimestamp("created_at").toInstant()
                 ), AgentService.DEMO_WORKSPACE_ID, limit);
     }
 
-    private void authorize(String suppliedRecoveryKey) {
-        if (recoveryKey.length == 0) {
-            throw new BusinessException(
-                    ErrorCode.CONFIGURATION_ERROR,
-                    "Idempotency recovery is disabled until FINSEC_IDEMPOTENCY_RECOVERY_KEY is configured"
-            );
-        }
-        byte[] supplied = suppliedRecoveryKey == null
-                ? new byte[0]
-                : suppliedRecoveryKey.getBytes(StandardCharsets.UTF_8);
-        if (!MessageDigest.isEqual(recoveryKey, supplied)) {
-            throw new BusinessException(ErrorCode.OPERATOR_AUTH_REQUIRED, "Valid operator recovery credentials are required");
-        }
-    }
-
     private StoredRecord lock(IdempotencyRecoveryDto.Request request) {
         List<StoredRecord> rows = jdbcTemplate.query("""
-                select id, request_digest, state, expires_at
+                select id, request_digest, state, expires_at, execution_finished_at
                   from api_idempotency_records
                  where workspace_id = ? and actor_id = ? and http_method = ?
                    and request_path = ? and idempotency_key = ?
@@ -205,7 +183,10 @@ public class IdempotencyRecoveryService {
                         resultSet.getObject("id", UUID.class),
                         resultSet.getString("request_digest"),
                         resultSet.getString("state"),
-                        resultSet.getTimestamp("expires_at").toInstant()
+                        resultSet.getTimestamp("expires_at").toInstant(),
+                        resultSet.getTimestamp("execution_finished_at") == null
+                                ? null
+                                : resultSet.getTimestamp("execution_finished_at").toInstant()
                 ),
                 AgentService.DEMO_WORKSPACE_ID,
                 request.actorId(),
@@ -244,24 +225,25 @@ public class IdempotencyRecoveryService {
         if (body.length > MAX_RECOVERED_RESPONSE_BYTES) {
             throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Recovered response body exceeds 1 MiB");
         }
+        String bodyDigest = digestService.sha256(body);
+        ObjectNode envelope = objectMapper.createObjectNode();
+        envelope.put("status", request.completedResponse().status());
+        envelope.put("contentType", normalizeNullable(request.completedResponse().contentType()));
+        envelope.put("location", normalizeNullable(request.completedResponse().location()));
+        envelope.put("traceId", request.completedResponse().traceId().toString());
+        envelope.put("bodyDigest", bodyDigest);
         return new Completion(
                 request.completedResponse().status(),
                 request.completedResponse().contentType(),
                 request.completedResponse().location(),
                 request.completedResponse().traceId(),
                 body,
-                digestService.sha256(body)
+                digestService.sha256(canonicalJsonService.canonicalize(envelope))
         );
     }
 
-    private String normalizeOperator(String actorId) {
-        if (actorId == null || !actorId.startsWith("operator:") || actorId.length() > 120) {
-            throw new BusinessException(
-                    ErrorCode.OPERATOR_AUTH_REQUIRED,
-                    "X-Actor-Id must identify an operator using the operator: prefix"
-            );
-        }
-        return actorId;
+    private String normalizeNullable(String value) {
+        return value == null ? "" : value.trim();
     }
 
     private void requireSingleTransition(int updated) {
@@ -270,7 +252,13 @@ public class IdempotencyRecoveryService {
         }
     }
 
-    private record StoredRecord(UUID id, String requestDigest, String state, Instant expiresAt) {
+    private record StoredRecord(
+            UUID id,
+            String requestDigest,
+            String state,
+            Instant expiresAt,
+            Instant executionFinishedAt
+    ) {
     }
 
     private record Completion(

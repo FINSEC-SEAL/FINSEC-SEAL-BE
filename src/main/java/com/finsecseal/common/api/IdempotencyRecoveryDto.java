@@ -60,6 +60,8 @@ public final class IdempotencyRecoveryDto {
             String idempotencyKey,
             String requestDigest,
             Instant expiresAt,
+            Instant executionFinishedAt,
+            String recoveryReason,
             Instant createdAt
     ) {
     }

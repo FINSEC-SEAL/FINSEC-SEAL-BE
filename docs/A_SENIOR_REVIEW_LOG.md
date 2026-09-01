@@ -306,3 +306,54 @@
 - Reverification: `git diff --check` 성공. 실제 PostgreSQL `17.11-alpine` 대상
   `./gradlew clean test --warning-mode all --rerun-tasks` 전체 55 tests, 실패/오류/skip 0건.
   fixed commit 후 동일 선임에게 G2 third review 요청 예정
+
+## G2 — Third review
+
+- Result: rejected
+- Reviewed fixed commit: `f397782d3343cc0b3e05039164690b475b8ad352`
+- Independent verification: 선임의 clean detached worktree와 PostgreSQL `17.11-alpine`에서
+  전체 55 tests 통과
+- P0 feedback:
+  - prompt rollback audit의 `REQUIRES_NEW` 접근이 outer transaction 커넥션 반납 전에 다른
+    커넥션을 요구해 작은 pool에서 starvation/deadlock 가능
+  - Attestation은 DB에서 부분 projection만 비교하고 기존 row의 서비스 expected rebuild를
+    생략해 self-consistent forged document/hash를 허용 가능
+  - recovery row 위조로 활성 reservation을 삭제할 수 있는 DB transition 결함
+- P1 feedback:
+  - TTL 경계에서 활성 원 요청과 operator recovery가 경합할 수 있어 실행 lease 필요
+  - latest Decision/Invalidation과 Attestation 생성 TOCTOU
+  - Decision snapshot evidence completeness/DB closure 검증 부족
+  - invalidation된 과거 Decision이 현재 lifecycle `VERIFYING` 등일 때 historical Attestation 생성 실패
+- P2 feedback:
+  - concurrent Attestation/invalidation/latest Decision test 부족
+  - recovery response digest가 body만 복인하고 HTTP metadata를 봉인하지 않음
+  - 잘못된 복구 credential 403이 명령의 idempotency key를 오염시킬 수 있음
+  - NFC field-name collision이 정의된 manifest 오류 대신 500으로 노출
+- Gate: G2 FAIL
+
+## G2 — Third review feedback applied
+
+- Prompt audit:
+  - outer transaction에서 이벤트만 발행하고 `AFTER_ROLLBACK` 후 bounded async executor에서
+    새 transaction으로 audit을 복원하도록 커넥션 순서 분리
+  - Hikari pool 2개로 동시 rollback 2건을 발생시켜 요청 종료와 audit 보존 모두 검증
+- Attestation:
+  - Release row lock 후 latest Decision/invalidation/snapshot을 읽어 Decision 생성과 직렬화
+  - 기존 row도 immutable Decision snapshot에서 expected JSON/hash/HTML을 매번 재생성해 exact 비교
+  - DB trigger도 latest Decision과 snapshot의 모든 projection field, Decision/reviewer/disclaimer를 재대조
+  - TestSuite/Run/Finding의 release/workspace closure, result/metric fraction·digest·source,
+    PASS 근거, patch/rule trace의 구조를 검증
+  - 동시 생성/latest Decision/invalidation, forged metric, forged HTML, historical lifecycle 회귀 테스트 추가
+- Idempotency recovery:
+  - application instance UUID lease/heartbeat와 owner를 reservation에 기록
+  - 5xx/예외 종료 또는 `TTL 만료 + owner lease stale`일 때만
+    `RECOVERY_REQUIRED`로 전환하는 DB 상태 머신 도입
+  - exact recovery evidence INSERT를 원 row COMPLETE/DELETE보다 먼저 하고 DB trigger로 항목 전체 대조
+  - 인증 pre-filter를 idempotency filter 전에 배치해 잘못된 credential이 명령 키를 점유하지 못하게 함
+  - status/contentType/Location/traceId/bodyDigest canonical envelope를 response digest로 사용
+  - 활성 owner, stale owner, forged recovery, wrong-credential reuse, exact replay를 real HTTP/DB로 검증
+- Manifest:
+  - NFC object-field collision을 `MANIFEST_INVALID`로 정규 매핑하고 통합 테스트 추가
+- Reverification: `git diff --check` 성공. 실제 PostgreSQL `17.11-alpine`에서
+  `./gradlew clean test --warning-mode all --rerun-tasks` 전체 64 tests,
+  실패/오류/skip 0건. fixed commit 생성 후 동일 선임에게 fourth review 요청 예정

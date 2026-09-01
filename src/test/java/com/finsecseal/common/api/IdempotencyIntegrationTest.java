@@ -50,6 +50,9 @@ class IdempotencyIntegrationTest {
     @Autowired
     DigestService digestService;
 
+    @Autowired
+    IdempotencyInstanceLease instanceLease;
+
     private final HttpClient client = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
             .build();
@@ -110,14 +113,15 @@ class IdempotencyIntegrationTest {
         jdbcTemplate.update("""
                 insert into api_idempotency_records
                     (id, workspace_id, actor_id, http_method, request_path, idempotency_key,
-                     request_digest, state, expires_at)
-                values (?, ?, 'role-a-test', 'POST', '/api/v1/agents', ?, ?, 'PROCESSING', ?)
+                     request_digest, state, expires_at, owner_instance_id)
+                values (?, ?, 'role-a-test', 'POST', '/api/v1/agents', ?, ?, 'PROCESSING', ?, ?)
                 """,
                 UUID.fromString("0198f200-0000-7000-8000-000000009001"),
                 AgentService.DEMO_WORKSPACE_ID,
                 key,
                 semanticRequestDigest(body, "application/json", ""),
-                java.sql.Timestamp.from(Instant.now().minus(Duration.ofHours(1)))
+                java.sql.Timestamp.from(Instant.now().minus(Duration.ofHours(1))),
+                instanceLease.instanceId()
         );
 
         HttpResponse<String> response = post(body, key);

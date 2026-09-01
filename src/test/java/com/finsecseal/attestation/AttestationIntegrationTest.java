@@ -12,10 +12,15 @@ import com.finsecseal.release.DigestService;
 import com.finsecseal.release.ReleaseDto;
 import com.finsecseal.release.ReleaseService;
 import java.io.IOException;
+import java.sql.Connection;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -61,6 +66,9 @@ class AttestationIntegrationTest {
     @Autowired
     DigestService digestService;
 
+    @Autowired
+    DataSource dataSource;
+
     @Test
     void createsOneDeterministicAttestationPreservesItAndMarksItStale() throws Exception {
         Seed seed = seedDecision("deterministic", false);
@@ -70,6 +78,22 @@ class AttestationIntegrationTest {
                      html_content, generated_at, disclaimer_version)
                 values (?, ?, '1.0', '{}'::jsonb, ?, 'not a valid report', ?, 'finsec-internal/v1')
                 """, UUID.randomUUID(), seed.decisionId(), HASH_A,
+                Timestamp.from(seed.confirmedAt())));
+        ObjectNode forged = projectionDocument(seed, true);
+        String forgedHash = digestService.sha256(canonicalJsonService.canonicalize(forged));
+        String forgedHtml = "%s %s %s %s %s".formatted(
+                AttestationService.DISCLAIMER_KO,
+                AttestationService.DISCLAIMER_EN,
+                seed.releaseId(),
+                "BLOCKED",
+                forgedHash
+        );
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                insert into release_attestations
+                    (id, release_decision_id, format_version, document_json, document_hash,
+                     html_content, generated_at, disclaimer_version)
+                values (?, ?, '1.0', ?::jsonb, ?, ?, ?, 'finsec-internal/v1')
+                """, UUID.randomUUID(), seed.decisionId(), json(forged), forgedHash, forgedHtml,
                 Timestamp.from(seed.confirmedAt())));
 
         AttestationDto.View first = attestationService.findOrCreate(seed.releaseId(), "governance-reviewer");
@@ -124,8 +148,51 @@ class AttestationIntegrationTest {
     }
 
     @Test
+    void rejectsStoredProjectionWithValidDocumentButForgedHtml() throws Exception {
+        Seed seed = seedDecision("forged-html", false);
+        ObjectNode exactDocument = projectionDocument(seed, false);
+        String exactHash = digestService.sha256(canonicalJsonService.canonicalize(exactDocument));
+        String forgedHtml = "%s %s %s %s %s forged-template".formatted(
+                AttestationService.DISCLAIMER_KO,
+                AttestationService.DISCLAIMER_EN,
+                seed.releaseId(),
+                "BLOCKED",
+                exactHash
+        );
+        assertThat(jdbcTemplate.update("""
+                insert into release_attestations
+                    (id, release_decision_id, format_version, document_json, document_hash,
+                     html_content, generated_at, disclaimer_version)
+                values (?, ?, '1.0', ?::jsonb, ?, ?, ?, 'finsec-internal/v1')
+                """, UUID.randomUUID(), seed.decisionId(), json(exactDocument), exactHash, forgedHtml,
+                Timestamp.from(seed.confirmedAt()))).isEqualTo(1);
+
+        assertThatThrownBy(() -> attestationService.findOrCreate(seed.releaseId(), "governance-reviewer"))
+                .isInstanceOfSatisfying(BusinessException.class, exception ->
+                        assertThat(exception.errorCode()).isEqualTo(ErrorCode.RELEASE_CHANGED));
+    }
+
+    @Test
     void rejectsDecisionSnapshotWhoseDigestDoesNotMatch() throws Exception {
         Seed seed = seedDecision("bad-digest", true);
+
+        assertThatThrownBy(() -> attestationService.findOrCreate(seed.releaseId(), "governance-reviewer"))
+                .isInstanceOfSatisfying(BusinessException.class, exception ->
+                        assertThat(exception.errorCode()).isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE));
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from release_attestations where release_decision_id = ?",
+                Integer.class,
+                seed.decisionId()
+        )).isZero();
+    }
+
+    @Test
+    void rejectsDecisionSnapshotWhoseTestSuiteDoesNotCloseToStoredEvidence() throws Exception {
+        Seed seed = seedDecision(
+                "bad-suite-closure",
+                false,
+                snapshot -> ((ObjectNode) snapshot.path("testSuite")).put("hash", HASH_B)
+        );
 
         assertThatThrownBy(() -> attestationService.findOrCreate(seed.releaseId(), "governance-reviewer"))
                 .isInstanceOfSatisfying(BusinessException.class, exception ->
@@ -146,6 +213,11 @@ class AttestationIntegrationTest {
                 seed.releaseId()
         );
         invalidateAndChangeContract(seed);
+        jdbcTemplate.update("""
+                update agent_releases
+                   set lifecycle_state = 'VERIFYING', effective_status = 'VERIFYING'
+                 where id = ?
+                """, seed.releaseId());
 
         AttestationDto.View attestation = attestationService.findOrCreate(
                 seed.releaseId(),
@@ -163,7 +235,104 @@ class AttestationIntegrationTest {
         )).isEqualTo(HASH_B);
     }
 
+    @Test
+    void serializesConcurrentCreationToOneImmutableAttestation() throws Exception {
+        Seed seed = seedDecision("concurrent-create", false);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var first = executor.submit(() -> attestationService.findOrCreate(seed.releaseId(), "reviewer-one"));
+            var second = executor.submit(() -> attestationService.findOrCreate(seed.releaseId(), "reviewer-two"));
+
+            AttestationDto.View firstView = first.get(5, TimeUnit.SECONDS);
+            AttestationDto.View secondView = second.get(5, TimeUnit.SECONDS);
+            assertThat(secondView.id()).isEqualTo(firstView.id());
+            assertThat(secondView.documentHash()).isEqualTo(firstView.documentHash());
+        }
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from release_attestations where release_decision_id = ?",
+                Integer.class,
+                seed.decisionId()
+        )).isEqualTo(1);
+    }
+
+    @Test
+    void waitsForConcurrentLatestDecisionAndBuildsTheNewDecision() throws Exception {
+        Seed seed = seedDecision("latest-race", false);
+        UUID latestDecisionId = UUID.randomUUID();
+        Instant latestConfirmedAt = seed.confirmedAt().plusSeconds(2);
+        ObjectNode latestSnapshot = seed.snapshot().deepCopy();
+        latestSnapshot.put("testedAt", latestConfirmedAt.toString());
+        String latestDigest = digestService.sha256(canonicalJsonService.canonicalize(latestSnapshot));
+
+        try (Connection first = dataSource.getConnection(); var executor = Executors.newSingleThreadExecutor()) {
+            first.setAutoCommit(false);
+            lockRelease(first, seed.releaseId());
+            var attestation = executor.submit(() ->
+                    attestationService.findOrCreate(seed.releaseId(), "latest-race-reviewer")
+            );
+            assertThatThrownBy(() -> attestation.get(200, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(java.util.concurrent.TimeoutException.class);
+            try (var insert = first.prepareStatement("""
+                    insert into release_decisions
+                        (id, release_id, decision, gate_policy_version, input_snapshot_json, input_digest,
+                         proposed_at, confirmed_by, confirmed_at)
+                    values (?, ?, 'BLOCKED', 'mvp-gate/1', ?::jsonb, ?, ?, 'governance-reviewer', ?)
+                    """)) {
+                insert.setObject(1, latestDecisionId);
+                insert.setObject(2, seed.releaseId());
+                insert.setString(3, json(latestSnapshot));
+                insert.setString(4, latestDigest);
+                insert.setTimestamp(5, Timestamp.from(latestConfirmedAt.minusSeconds(1)));
+                insert.setTimestamp(6, Timestamp.from(latestConfirmedAt));
+                assertThat(insert.executeUpdate()).isEqualTo(1);
+            }
+            first.commit();
+            assertThat(attestation.get(5, TimeUnit.SECONDS).releaseDecisionId())
+                    .isEqualTo(latestDecisionId);
+        }
+    }
+
+    @Test
+    void waitsForConcurrentInvalidationAndReturnsHistoricalAttestationAsStale() throws Exception {
+        Seed seed = seedDecision("invalidation-race", false);
+        try (Connection first = dataSource.getConnection(); var executor = Executors.newSingleThreadExecutor()) {
+            first.setAutoCommit(false);
+            lockRelease(first, seed.releaseId());
+            var attestation = executor.submit(() ->
+                    attestationService.findOrCreate(seed.releaseId(), "invalidation-race-reviewer")
+            );
+            assertThatThrownBy(() -> attestation.get(200, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(java.util.concurrent.TimeoutException.class);
+            try (var invalidation = first.prepareStatement("""
+                    insert into decision_invalidations
+                        (id, release_decision_id, reasons_json, invalidated_by, invalidated_at, created_at)
+                    values (?, ?, '{"reason":"MODEL_CHANGE"}'::jsonb, 'reviewer', now(), now())
+                    """)) {
+                invalidation.setObject(1, UUID.randomUUID());
+                invalidation.setObject(2, seed.decisionId());
+                assertThat(invalidation.executeUpdate()).isEqualTo(1);
+            }
+            try (var transition = first.prepareStatement("""
+                    update agent_releases
+                       set lifecycle_state = 'VERIFYING', effective_status = 'VERIFYING'
+                     where id = ?
+                    """)) {
+                transition.setObject(1, seed.releaseId());
+                assertThat(transition.executeUpdate()).isEqualTo(1);
+            }
+            first.commit();
+            assertThat(attestation.get(5, TimeUnit.SECONDS).stale()).isTrue();
+        }
+    }
+
     private Seed seedDecision(String suffix, boolean badDigest) throws IOException {
+        return seedDecision(suffix, badDigest, snapshot -> { });
+    }
+
+    private Seed seedDecision(
+            String suffix,
+            boolean badDigest,
+            Consumer<ObjectNode> snapshotMutator
+    ) throws IOException {
         String agentKey = "attestation-" + suffix + "-" + UUID.randomUUID().toString().substring(0, 8);
         AgentDto.Response agent = agentService.create(new AgentDto.CreateRequest(
                 agentKey,
@@ -189,6 +358,7 @@ class AttestationIntegrationTest {
         UUID decisionId = UUID.randomUUID();
         Instant confirmedAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
         ObjectNode snapshot = decisionSnapshot(agent, release, manifest, fingerprints, confirmedAt);
+        snapshotMutator.accept(snapshot);
         String inputDigest = badDigest
                 ? HASH_A
                 : digestService.sha256(canonicalJsonService.canonicalize(snapshot));
@@ -205,7 +375,7 @@ class AttestationIntegrationTest {
                 Timestamp.from(confirmedAt.minusSeconds(1)),
                 Timestamp.from(confirmedAt)
         );
-        return new Seed(release.id(), decisionId, confirmedAt);
+        return new Seed(release.id(), decisionId, confirmedAt, inputDigest, snapshot.deepCopy());
     }
 
     private ObjectNode decisionSnapshot(
@@ -253,8 +423,20 @@ class AttestationIntegrationTest {
                 .putNull("versionId")
                 .putNull("version")
                 .putNull("hash"));
+        UUID suiteId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                insert into test_suites
+                    (id, workspace_id, suite_key, version, fixture_version,
+                     generation_config_json, suite_hash, status, created_at, updated_at)
+                values (?, ?, ?, '1.0.0', 'fixture-v1', '{}'::jsonb, ?, 'READY', now(), now())
+                """,
+                suiteId,
+                AgentService.DEMO_WORKSPACE_ID,
+                "attestation-suite-" + suiteId.toString().substring(0, 8),
+                HASH_A
+        );
         snapshot.set("testSuite", objectMapper.createObjectNode()
-                .put("id", UUID.randomUUID().toString())
+                .put("id", suiteId.toString())
                 .put("version", "1.0.0")
                 .put("hash", HASH_A));
         snapshot.set("sandbox", objectMapper.createObjectNode()
@@ -268,7 +450,18 @@ class AttestationIntegrationTest {
             result.putArray("sourceRunIds");
             results.set(field, result);
         }
-        snapshot.putArray("metrics");
+        ArrayNode metrics = snapshot.putArray("metrics");
+        for (String metricName : new String[]{
+                "BaselineASR", "SealReplayASR", "HeldOutASR", "NormalRegression"
+        }) {
+            ObjectNode metric = objectMapper.createObjectNode()
+                    .put("metric", metricName)
+                    .put("status", "N_A")
+                    .put("reason", "No conclusive trials")
+                    .put("calculatorVersion", "1.0");
+            metric.putArray("sourceTestRunIds");
+            metrics.add(metric);
+        }
         snapshot.putArray("remainingFindings");
         snapshot.putNull("approvedPatch");
         ObjectNode decision = objectMapper.createObjectNode()
@@ -312,11 +505,65 @@ class AttestationIntegrationTest {
                 """, HASH_B, HASH_B, seed.releaseId());
     }
 
+    private ObjectNode projectionDocument(Seed seed, boolean forgeMetric) {
+        ObjectNode snapshot = seed.snapshot();
+        ObjectNode document = objectMapper.createObjectNode();
+        document.put("schemaVersion", "1.0");
+        document.put("attestationType", "FINSEC_SEAL_INTERNAL_RELEASE_ATTESTATION");
+        document.put("canonicalizationVersion", CanonicalJsonService.VERSION);
+        for (String field : new String[]{
+                "agent", "release", "model", "systemPromptFingerprint", "toolSetFingerprint",
+                "toolSchemaFingerprints", "ragConfigurationFingerprint", "safetyContract",
+                "testSuite", "sandbox", "results", "metrics", "remainingFindings", "approvedPatch"
+        }) {
+            document.set(field, snapshot.path(field).deepCopy());
+        }
+        if (forgeMetric) {
+            ((ObjectNode) document.path("metrics").get(0)).put("reason", "forged metric evidence");
+        }
+        ObjectNode decision = objectMapper.createObjectNode()
+                .put("id", seed.decisionId().toString())
+                .put("value", "BLOCKED")
+                .put("gatePolicyVersion", "mvp-gate/1")
+                .put("inputDigest", seed.inputDigest())
+                .put("proposedAt", seed.confirmedAt().minusSeconds(1).toString())
+                .put("confirmedAt", seed.confirmedAt().toString());
+        decision.set("ruleTrace", snapshot.at("/decision/ruleTrace").deepCopy());
+        document.set("decision", decision);
+        document.set("reviewer", objectMapper.createObjectNode()
+                .put("actorId", "governance-reviewer")
+                .put("role", "AI_GOVERNANCE_REVIEWER")
+                .put("demoMode", true));
+        document.set("testedAt", snapshot.path("testedAt").deepCopy());
+        document.putArray("revalidationTriggers")
+                .add("MODEL_CHANGE")
+                .add("SYSTEM_PROMPT_CHANGE")
+                .add("TOOL_SET_OR_SCHEMA_OR_DESCRIPTION_CHANGE")
+                .add("RAG_CHANGE")
+                .add("SAFETY_CONTRACT_CHANGE")
+                .add("BUSINESS_PURPOSE_OR_CONTEXT_CHANGE");
+        document.set("disclaimer", objectMapper.createObjectNode()
+                .put("version", AttestationService.DISCLAIMER_VERSION)
+                .put("ko", AttestationService.DISCLAIMER_KO)
+                .put("en", AttestationService.DISCLAIMER_EN));
+        document.put("generatedAt", seed.confirmedAt().toString());
+        return document;
+    }
+
     private String json(JsonNode value) {
         try {
             return objectMapper.writeValueAsString(value);
         } catch (Exception exception) {
             throw new IllegalArgumentException(exception);
+        }
+    }
+
+    private void lockRelease(Connection connection, UUID releaseId) throws Exception {
+        try (var lock = connection.prepareStatement(
+                "select id from agent_releases where id = ? for update"
+        )) {
+            lock.setObject(1, releaseId);
+            lock.executeQuery().close();
         }
     }
 
@@ -327,6 +574,12 @@ class AttestationIntegrationTest {
                         assertThat(exception.getSQLState()).isEqualTo(expected));
     }
 
-    private record Seed(UUID releaseId, UUID decisionId, Instant confirmedAt) {
+    private record Seed(
+            UUID releaseId,
+            UUID decisionId,
+            Instant confirmedAt,
+            String inputDigest,
+            ObjectNode snapshot
+    ) {
     }
 }

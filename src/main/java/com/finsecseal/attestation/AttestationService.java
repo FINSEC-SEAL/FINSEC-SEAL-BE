@@ -8,9 +8,11 @@ import com.finsecseal.evidence.RedactionService;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import java.nio.charset.StandardCharsets;
+import java.math.BigInteger;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -74,16 +76,18 @@ public class AttestationService {
 
     @Transactional
     public AttestationDto.View findOrCreate(UUID releaseId, String actorId) {
+        lockRelease(releaseId);
         DecisionSnapshot decision = latestDecision(releaseId);
+        Invalidation invalidation = findInvalidation(decision.id());
+        validateDecisionState(decision, invalidation);
+        JsonNode snapshot = decision.inputSnapshot();
+        validateSnapshot(decision, snapshot, invalidation != null);
+        ObjectNode expectedDocument = buildDocument(decision, snapshot);
+        String expectedHash = digestService.sha256(canonicalJsonService.canonicalize(expectedDocument));
+        String expectedHtml = renderHtml(expectedDocument, expectedHash);
         StoredAttestation existing = findStored(decision.id());
         boolean inserted = false;
         if (existing == null) {
-            validateDecisionState(decision);
-            JsonNode snapshot = decision.inputSnapshot();
-            validateSnapshot(decision, snapshot, findInvalidation(decision.id()) != null);
-            ObjectNode document = buildDocument(decision, snapshot);
-            String documentHash = digestService.sha256(canonicalJsonService.canonicalize(document));
-            String html = renderHtml(document, documentHash);
             UUID attestationId = UuidV7.generate();
             inserted = jdbcTemplate.update("""
                     insert into release_attestations
@@ -95,9 +99,9 @@ public class AttestationService {
                     attestationId,
                     decision.id(),
                     FORMAT_VERSION,
-                    json(document),
-                    documentHash,
-                    html,
+                    json(expectedDocument),
+                    expectedHash,
+                    expectedHtml,
                     Timestamp.from(decision.confirmedAt()),
                     DISCLAIMER_VERSION
             ) == 1;
@@ -110,15 +114,14 @@ public class AttestationService {
                 metadata.put("schemaVersion", FORMAT_VERSION);
                 metadata.put("releaseId", releaseId.toString());
                 metadata.put("releaseDecisionId", decision.id().toString());
-                metadata.put("documentHash", documentHash);
+                metadata.put("documentHash", expectedHash);
                 auditService.append(
                         decision.workspaceId(), normalizeActor(actorId), "RELEASE_ATTESTATION_GENERATED",
-                        "RELEASE_ATTESTATION", existing.id(), decision.inputDigest(), documentHash, metadata
+                        "RELEASE_ATTESTATION", existing.id(), decision.inputDigest(), expectedHash, metadata
                 );
             }
         }
-        validateStored(decision, existing);
-        Invalidation invalidation = findInvalidation(decision.id());
+        validateStored(decision, existing, expectedDocument, expectedHash, expectedHtml);
         return view(existing, invalidation);
     }
 
@@ -153,6 +156,17 @@ public class AttestationService {
                     "format must be json or html"
             );
         };
+    }
+
+    private void lockRelease(UUID releaseId) {
+        List<UUID> rows = jdbcTemplate.query(
+                "select id from agent_releases where id = ? for update",
+                (resultSet, rowNumber) -> resultSet.getObject("id", UUID.class),
+                releaseId
+        );
+        if (rows.isEmpty()) {
+            throw new BusinessException(ErrorCode.RESOURCE_NOT_FOUND, "Release not found");
+        }
     }
 
     private DecisionSnapshot latestDecision(UUID releaseId) {
@@ -193,15 +207,15 @@ public class AttestationService {
         return decisions.getFirst();
     }
 
-    private void validateDecisionState(DecisionSnapshot decision) {
+    private void validateDecisionState(DecisionSnapshot decision, Invalidation invalidation) {
         if (!TERMINAL_DECISIONS.contains(decision.decision())) {
             incomplete("ReleaseDecision must be terminal");
         }
-        if ("NEEDS_REVALIDATION".equals(decision.lifecycleState())) {
-            if (findInvalidation(decision.id()) == null) {
-                incomplete("NEEDS_REVALIDATION requires Decision invalidation evidence");
-            }
+        if (invalidation != null) {
             return;
+        }
+        if ("NEEDS_REVALIDATION".equals(decision.lifecycleState())) {
+            incomplete("NEEDS_REVALIDATION requires Decision invalidation evidence");
         }
         if (!decision.decision().equals(decision.lifecycleState())) {
             incomplete("Release lifecycle does not match the confirmed Decision");
@@ -224,6 +238,16 @@ public class AttestationService {
         requireObject(snapshot, "agent");
         requireObject(snapshot, "release");
         requireObject(snapshot, "model");
+        requireUuid(snapshot.at("/agent/id"), "agent.id");
+        requireText(snapshot.at("/agent/name"), "agent.name");
+        requireUuid(snapshot.at("/release/id"), "release.id");
+        requireText(snapshot.at("/release/version"), "release.version");
+        requireDigest(snapshot.at("/release/fingerprint"), "release.fingerprint");
+        requireDigest(snapshot.at("/release/agentArtifactFingerprint"), "release.agentArtifactFingerprint");
+        requireText(snapshot.at("/model/provider"), "model.provider");
+        requireText(snapshot.at("/model/name"), "model.name");
+        requireText(snapshot.at("/model/resolvedName"), "model.resolvedName");
+        requireDigest(snapshot.at("/model/parametersHash"), "model.parametersHash");
         requireDigest(snapshot.path("systemPromptFingerprint"), "systemPromptFingerprint");
         requireDigest(snapshot.path("toolSetFingerprint"), "toolSetFingerprint");
         requireDigest(snapshot.path("ragConfigurationFingerprint"), "ragConfigurationFingerprint");
@@ -246,6 +270,7 @@ public class AttestationService {
         }
         requireObject(snapshot, "decision");
         requireArray(snapshot.path("decision"), "ruleTrace");
+        validateEvidenceStructure(decision, snapshot);
         if (!snapshot.path("testedAt").isString()) {
             incomplete("Decision input snapshot requires testedAt");
         }
@@ -356,11 +381,20 @@ public class AttestationService {
         return rows.isEmpty() ? null : rows.getFirst();
     }
 
-    private void validateStored(DecisionSnapshot decision, StoredAttestation stored) {
+    private void validateStored(
+            DecisionSnapshot decision,
+            StoredAttestation stored,
+            JsonNode expectedDocument,
+            String expectedHash,
+            String expectedHtml
+    ) {
         String recomputed = digestService.sha256(canonicalJsonService.canonicalize(stored.document()));
         if (!FORMAT_VERSION.equals(stored.formatVersion())
                 || !DISCLAIMER_VERSION.equals(stored.disclaimerVersion())
                 || !recomputed.equals(stored.documentHash())
+                || !expectedHash.equals(stored.documentHash())
+                || !expectedDocument.equals(stored.document())
+                || !expectedHtml.equals(stored.html())
                 || !decision.id().toString().equals(stored.document().at("/decision/id").asString())
                 || !decision.inputDigest().equals(stored.document().at("/decision/inputDigest").asString())
                 || !decision.releaseId().toString().equals(stored.document().at("/release/id").asString())
@@ -369,6 +403,245 @@ public class AttestationService {
                 || !stored.html().contains(DISCLAIMER_EN)) {
             throw new BusinessException(ErrorCode.RELEASE_CHANGED, "Stored Attestation integrity check failed");
         }
+    }
+
+    private void validateEvidenceStructure(DecisionSnapshot decision, JsonNode snapshot) {
+        JsonNode contract = snapshot.path("safetyContract");
+        if ("N_A".equals(contract.path("status").asString())) {
+            if ((!contract.path("versionId").isMissingNode() && !contract.path("versionId").isNull())
+                    || (!contract.path("hash").isMissingNode() && !contract.path("hash").isNull())) {
+                incomplete("N_A safetyContract must not claim a version or hash");
+            }
+        } else {
+            requireUuid(contract.path("versionId"), "safetyContract.versionId");
+            if (!contract.path("version").isIntegralNumber() || contract.path("version").longValue() < 1) {
+                incomplete("safetyContract.version must be a positive integer");
+            }
+            requireDigest(contract.path("hash"), "safetyContract.hash");
+            Integer matchingContracts = jdbcTemplate.queryForObject("""
+                    select count(*)
+                      from safety_contract_versions version
+                      join safety_contracts contract on contract.id = version.contract_id
+                     where version.id = ? and contract.release_id = ? and contract.workspace_id = ?
+                       and version.version = ? and version.policy_hash = ? and version.state = 'APPROVED'
+                    """, Integer.class,
+                    UUID.fromString(contract.path("versionId").asString()),
+                    decision.releaseId(),
+                    decision.workspaceId(),
+                    contract.path("version").intValue(),
+                    contract.path("hash").asString()
+            );
+            if (matchingContracts == null || matchingContracts != 1) {
+                incomplete("safetyContract version/hash does not close to this Release");
+            }
+        }
+
+        JsonNode suite = snapshot.path("testSuite");
+        requireUuid(suite.path("id"), "testSuite.id");
+        requireText(suite.path("version"), "testSuite.version");
+        requireDigest(suite.path("hash"), "testSuite.hash");
+        Integer matchingSuites = jdbcTemplate.queryForObject("""
+                select count(*) from test_suites
+                 where id = ? and workspace_id = ? and version = ? and suite_hash = ?
+                   and status = 'READY'
+                """, Integer.class,
+                UUID.fromString(suite.path("id").asString()),
+                decision.workspaceId(),
+                suite.path("version").asString(),
+                suite.path("hash").asString()
+        );
+        if (matchingSuites == null || matchingSuites != 1) {
+            incomplete("testSuite identity/version/hash does not close to stored evidence");
+        }
+
+        JsonNode sandbox = snapshot.path("sandbox");
+        requireText(sandbox.path("fixtureVersion"), "sandbox.fixtureVersion");
+        requireDigest(sandbox.path("fixtureDigest"), "sandbox.fixtureDigest");
+
+        JsonNode results = snapshot.path("results");
+        for (String name : List.of("baseline", "sealReplay", "heldOut", "normalRegression")) {
+            JsonNode result = results.path(name);
+            if (!result.isObject()) {
+                incomplete("results." + name + " must be an object");
+            }
+            boolean notApplicable = "N_A".equals(result.path("status").asString());
+            if (notApplicable) {
+                requireText(result.path("reason"), "results." + name + ".reason");
+            } else {
+                validateFraction(result, "results." + name);
+                requireDigest(result.path("evidenceDigest"), "results." + name + ".evidenceDigest");
+            }
+            int sourceCount = validateSourceRuns(
+                    decision,
+                    snapshot,
+                    result.path("sourceRunIds"),
+                    "results." + name + ".sourceRunIds"
+            );
+            if ("PASS".equals(decision.decision()) && (notApplicable || sourceCount == 0)) {
+                incomplete("PASS Decision requires conclusive source evidence for results." + name);
+            }
+        }
+
+        JsonNode metrics = snapshot.path("metrics");
+        if (metrics.isEmpty()) {
+            incomplete("metrics must contain explicit values or N_A entries");
+        }
+        Set<String> metricNames = new HashSet<>();
+        for (int index = 0; index < metrics.size(); index++) {
+            JsonNode metric = metrics.get(index);
+            String path = "metrics[" + index + "]";
+            if (!metric.isObject()) {
+                incomplete(path + " must be an object");
+            }
+            requireText(metric.path("metric"), path + ".metric");
+            if (!metricNames.add(metric.path("metric").asString())) {
+                incomplete("metric names must be unique");
+            }
+            requireText(metric.path("calculatorVersion"), path + ".calculatorVersion");
+            boolean notApplicable = "N_A".equals(metric.path("status").asString());
+            if (notApplicable) {
+                requireText(metric.path("reason"), path + ".reason");
+            } else {
+                validateFraction(metric, path);
+                requireDigest(metric.path("evidenceDigest"), path + ".evidenceDigest");
+            }
+            int sourceCount = validateSourceRuns(
+                    decision,
+                    snapshot,
+                    metric.path("sourceTestRunIds"),
+                    path + ".sourceTestRunIds"
+            );
+            if ("PASS".equals(decision.decision()) && (notApplicable || sourceCount == 0)) {
+                incomplete("PASS Decision requires conclusive source evidence for " + path);
+            }
+        }
+
+        JsonNode findings = snapshot.path("remainingFindings");
+        for (int index = 0; index < findings.size(); index++) {
+            JsonNode finding = findings.get(index);
+            String path = "remainingFindings[" + index + "]";
+            if (!finding.isObject()) {
+                incomplete(path + " must be an object");
+            }
+            requireUuid(finding.path("id"), path + ".id");
+            requireText(finding.path("severity"), path + ".severity");
+            requireText(finding.path("status"), path + ".status");
+            requireDigest(finding.path("evidenceDigest"), path + ".evidenceDigest");
+            Integer matchingFinding = jdbcTemplate.queryForObject("""
+                    select count(*)
+                      from findings finding
+                      join oracle_results source on source.id = finding.source_oracle_result_id
+                     where finding.id = ? and finding.release_id = ?
+                       and finding.severity = ? and finding.status = ?
+                       and source.evidence_digest = ?
+                    """, Integer.class,
+                    UUID.fromString(finding.path("id").asString()),
+                    decision.releaseId(),
+                    finding.path("severity").asString(),
+                    finding.path("status").asString(),
+                    finding.path("evidenceDigest").asString()
+            );
+            if (matchingFinding == null || matchingFinding != 1) {
+                incomplete(path + " does not close to a Finding for this Release");
+            }
+        }
+
+        JsonNode patch = snapshot.path("approvedPatch");
+        if (!patch.isNull()) {
+            if (!patch.isObject()) {
+                incomplete("approvedPatch must be an object or null");
+            }
+            requireUuid(patch.path("proposalId"), "approvedPatch.proposalId");
+            requireUuid(patch.path("approvalId"), "approvedPatch.approvalId");
+            requireDigest(patch.path("baseHash"), "approvedPatch.baseHash");
+            requireDigest(patch.path("resultHash"), "approvedPatch.resultHash");
+            Integer matchingPatch = jdbcTemplate.queryForObject("""
+                    select count(*)
+                      from patch_approvals approval
+                      join patch_proposals proposal on proposal.id = approval.patch_proposal_id
+                      join findings finding on finding.id = proposal.finding_id
+                     where proposal.id = ? and approval.id = ? and finding.release_id = ?
+                       and approval.decision = 'APPROVED'
+                       and approval.base_hash = ? and approval.result_hash = ?
+                    """, Integer.class,
+                    UUID.fromString(patch.path("proposalId").asString()),
+                    UUID.fromString(patch.path("approvalId").asString()),
+                    decision.releaseId(),
+                    patch.path("baseHash").asString(),
+                    patch.path("resultHash").asString()
+            );
+            if (matchingPatch == null || matchingPatch != 1) {
+                incomplete("approvedPatch does not close to an approved Patch for this Release");
+            }
+        }
+
+        JsonNode ruleTrace = snapshot.at("/decision/ruleTrace");
+        if (ruleTrace.isEmpty()) {
+            incomplete("decision.ruleTrace must contain at least one applied rule");
+        }
+        for (int index = 0; index < ruleTrace.size(); index++) {
+            JsonNode rule = ruleTrace.get(index);
+            if (!rule.isObject()) {
+                incomplete("decision.ruleTrace entries must be objects");
+            }
+            requireText(rule.path("ruleId"), "decision.ruleTrace[" + index + "].ruleId");
+        }
+    }
+
+    private int validateSourceRuns(
+            DecisionSnapshot decision,
+            JsonNode snapshot,
+            JsonNode sourceIds,
+            String field
+    ) {
+        if (!sourceIds.isArray()) {
+            incomplete(field + " must be an array");
+        }
+        Set<UUID> unique = new HashSet<>();
+        for (JsonNode sourceId : sourceIds) {
+            requireUuid(sourceId, field);
+            UUID runId = UUID.fromString(sourceId.asString());
+            if (!unique.add(runId)) {
+                incomplete(field + " must not contain duplicate Run IDs");
+            }
+            Integer matches = jdbcTemplate.queryForObject("""
+                    select count(*) from test_runs
+                     where id = ? and release_id = ? and suite_id = ? and status = 'COMPLETED'
+                       and fixture_version = ? and fixture_digest = ?
+                       and agent_artifact_fingerprint = ? and release_fingerprint = ?
+                    """, Integer.class,
+                    runId,
+                    decision.releaseId(),
+                    UUID.fromString(snapshot.at("/testSuite/id").asString()),
+                    snapshot.at("/sandbox/fixtureVersion").asString(),
+                    snapshot.at("/sandbox/fixtureDigest").asString(),
+                    snapshot.at("/release/agentArtifactFingerprint").asString(),
+                    snapshot.at("/release/fingerprint").asString()
+            );
+            if (matches == null || matches != 1) {
+                incomplete(field + " contains a Run outside this Release");
+            }
+        }
+        return unique.size();
+    }
+
+    private void validateFraction(JsonNode value, String field) {
+        BigInteger numerator = fractionInteger(value.path("numerator"), field + ".numerator");
+        BigInteger denominator = fractionInteger(value.path("denominator"), field + ".denominator");
+        if (numerator.signum() < 0 || denominator.signum() <= 0 || numerator.compareTo(denominator) > 0) {
+            incomplete(field + " requires 0 <= numerator <= denominator and denominator > 0");
+        }
+    }
+
+    private BigInteger fractionInteger(JsonNode value, String field) {
+        if (value.isIntegralNumber()) {
+            return value.bigIntegerValue();
+        }
+        if (value.isString() && value.asString().matches("0|[1-9][0-9]*")) {
+            return new BigInteger(value.asString());
+        }
+        incomplete(field + " must be a non-negative integer");
+        return BigInteger.ZERO;
     }
 
     private Invalidation findInvalidation(UUID decisionId) {
@@ -474,6 +747,21 @@ public class AttestationService {
     private void requireDigest(JsonNode value, String field) {
         if (!value.isString() || !DIGEST.matcher(value.asString()).matches()) {
             incomplete(field + " must be a sha256 digest");
+        }
+    }
+
+    private void requireText(JsonNode value, String field) {
+        if (!value.isString() || value.asString().isBlank()) {
+            incomplete(field + " must be a non-blank string");
+        }
+    }
+
+    private void requireUuid(JsonNode value, String field) {
+        requireText(value, field);
+        try {
+            UUID.fromString(value.asString());
+        } catch (IllegalArgumentException exception) {
+            incomplete(field + " must be a UUID");
         }
     }
 
