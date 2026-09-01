@@ -237,6 +237,11 @@ class IdempotencyRecoveryIntegrationTest {
                    set transition_secret_hash = digest('attacker-chosen-secret', 'sha256')
                  where id = ?
                 """, instanceLease.instanceId()));
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                update application_instance_leases
+                   set lease_expires_at = heartbeat_at, stopped_at = now()
+                 where id = ?
+                """, instanceLease.instanceId()));
 
         UUID readyId = seedRecoveryRequired("mismatch-" + suffix, body);
         Instant expiresAt = jdbcTemplate.queryForObject(
@@ -304,6 +309,60 @@ class IdempotencyRecoveryIntegrationTest {
                 select state, recovery_reason from api_idempotency_records where id = ?
                 """, recordId)).containsEntry("state", "RECOVERY_REQUIRED")
                 .containsEntry("recovery_reason", "OWNER_LEASE_EXPIRED");
+    }
+
+    @Test
+    void reconcilerSkipsALeaseWhoseOwnerIsHeartbeatUpdating() throws Exception {
+        UUID owner = UUID.randomUUID();
+        Instant stale = Instant.now().minusSeconds(120);
+        jdbcTemplate.update("""
+                insert into application_instance_leases
+                    (id, started_at, heartbeat_at, lease_expires_at, transition_secret_hash)
+                values (?, ?, ?, ?, digest('race-owner-secret', 'sha256'))
+                """,
+                owner,
+                java.sql.Timestamp.from(stale),
+                java.sql.Timestamp.from(stale),
+                java.sql.Timestamp.from(stale.plusSeconds(30))
+        );
+        UUID recordId = seedProcessing(
+                "heartbeat-race-" + UUID.randomUUID().toString().substring(0, 8),
+                "{\"race\":true}",
+                owner,
+                true
+        );
+
+        try (var first = jdbcTemplate.getDataSource().getConnection();
+             var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            first.setAutoCommit(false);
+            try (var heartbeat = first.prepareStatement("""
+                    with transition_proof as (
+                        select set_config('finsec.idempotency_transition_secret', 'race-owner-secret', true)
+                    )
+                    update application_instance_leases
+                       set heartbeat_at = now(), lease_expires_at = now() + interval '30 seconds'
+                      from transition_proof
+                     where id = ?
+                    """)) {
+                heartbeat.setObject(1, owner);
+                assertThat(heartbeat.executeUpdate()).isEqualTo(1);
+            }
+            var reconciliation = executor.submit(instanceLease::heartbeatAndReconcile);
+            reconciliation.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            assertThat(jdbcTemplate.queryForObject(
+                    "select state from api_idempotency_records where id = ?",
+                    String.class,
+                    recordId
+            )).isEqualTo("PROCESSING");
+            first.commit();
+        }
+
+        instanceLease.heartbeatAndReconcile();
+        assertThat(jdbcTemplate.queryForObject(
+                "select state from api_idempotency_records where id = ?",
+                String.class,
+                recordId
+        )).isEqualTo("PROCESSING");
     }
 
     private UUID seedRecoveryRequired(String key, String body) {

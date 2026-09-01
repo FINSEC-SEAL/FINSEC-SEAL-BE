@@ -12,7 +12,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Transactional;
 
 @Component
 public class IdempotencyInstanceLease {
@@ -61,28 +60,39 @@ public class IdempotencyInstanceLease {
     }
 
     @Scheduled(fixedDelayString = "${finsec.idempotency.instance-heartbeat-ms:5000}")
-    @Transactional
     public void heartbeatAndReconcile() {
         Instant now = Instant.now();
         jdbcTemplate.update("""
+                with transition_proof as (
+                    select set_config('finsec.idempotency_transition_secret', ?, true)
+                )
                 update application_instance_leases set heartbeat_at = ?, lease_expires_at = ?
+                  from transition_proof
                  where id = ? and stopped_at is null
-                """, Timestamp.from(now), Timestamp.from(now.plus(staleAfter)), instanceId);
+                """,
+                transitionSecret,
+                Timestamp.from(now),
+                Timestamp.from(now.plus(staleAfter)),
+                instanceId
+        );
         jdbcTemplate.update("""
+                with recoverable as materialized (
+                    select record.id
+                      from api_idempotency_records record
+                      join application_instance_leases lease on lease.id = record.owner_instance_id
+                     where record.state = 'PROCESSING' and record.expires_at <= ?
+                       and (lease.stopped_at is not null or lease.lease_expires_at <= ?)
+                     for update of record, lease skip locked
+                )
                 update api_idempotency_records record
                    set state = 'RECOVERY_REQUIRED', execution_finished_at = ?,
                        recovery_reason = 'OWNER_LEASE_EXPIRED'
-                 where record.state = 'PROCESSING' and record.expires_at <= ?
-                   and exists (
-                       select 1 from application_instance_leases lease
-                        where lease.id = record.owner_instance_id
-                          and (lease.stopped_at is not null or lease.lease_expires_at <= ?)
-                   )
+                  from recoverable
+                 where record.id = recoverable.id
                 """,
                 Timestamp.from(now),
                 Timestamp.from(now),
                 Timestamp.from(now)
         );
     }
-
 }

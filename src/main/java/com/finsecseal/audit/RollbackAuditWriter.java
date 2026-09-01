@@ -87,4 +87,3 @@ public class RollbackAuditWriter {
         dataSource.close();
     }
 }
-

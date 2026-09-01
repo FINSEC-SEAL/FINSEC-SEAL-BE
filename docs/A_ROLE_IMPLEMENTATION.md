@@ -35,6 +35,8 @@
   그대로 replay하고 다른 body는 409, 미완료 reservation은 fail-closed 처리
 - 인스턴스 lease/heartbeat로 실행 주체를 추적하는 `PROCESSING → RECOVERY_REQUIRED`
   fail-closed 멱등성 상태 머신과 audited `RELEASE`/`COMPLETE` 운영자 복구
+- 인스턴스 메모리의 256-bit secret/DB hash proof로 request completion과 lease heartbeat를
+  소유자에게 귀속시키고, stale reconciliation은 locked lease를 건너뛰어 heartbeat와 경합하지 않음
 - 잘못된 복구 인증을 멱등성 예약 전에 거부하고, 복구 응답의 status/content type/
   Location/trace/body digest 전체를 하나의 canonical response digest로 봉인
 - transaction rollback 후 메인 pool과 분리된 전용 2-connection audit pool에서 동기 commit하는

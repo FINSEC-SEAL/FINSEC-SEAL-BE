@@ -398,3 +398,33 @@
 - Reverification: `git diff --check` 성공. PostgreSQL `17.11-alpine`에서
   `./gradlew clean test --warning-mode all --rerun-tasks` 전체 65 tests,
   실패/오류/skip 0건. fixed commit 후 fifth review 요청 예정
+
+## G2 — Fifth review
+
+- Result: rejected during independent fixed-commit review
+- Reviewed fixed commit: `089cfcdc006b5baa637051090835f1909828dcc4`
+- Independent verification: PostgreSQL `17.11-alpine` 전체 65 tests 통과,
+  transition proof가 정상 HTTP completion과 forged secret/hash 변경을 의도대로 분리함
+- Remaining feedback:
+  - application lease의 `lease_expires_at`/`stopped_at`은 owner proof 없이 변경 가능해
+    expired reservation을 `OWNER_LEASE_EXPIRED`로 위조할 수 있음
+  - stale reconciler가 lease row lock 없이 heartbeat snapshot을 읽으면 활성 owner의 동시
+    heartbeat를 놓치고 recovery-ready로 전환할 수 있음
+  - `RollbackAuditWriter.java` EOF blank line으로 fixed commit 대상 `git diff --check` 실패
+- Gate: G2 FAIL
+
+## G2 — Fifth review feedback applied
+
+- Lease mutation:
+  - heartbeat/expiry/stop 변경도 인스턴스 transition secret proof가 있는 단일 SQL에서만 허용
+  - heartbeat와 lease expiry의 단조 증가, 이미 stopped된 lease의 추가 변경 거부
+  - proof 없는 expiry 축소/stopped 위조를 PostgreSQL negative test로 차단
+- Heartbeat/reconciler serialization:
+  - own heartbeat를 독립 statement로 먼저 commit한 뒤 stale reconciliation 실행
+  - stale 후보의 reservation과 lease를 `FOR UPDATE OF record, lease SKIP LOCKED`로 선점해
+    진행 중인 heartbeat lease는 건너뛰
+  - two-connection test에서 owner heartbeat가 lease lock을 잡은 동안 reconciler가 종료되더라도
+    reservation은 `PROCESSING`을 유지하고, heartbeat commit 후 재조회해도 유지됨을 검증
+- Hygiene: `RollbackAuditWriter.java` EOF 공백 제거, `git diff --check` 성공
+- Reverification: PostgreSQL `17.11-alpine` 전체 66 tests,
+  실패/오류/skip 0건. fixed commit 후 sixth review 요청 예정
