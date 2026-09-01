@@ -158,3 +158,24 @@
   real HTTP idempotent replay/body conflict/missing key/processing reservation 테스트 포함
   `./gradlew clean test --warning-mode all` 성공
 - Review status: fixed commit을 생성해 선임 G2 리뷰 요청 예정
+
+## G1 — Seventh review
+
+- Result: rejected
+- Verified before review: fixed commit `16bb82f`, PostgreSQL 17.11 및 전체 Gradle test 성공
+- Passed from prior review: terminal parent 아래 CaseRun/Event 차단, 실제 child/counter 대조,
+  direct terminal Run 차단, Event→terminal 및 Suite/Approval/Decision row-lock 직렬화
+- Remaining P0 feedback:
+  - `total_cases`를 terminal 전이와 동시에 축소하면 planned coverage를 거짓 완료할 수 있음
+  - Oracle/Finding INSERT가 parent Run을 lock하거나 terminal 상태를 확인하지 않아 종료 뒤 증거를
+    추가하거나 terminal 전이와 경쟁할 수 있음
+- Applied:
+  - `total_cases`를 Run identity snapshot에 포함해 생성 이후 변경을 전면 차단
+  - terminal 시 `operational_error_count`를 실제 `ERROR` CaseRun 수와 대조
+  - Oracle INSERT와 새 Finding INSERT가 source TestRun row를 `FOR UPDATE`하고 terminal이면 거부
+  - 새 Finding의 `first_seen_run_id`가 source Oracle의 Run과 동일하도록 강제
+  - planned-total downshift, forged operational error count, late Oracle/Finding negative test 추가
+  - Oracle/Finding commit과 terminal 전이 경쟁은 두 connection과 PostgreSQL `lock_timeout`을 사용해
+    실제 row-lock 대기(`55P03`)와 증거 commit 후 정상 terminal 전이를 검증
+- Reverification: 실제 PostgreSQL 17.11 대상 `MigrationIntegrationTest` 성공. 전체 test 및 fixed commit
+  생성 후 8차 검토 요청 예정

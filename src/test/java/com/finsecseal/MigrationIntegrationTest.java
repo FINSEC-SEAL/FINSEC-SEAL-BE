@@ -293,11 +293,90 @@ class MigrationIntegrationTest {
         );
         insertCaseRun("0198f200-0000-7000-8000-000000000079",
                 "0198f200-0000-7000-8000-000000000057", 0, "CANCELLED", hashA, true);
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                update test_runs
+                   set total_cases = 1, status = 'CANCELLED', completed_cases = 1, completed_at = now()
+                 where id = '0198f200-0000-7000-8000-000000000057'
+                """));
         assertThat(jdbcTemplate.update("""
                 update test_runs
                    set status = 'CANCELLED', completed_cases = 1, completed_at = now()
                  where id = '0198f200-0000-7000-8000-000000000057'
                 """)).isEqualTo(1);
+
+        insertActiveRun(
+                "0198f200-0000-7000-8000-000000000058",
+                "0198f200-0000-7000-8000-000000000012",
+                "BASELINE",
+                null,
+                "0198f200-0000-7000-8000-000000000207",
+                hashC,
+                hashC,
+                42,
+                1
+        );
+        insertCaseRun("0198f200-0000-7000-8000-000000000128",
+                "0198f200-0000-7000-8000-000000000058", 0, "ERROR", hashA, true);
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                update test_runs
+                   set status = 'FAILED', completed_cases = 1, operational_error_count = 0,
+                       completed_at = now()
+                 where id = '0198f200-0000-7000-8000-000000000058'
+                """));
+        assertThat(jdbcTemplate.update("""
+                update test_runs
+                   set status = 'FAILED', completed_cases = 1, operational_error_count = 1,
+                       completed_at = now()
+                 where id = '0198f200-0000-7000-8000-000000000058'
+                """)).isEqualTo(1);
+        assertSqlState("55000", () -> insertOracle(
+                null,
+                "0198f200-0000-7000-8000-000000000129",
+                "0198f200-0000-7000-8000-000000000128",
+                "LATE_ORACLE",
+                "INV-LATE-ORACLE",
+                hashA
+        ));
+
+        insertActiveRun(
+                "0198f200-0000-7000-8000-000000000059",
+                "0198f200-0000-7000-8000-000000000012",
+                "BASELINE",
+                null,
+                "0198f200-0000-7000-8000-000000000208",
+                hashC,
+                hashC,
+                42,
+                1
+        );
+        insertCaseRun("0198f200-0000-7000-8000-000000000130",
+                "0198f200-0000-7000-8000-000000000059", 0, "PASSED", hashA, true);
+        assertOracleCommitPrecedesTerminalTransition(hashA);
+
+        insertActiveRun(
+                "0198f200-0000-7000-8000-000000000060",
+                "0198f200-0000-7000-8000-000000000012",
+                "BASELINE",
+                null,
+                "0198f200-0000-7000-8000-000000000209",
+                hashC,
+                hashC,
+                42,
+                1
+        );
+        insertCaseRun("0198f200-0000-7000-8000-000000000133",
+                "0198f200-0000-7000-8000-000000000060", 0, "PASSED", hashA, true);
+        insertOracle(null, "0198f200-0000-7000-8000-000000000134",
+                "0198f200-0000-7000-8000-000000000133", "FINDING_SOURCE", "INV-FINDING-1", hashA);
+        insertOracle(null, "0198f200-0000-7000-8000-000000000135",
+                "0198f200-0000-7000-8000-000000000133", "FINDING_SOURCE", "INV-FINDING-2", hashA);
+        assertFindingCommitPrecedesTerminalTransition();
+        assertSqlState("55000", () -> insertFinding(
+                null,
+                "0198f200-0000-7000-8000-000000000138",
+                "0198f200-0000-7000-8000-000000000135",
+                "0198f200-0000-7000-8000-000000000060"
+        ));
         assertSqlState("23514", () -> jdbcTemplate.update("""
                 insert into evidence_references
                     (id, workspace_id, owner_type, owner_id, evidence_type, source_event_id,
@@ -1004,6 +1083,78 @@ class MigrationIntegrationTest {
         }
     }
 
+    private void assertOracleCommitPrecedesTerminalTransition(String evidenceDigest) throws Exception {
+        try (Connection first = dataSource.getConnection(); var executor = Executors.newSingleThreadExecutor()) {
+            first.setAutoCommit(false);
+            insertOracle(
+                    first,
+                    "0198f200-0000-7000-8000-000000000131",
+                    "0198f200-0000-7000-8000-000000000130",
+                    "RACE_ORACLE",
+                    "INV-RACE-ORACLE",
+                    evidenceDigest
+            );
+
+            Future<String> terminalAttempt = executor.submit(() -> attemptTerminalWithLockTimeout(
+                    "0198f200-0000-7000-8000-000000000059"
+            ));
+            assertThat(terminalAttempt.get(5, TimeUnit.SECONDS)).isEqualTo("55P03");
+
+            first.commit();
+            completeRun("0198f200-0000-7000-8000-000000000059", "COMPLETED", 1);
+        }
+
+        assertSqlState("55000", () -> insertOracle(
+                null,
+                "0198f200-0000-7000-8000-000000000132",
+                "0198f200-0000-7000-8000-000000000130",
+                "LATE_ORACLE",
+                "INV-LATE-RACE-ORACLE",
+                evidenceDigest
+        ));
+    }
+
+    private void assertFindingCommitPrecedesTerminalTransition() throws Exception {
+        try (Connection first = dataSource.getConnection(); var executor = Executors.newSingleThreadExecutor()) {
+            first.setAutoCommit(false);
+            insertFinding(
+                    first,
+                    "0198f200-0000-7000-8000-000000000136",
+                    "0198f200-0000-7000-8000-000000000134",
+                    "0198f200-0000-7000-8000-000000000060"
+            );
+
+            Future<String> terminalAttempt = executor.submit(() -> attemptTerminalWithLockTimeout(
+                    "0198f200-0000-7000-8000-000000000060"
+            ));
+            assertThat(terminalAttempt.get(5, TimeUnit.SECONDS)).isEqualTo("55P03");
+
+            first.commit();
+            completeRun("0198f200-0000-7000-8000-000000000060", "COMPLETED", 1);
+        }
+    }
+
+    private String attemptTerminalWithLockTimeout(String runId) {
+        try (Connection connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            try (PreparedStatement timeout = connection.prepareStatement("set local lock_timeout = '250ms'")) {
+                timeout.execute();
+            }
+            try (PreparedStatement statement = connection.prepareStatement("""
+                    update test_runs
+                       set status = 'COMPLETED', completed_cases = 1, completed_at = now()
+                     where id = ?::uuid
+                    """)) {
+                statement.setString(1, runId);
+                statement.executeUpdate();
+            }
+            connection.commit();
+            return "committed";
+        } catch (SQLException exception) {
+            return exception.getSQLState();
+        }
+    }
+
     private void assertConcurrentSuiteMutationRejected(
             String releaseFingerprint,
             String fixtureHash,
@@ -1189,6 +1340,66 @@ class MigrationIntegrationTest {
             statement.setString(6, previousHash);
             statement.setString(7, eventHash);
             statement.executeUpdate();
+        }
+    }
+
+    private void insertOracle(
+            Connection connection,
+            String oracleId,
+            String caseRunId,
+            String oracleType,
+            String invariantId,
+            String evidenceDigest
+    ) {
+        String sql = """
+                insert into oracle_results
+                    (id, test_case_run_id, oracle_type, oracle_version, outcome, reason_code,
+                     invariant_id, evidence_json, evidence_digest, evaluated_at, created_at, updated_at)
+                values (?::uuid, ?::uuid, ?, '1.0', 'NORMAL_SUCCESS', 'EXPECTED_RESULT', ?,
+                        '{}'::jsonb, ?, now(), now(), now())
+                """;
+        try {
+            if (connection == null) {
+                jdbcTemplate.update(sql, oracleId, caseRunId, oracleType, invariantId, evidenceDigest);
+                return;
+            }
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setString(1, oracleId);
+                statement.setString(2, caseRunId);
+                statement.setString(3, oracleType);
+                statement.setString(4, invariantId);
+                statement.setString(5, evidenceDigest);
+                statement.executeUpdate();
+            }
+        } catch (SQLException exception) {
+            throw new RuntimeException(exception);
+        }
+    }
+
+    private void insertFinding(Connection connection, String findingId, String oracleId, String runId) {
+        String sql = """
+                insert into findings
+                    (id, release_id, source_oracle_result_id, category, severity, title, status,
+                     violated_invariant, root_cause_json, first_seen_run_id, latest_seen_run_id,
+                     created_at, updated_at)
+                values (?::uuid, '0198f200-0000-7000-8000-000000000012', ?::uuid,
+                        'SCOPE', 'HIGH', 'Synthetic race finding', 'OPEN', 'INV-RACE', '{}'::jsonb,
+                        ?::uuid, ?::uuid, now(), now())
+                """;
+        try {
+            if (connection == null) {
+                jdbcTemplate.update(sql, findingId, oracleId, runId, runId);
+                return;
+            }
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setString(1, findingId);
+                statement.setString(2, oracleId);
+                statement.setString(3, runId);
+                statement.setString(4, runId);
+                statement.executeUpdate();
+            }
+        } catch (SQLException exception) {
+            throw new RuntimeException(exception);
         }
     }
 

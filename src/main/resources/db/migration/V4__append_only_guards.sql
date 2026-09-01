@@ -237,6 +237,7 @@ AS $$
 DECLARE
     child_count integer;
     terminal_child_count integer;
+    error_child_count integer;
 BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION 'test run cannot be deleted' USING ERRCODE = '55000';
@@ -252,7 +253,8 @@ BEGIN
        OR NEW.fixture_version IS DISTINCT FROM OLD.fixture_version
        OR NEW.fixture_digest IS DISTINCT FROM OLD.fixture_digest
        OR NEW.model_config_hash IS DISTINCT FROM OLD.model_config_hash
-       OR NEW.random_seed IS DISTINCT FROM OLD.random_seed THEN
+       OR NEW.random_seed IS DISTINCT FROM OLD.random_seed
+       OR NEW.total_cases IS DISTINCT FROM OLD.total_cases THEN
         RAISE EXCEPTION 'test run identity snapshot is immutable' USING ERRCODE = '55000';
     END IF;
     IF OLD.status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN
@@ -264,7 +266,8 @@ BEGIN
     IF NEW.status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN
         SELECT count(*), count(*) FILTER (
             WHERE status IN ('PASSED', 'FAILED_SECURITY', 'FAILED_FUNCTIONAL', 'ERROR', 'CANCELLED')
-        ) INTO child_count, terminal_child_count
+        ), count(*) FILTER (WHERE status = 'ERROR')
+          INTO child_count, terminal_child_count, error_child_count
           FROM test_case_runs WHERE test_run_id = OLD.id;
         IF child_count <> terminal_child_count OR NEW.completed_cases <> terminal_child_count THEN
             RAISE EXCEPTION 'terminal test run requires every materialized child sealed and counters reconciled'
@@ -272,6 +275,10 @@ BEGIN
         END IF;
         IF NEW.status = 'COMPLETED' AND child_count <> NEW.total_cases THEN
             RAISE EXCEPTION 'completed test run requires all planned cases materialized and completed'
+                USING ERRCODE = '23514';
+        END IF;
+        IF NEW.operational_error_count <> error_child_count THEN
+            RAISE EXCEPTION 'terminal test run operational error count must match ERROR children'
                 USING ERRCODE = '23514';
         END IF;
     END IF;
@@ -581,12 +588,21 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     oracle_run uuid;
+    oracle_run_status varchar(30);
     event_run uuid;
     event_case_run uuid;
 BEGIN
-    SELECT test_run_id INTO oracle_run FROM test_case_runs WHERE id = NEW.test_case_run_id;
+    SELECT run.id, run.status INTO oracle_run, oracle_run_status
+      FROM test_case_runs case_run
+      JOIN test_runs run ON run.id = case_run.test_run_id
+     WHERE case_run.id = NEW.test_case_run_id
+     FOR UPDATE OF run;
     IF oracle_run IS NULL THEN
         RAISE EXCEPTION 'oracle case-run does not exist' USING ERRCODE = '23503';
+    END IF;
+    IF oracle_run_status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN
+        RAISE EXCEPTION 'oracle evidence cannot be appended after run termination'
+            USING ERRCODE = '55000';
     END IF;
     IF NEW.source_event_id IS NOT NULL THEN
         SELECT run_id, test_case_run_id INTO event_run, event_case_run
@@ -610,17 +626,28 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     oracle_release uuid;
+    oracle_run uuid;
+    oracle_run_status varchar(30);
     first_release uuid;
     latest_release uuid;
 BEGIN
-    SELECT tr.release_id INTO oracle_release
+    SELECT tr.release_id, tr.id, tr.status INTO oracle_release, oracle_run, oracle_run_status
       FROM oracle_results result JOIN test_case_runs tcr ON tcr.id = result.test_case_run_id
-      JOIN test_runs tr ON tr.id = tcr.test_run_id WHERE result.id = NEW.source_oracle_result_id;
+      JOIN test_runs tr ON tr.id = tcr.test_run_id WHERE result.id = NEW.source_oracle_result_id
+      FOR UPDATE OF tr;
+    IF TG_OP = 'INSERT' AND oracle_run_status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN
+        RAISE EXCEPTION 'finding evidence cannot be created after source run termination'
+            USING ERRCODE = '55000';
+    END IF;
     SELECT release_id INTO first_release FROM test_runs WHERE id = NEW.first_seen_run_id;
     SELECT release_id INTO latest_release FROM test_runs WHERE id = NEW.latest_seen_run_id;
     IF oracle_release IS NULL OR oracle_release <> NEW.release_id
        OR first_release IS DISTINCT FROM NEW.release_id OR latest_release IS DISTINCT FROM NEW.release_id THEN
         RAISE EXCEPTION 'finding evidence and runs must belong to the same release' USING ERRCODE = '23514';
+    END IF;
+    IF TG_OP = 'INSERT' AND oracle_run IS DISTINCT FROM NEW.first_seen_run_id THEN
+        RAISE EXCEPTION 'new finding first-seen run must own its source oracle evidence'
+            USING ERRCODE = '23514';
     END IF;
     RETURN NEW;
 END;
