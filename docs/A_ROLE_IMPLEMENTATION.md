@@ -37,8 +37,8 @@
   fail-closed 멱등성 상태 머신과 audited `RELEASE`/`COMPLETE` 운영자 복구
 - 잘못된 복구 인증을 멱등성 예약 전에 거부하고, 복구 응답의 status/content type/
   Location/trace/body digest 전체를 하나의 canonical response digest로 봉인
-- transaction rollback 후 bounded async worker의 새 transaction으로 복원하는 system prompt
-  plaintext 접근 audit
+- transaction rollback 후 메인 pool과 분리된 전용 2-connection audit pool에서 동기 commit하는
+  system prompt plaintext 접근 audit(인메모리 queue 미사용)
 
 ### G3 — TestRun, Trace, Evidence and Audit delivery
 

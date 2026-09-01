@@ -210,6 +210,33 @@ class IdempotencyRecoveryIntegrationTest {
                 "delete from api_idempotency_records where id = ?",
                 activeId
         ));
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                update api_idempotency_records
+                   set state = 'RECOVERY_REQUIRED', execution_finished_at = now(),
+                       recovery_reason = 'FORGED'
+                 where id = ?
+                """, activeId));
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                update api_idempotency_records
+                   set state = 'RECOVERY_REQUIRED', execution_finished_at = now(),
+                       recovery_reason = 'HTTP_5XX_RESPONSE'
+                 where id = ?
+                """, activeId));
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                with forged_proof as (
+                    select set_config('finsec.idempotency_transition_secret', 'forged-secret', true)
+                )
+                update api_idempotency_records
+                   set state = 'RECOVERY_REQUIRED', execution_finished_at = now(),
+                       recovery_reason = 'HTTP_5XX_RESPONSE'
+                  from forged_proof
+                 where id = ?
+                """, activeId));
+        assertSqlState("55000", () -> jdbcTemplate.update("""
+                update application_instance_leases
+                   set transition_secret_hash = digest('attacker-chosen-secret', 'sha256')
+                 where id = ?
+                """, instanceLease.instanceId()));
 
         UUID readyId = seedRecoveryRequired("mismatch-" + suffix, body);
         Instant expiresAt = jdbcTemplate.queryForObject(
@@ -255,9 +282,15 @@ class IdempotencyRecoveryIntegrationTest {
         UUID staleInstance = UUID.randomUUID();
         Instant stale = Instant.now().minusSeconds(120);
         jdbcTemplate.update("""
-                insert into application_instance_leases (id, started_at, heartbeat_at)
-                values (?, ?, ?)
-                """, staleInstance, java.sql.Timestamp.from(stale), java.sql.Timestamp.from(stale));
+                insert into application_instance_leases
+                    (id, started_at, heartbeat_at, lease_expires_at, transition_secret_hash)
+                values (?, ?, ?, ?, digest('stale-test-secret', 'sha256'))
+                """,
+                staleInstance,
+                java.sql.Timestamp.from(stale),
+                java.sql.Timestamp.from(stale),
+                java.sql.Timestamp.from(stale.plusSeconds(30))
+        );
         UUID recordId = seedProcessing(
                 "stale-owner-" + UUID.randomUUID().toString().substring(0, 8),
                 "{\"orphan\":true}",

@@ -357,3 +357,44 @@
 - Reverification: `git diff --check` 성공. 실제 PostgreSQL `17.11-alpine`에서
   `./gradlew clean test --warning-mode all --rerun-tasks` 전체 64 tests,
   실패/오류/skip 0건. fixed commit 생성 후 동일 선임에게 fourth review 요청 예정
+
+## G2 — Fourth review
+
+- Result: rejected
+- Reviewed fixed commit: `981294ca012efba72f34b042d700c9532cd054d4`
+- Independent verification: clean fixed commit, `git diff --check`, PostgreSQL `17.11-alpine`
+  전체 64 tests는 모두 통과
+- P0 feedback and reproduction:
+  - V9 trigger가 주체/lease 증명 없이 모든 `PROCESSING → RECOVERY_REQUIRED` UPDATE를 허용
+  - active row에 `execution_finished_at`/`recovery_reason`을 직접 채운 뒤 exact RELEASE recovery를
+    INSERT하면 활성 reservation DELETE가 가능한 2단계 우회
+- Additional review observations:
+  - rollback audit의 in-memory async queue는 process 종료 시 접근 증적을 잃을 수 있음
+  - historical Decision snapshot의 Finding status를 현재 mutable Finding status와 재대조하면 과거
+    Attestation이 사후 상태 변경에 결합될 수 있음
+  - direct invalidation INSERT도 Attestation과 같은 Release parent lock에 직렬화할 필요
+- Gate: G2 FAIL
+
+## G2 — Fourth review feedback applied
+
+- Idempotency transition proof:
+  - 인스턴스 메모리에만 있는 256-bit random secret과 DB의 SHA-256 hash를 단일 SQL
+    statement 안에서 대조해 owner만 `COMPLETED`/5xx·예외 `RECOVERY_REQUIRED` 전환 가능
+  - transition secret hash와 instance identity를 DB trigger로 불변화
+  - owner lease expiry와 reservation TTL이 모두 만료된 `OWNER_LEASE_EXPIRED`만 proof 없이 허용
+  - FORGED 사유, 정상 사유 위조, 위조 proof, secret hash 교체를 모두 DB negative test로 차단
+- Prompt audit durability:
+  - in-memory async queue를 제거하고 메인 transaction pool과 분리된 전용 2-connection pool에서
+    `AFTER_ROLLBACK` audit를 동기 commit
+  - 메인 Hikari pool 2개를 모두 점유한 동시 rollback 2건이 교착 없이 완료되고
+    반환 시점에 audit가 이미 저장됐음을 검증
+- Historical Attestation:
+  - Finding ID/release/severity/source Oracle evidence digest는 immutable provenance로 대조하되,
+    Decision 후 변경 가능한 현재 Finding status는 historical snapshot에 재투영하지 않음
+  - DecisionInvalidation INSERT에도 Release parent `FOR UPDATE`를 추가해 Attestation/latest
+    Decision/invalidation을 하나의 직렬화 지점으로 통일
+  - direct invalidation이 이미 잡힌 Release lock에 대기한 뒤 stale Attestation이 되는
+    two-connection concurrency test 추가
+- Reverification: `git diff --check` 성공. PostgreSQL `17.11-alpine`에서
+  `./gradlew clean test --warning-mode all --rerun-tasks` 전체 65 tests,
+  실패/오류/skip 0건. fixed commit 후 fifth review 요청 예정

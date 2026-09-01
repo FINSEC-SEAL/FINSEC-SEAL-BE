@@ -94,3 +94,25 @@ $$;
 CREATE TRIGGER release_attestation_projection_guard
 BEFORE INSERT ON release_attestations
 FOR EACH ROW EXECUTE FUNCTION finsec_validate_release_attestation();
+
+CREATE OR REPLACE FUNCTION finsec_lock_decision_invalidation_release()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    decision_release_id uuid;
+BEGIN
+    SELECT release_id INTO decision_release_id
+      FROM release_decisions
+     WHERE id = NEW.release_decision_id;
+    IF decision_release_id IS NULL THEN
+        RAISE EXCEPTION 'invalidation decision does not exist' USING ERRCODE = '23503';
+    END IF;
+    PERFORM 1 FROM agent_releases WHERE id = decision_release_id FOR UPDATE;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER decision_invalidation_release_lock
+BEFORE INSERT ON decision_invalidations
+FOR EACH ROW EXECUTE FUNCTION finsec_lock_decision_invalidation_release();

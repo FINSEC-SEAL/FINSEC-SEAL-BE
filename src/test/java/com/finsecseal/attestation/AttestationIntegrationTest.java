@@ -324,6 +324,28 @@ class AttestationIntegrationTest {
         }
     }
 
+    @Test
+    void directInvalidationInsertSerializesOnTheReleaseParentLock() throws Exception {
+        Seed seed = seedDecision("direct-invalidation-lock", false);
+        try (Connection first = dataSource.getConnection(); var executor = Executors.newSingleThreadExecutor()) {
+            first.setAutoCommit(false);
+            lockRelease(first, seed.releaseId());
+            var invalidation = executor.submit(() -> jdbcTemplate.update("""
+                    insert into decision_invalidations
+                        (id, release_decision_id, reasons_json, invalidated_by, invalidated_at, created_at)
+                    values (?, ?, '{"reason":"MODEL_CHANGE"}'::jsonb, 'reviewer', now(), now())
+                    """, UUID.randomUUID(), seed.decisionId()));
+
+            assertThatThrownBy(() -> invalidation.get(200, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(java.util.concurrent.TimeoutException.class);
+            first.rollback();
+            assertThat(invalidation.get(5, TimeUnit.SECONDS)).isEqualTo(1);
+        }
+
+        assertThat(attestationService.findOrCreate(seed.releaseId(), "governance-reviewer").stale())
+                .isTrue();
+    }
+
     private Seed seedDecision(String suffix, boolean badDigest) throws IOException {
         return seedDecision(suffix, badDigest, snapshot -> { });
     }

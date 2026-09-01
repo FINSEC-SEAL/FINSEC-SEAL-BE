@@ -229,6 +229,9 @@ public class IdempotencyFilter extends OncePerRequestFilter {
     ) {
         Instant now = Instant.now();
         int updated = jdbcTemplate.update("""
+                with transition_proof as (
+                    select set_config('finsec.idempotency_transition_secret', ?, true)
+                )
                 update api_idempotency_records
                    set state = 'COMPLETED', response_status = ?, response_content_type = ?,
                        response_location = ?, response_trace_id = ?::uuid, response_body = ?,
@@ -236,7 +239,9 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                        expires_at = ?
                  where workspace_id = ? and actor_id = ? and http_method = ? and request_path = ?
                    and idempotency_key = ? and request_digest = ? and state = 'PROCESSING'
+                   and (select count(*) from transition_proof) = 1
                 """,
+                instanceLease.transitionSecret(),
                 status,
                 contentType,
                 location,
@@ -267,12 +272,17 @@ public class IdempotencyFilter extends OncePerRequestFilter {
     ) {
         Instant now = Instant.now();
         int updated = jdbcTemplate.update("""
+                with transition_proof as (
+                    select set_config('finsec.idempotency_transition_secret', ?, true)
+                )
                 update api_idempotency_records
                    set state = 'RECOVERY_REQUIRED', execution_finished_at = ?, recovery_reason = ?
                  where workspace_id = ? and actor_id = ? and http_method = ? and request_path = ?
                    and idempotency_key = ? and request_digest = ? and state = 'PROCESSING'
                    and owner_instance_id = ?
+                   and (select count(*) from transition_proof) = 1
                 """,
+                instanceLease.transitionSecret(),
                 Timestamp.from(now),
                 reason,
                 AgentService.DEMO_WORKSPACE_ID,

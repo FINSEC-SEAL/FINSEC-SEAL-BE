@@ -532,13 +532,12 @@ public class AttestationService {
                       from findings finding
                       join oracle_results source on source.id = finding.source_oracle_result_id
                      where finding.id = ? and finding.release_id = ?
-                       and finding.severity = ? and finding.status = ?
+                       and finding.severity = ?
                        and source.evidence_digest = ?
                     """, Integer.class,
                     UUID.fromString(finding.path("id").asString()),
                     decision.releaseId(),
                     finding.path("severity").asString(),
-                    finding.path("status").asString(),
                     finding.path("evidenceDigest").asString()
             );
             if (matchingFinding == null || matchingFinding != 1) {

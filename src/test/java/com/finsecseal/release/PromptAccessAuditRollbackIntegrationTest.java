@@ -1,7 +1,6 @@
 package com.finsecseal.release;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.awaitility.Awaitility.await;
 
 import com.finsecseal.agent.AgentDto;
 import com.finsecseal.agent.AgentService;
@@ -62,10 +61,8 @@ class PromptAccessAuditRollbackIntegrationTest {
             assertThat(secondFailure.get(5, TimeUnit.SECONDS)).isInstanceOf(BusinessException.class);
         }
 
-        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
-            assertThat(promptAuditCount(first.id())).isEqualTo(firstBefore + 2);
-            assertThat(promptAuditCount(second.id())).isEqualTo(secondBefore + 2);
-        });
+        assertThat(promptAuditCount(first.id())).isEqualTo(firstBefore + 2);
+        assertThat(promptAuditCount(second.id())).isEqualTo(secondBefore + 2);
         assertThat(latestPurpose(first.id())).isEqualTo("FINGERPRINT_INTEGRITY_CHECK");
         assertThat(latestPurpose(second.id())).isEqualTo("FINGERPRINT_INTEGRITY_CHECK");
     }
