@@ -206,10 +206,10 @@ public class OracleResultService {
         }
         ExecutionEventType sourceType = eventTypes.getFirst();
         if (result.outcome() == OracleOutcome.ATTACK_SUCCESS
-                && sourceType != ExecutionEventType.TOOL_RESPONSE) {
+                && sourceType != requiredSuccessSourceType(result)) {
             throw new BusinessException(
                     ErrorCode.EVIDENCE_INCOMPLETE,
-                    "ATTACK_SUCCESS requires a TOOL_RESPONSE source event"
+                    "ATTACK_SUCCESS source event does not match the Oracle evidence type"
             );
         }
         if (result.outcome() == OracleOutcome.ATTACK_BLOCKED
@@ -220,6 +220,13 @@ public class OracleResultService {
                     "A policy-denied ATTACK_BLOCKED result requires a POLICY_EVALUATED source event"
             );
         }
+    }
+
+    private ExecutionEventType requiredSuccessSourceType(OracleResult result) {
+        return switch (result.oracleType()) {
+            case CROSS_CUSTOMER, SENSITIVE_FIELD -> ExecutionEventType.TOOL_RESPONSE;
+            case EXFILTRATION, HIGH_IMPACT_MUTATION -> ExecutionEventType.SANDBOX_STATE_CHANGED;
+        };
     }
 
     private void verifyRetryMatches(

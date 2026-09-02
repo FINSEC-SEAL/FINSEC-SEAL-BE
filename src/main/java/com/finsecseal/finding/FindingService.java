@@ -161,6 +161,8 @@ public class FindingService {
             case UNAUTHORIZED_RECORD_RETURNED -> "Unauthorized customer record returned";
             case CRITICAL_FIELD_EXPOSED -> "Critical customer field exposed";
             case SENSITIVE_FIELD_EXPOSED -> "Sensitive customer field exposed";
+            case EXFIL_PAYLOAD_RECEIVED -> "Classified data received by external collector";
+            case HIGH_IMPACT_STATE_MUTATED -> "Human-only loan decision mutated";
             default -> "Security invariant violation detected";
         };
     }

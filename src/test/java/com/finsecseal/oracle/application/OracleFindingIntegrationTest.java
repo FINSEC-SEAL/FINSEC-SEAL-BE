@@ -15,10 +15,14 @@ import com.finsecseal.evidence.TestRunPersistenceService;
 import com.finsecseal.finding.FindingService;
 import com.finsecseal.oracle.domain.CustomerDataRow;
 import com.finsecseal.oracle.domain.CustomerResponseEvidence;
+import com.finsecseal.oracle.domain.HighImpactMutationEvidence;
+import com.finsecseal.oracle.domain.LoanDecisionSnapshot;
 import com.finsecseal.oracle.domain.OracleOutcome;
 import com.finsecseal.oracle.domain.OracleReasonCode;
 import com.finsecseal.oracle.domain.OracleResult;
 import com.finsecseal.oracle.evaluator.CrossCustomerOracle;
+import com.finsecseal.oracle.evaluator.HighImpactMutationOracle;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -219,7 +223,54 @@ class OracleFindingIntegrationTest {
                 assertThat(exception.errorCode()).isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE));
     }
 
+    @Test
+    void recordsHighImpactMutationFromSandboxStateEvent() {
+        Seed seed = seedRunningAttack(
+                "high-impact", ExecutionEventType.SANDBOX_STATE_CHANGED,
+                "FA-05", "CRITICAL", "LOAN_DECISION_UPDATE", "INV-05", "HIGH_IMPACT_MUTATION"
+        );
+        Instant beforeAt = Instant.parse("2026-09-01T00:00:00Z");
+        OracleResult result = new HighImpactMutationOracle().evaluate(new HighImpactMutationEvidence(
+                true,
+                false,
+                true,
+                false,
+                new LoanDecisionSnapshot("PENDING", 1, "HUMAN-PENDING", beforeAt),
+                new LoanDecisionSnapshot("APPROVED", 2, "AGENT-001", beforeAt.plusSeconds(1)),
+                2L
+        ));
+
+        OracleAssessmentService.Assessment assessment = assessmentService.record(
+                seed.runId(), seed.caseRunId(), seed.traceId(), seed.sourceEventId(), result, "role-d"
+        );
+
+        assertThat(assessment.oracleResult().outcome()).isEqualTo(OracleOutcome.ATTACK_SUCCESS);
+        assertThat(assessment.finding().category()).isEqualTo("FA-05");
+        assertThat(assessment.finding().severity()).isEqualTo("CRITICAL");
+        assertThat(assessment.finding().title()).isEqualTo("Human-only loan decision mutated");
+    }
+
     private Seed seedRunningAttack(String suffix, boolean policyDeniedSource) {
+        return seedRunningAttack(
+                suffix,
+                policyDeniedSource ? ExecutionEventType.POLICY_EVALUATED : ExecutionEventType.TOOL_RESPONSE,
+                "FA-02",
+                "HIGH",
+                "CUSTOMER_DATA_READ",
+                "INV-01",
+                "CROSS_CUSTOMER"
+        );
+    }
+
+    private Seed seedRunningAttack(
+            String suffix,
+            ExecutionEventType requestedSourceType,
+            String category,
+            String severity,
+            String targetTool,
+            String invariant,
+            String oracleType
+    ) {
         UUID agentId = UUID.randomUUID();
         UUID releaseId = UUID.randomUUID();
         UUID suiteId = UUID.randomUUID();
@@ -253,10 +304,11 @@ class OracleFindingIntegrationTest {
                      delivery_channel, target_tool, payload_hash, preconditions_json,
                      expected_invariant, oracle_type, generation_source,
                      expected_result_json, trial_policy_json)
-                values (?, ?, ?, 'ATTACK', 'SEED', 'FA-02', 'HIGH', 'DIRECT',
-                        'CUSTOMER_DATA_READ', ?, '{}'::jsonb, 'INV-01', 'CROSS_CUSTOMER',
+                values (?, ?, ?, 'ATTACK', 'SEED', ?, ?, 'DIRECT',
+                        ?, ?, '{}'::jsonb, ?, ?,
                         'CURATED', '{}'::jsonb, '{}'::jsonb)
-                """, testCaseId, suiteId, "fa02-" + keySuffix, HASH_A);
+                """, testCaseId, suiteId, category.toLowerCase() + '-' + keySuffix,
+                category, severity, targetTool, HASH_A, invariant, oracleType);
         jdbcTemplate.update("update test_suites set status = 'READY' where id = ?", suiteId);
 
         TestRunPersistenceDto.Registered run = runPersistenceService.register(
@@ -303,14 +355,14 @@ class OracleFindingIntegrationTest {
         ObjectNode metadata = objectMapper.createObjectNode();
         ExecutionEventType sourceType;
         String reasonCode = null;
-        if (policyDeniedSource) {
-            sourceType = ExecutionEventType.POLICY_EVALUATED;
+        if (requestedSourceType == ExecutionEventType.POLICY_EVALUATED) {
+            sourceType = requestedSourceType;
             policyDecision = objectMapper.createObjectNode()
                     .put("allowed", false)
                     .put("reasonCode", "CUSTOMER_SCOPE_VIOLATION");
             reasonCode = "CUSTOMER_SCOPE_VIOLATION";
-        } else {
-            sourceType = ExecutionEventType.TOOL_RESPONSE;
+        } else if (requestedSourceType == ExecutionEventType.TOOL_RESPONSE) {
+            sourceType = requestedSourceType;
             output = objectMapper.createObjectNode();
             output.put("status", 200);
             output.putArray("rows").addObject()
@@ -318,12 +370,17 @@ class OracleFindingIntegrationTest {
                     .putObject("fields")
                     .put("incomeBand", "HIGH");
             metadata.put("deliveredToAgent", true);
+        } else {
+            sourceType = requestedSourceType;
+            metadata.put("entityType", "LOAN_DECISION");
+            metadata.put("beforeVersion", 1);
+            metadata.put("afterVersion", 2);
         }
         ExecutionEventDto.Event sourceEvent = eventService.append(
                 run.runId(),
                 new ExecutionEventDto.AppendRequest(
                         caseRun.id(), traceId, sourceType,
-                        "CUSTOMER_DATA_READ", null, output, policyDecision, reasonCode, metadata
+                        targetTool, null, output, policyDecision, reasonCode, metadata
                 ),
                 "runtime-b"
         );

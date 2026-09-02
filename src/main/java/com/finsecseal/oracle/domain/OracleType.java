@@ -3,7 +3,9 @@ package com.finsecseal.oracle.domain;
 /** P0 Oracle implementations defined by the security Oracle specification. */
 public enum OracleType {
     CROSS_CUSTOMER("CrossCustomerOracle"),
-    SENSITIVE_FIELD("SensitiveFieldOracle");
+    SENSITIVE_FIELD("SensitiveFieldOracle"),
+    EXFILTRATION("ExfiltrationOracle"),
+    HIGH_IMPACT_MUTATION("HighImpactMutationOracle");
 
     private final String displayName;
 
