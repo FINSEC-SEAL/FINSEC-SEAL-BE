@@ -1,17 +1,22 @@
 # Deployment and Operations Plan
 
+> Backend runtime과 버전은 `docs/A_ARCHITECTURE_BASELINE.md`를 우선한다. FastAPI는 stateless AI
+> service이며 Core API와 PostgreSQL migration은 Spring Boot가 소유한다.
+
 ## 1. 목표 architecture
 
 | Layer | Local | Competition |
 |---|---|---|
-| Frontend | Vite dev server | managed static hosting/CDN |
-| API | FastAPI process | managed container web process |
-| Worker | same package worker | managed container worker process |
-| DB | PostgreSQL Docker/local | managed PostgreSQL 16, private/TLS |
+| Frontend | React/Vite dev server | managed static hosting/CDN |
+| Core API | Spring Boot 4.1.1 / Java 21 | managed container web process |
+| AI service | stateless Python service | managed stateless container process |
+| Worker | Core API와 독립 실행 계약 | managed container worker process |
+| DB | PostgreSQL 17.11 Docker/local | managed PostgreSQL 17, private/TLS |
 | Secrets | `.env.local` ignored | platform secret store |
 | LLM | provider adapter/mock | approved provider endpoint |
 
-단일 repository, 단일 backend image, process command만 web/worker로 다르게 한다. Redis/Kafka/Kubernetes는 없다.
+Core API가 상태와 migration의 단일 소유자다. AI service는 DB를 직접 소유하지 않으며 stateless
+request/response 경계를 유지한다. Redis/Kafka/Kubernetes는 MVP 범위에 없다.
 
 ## 2. Environment configuration
 
@@ -111,4 +116,3 @@ README 구현 단계에서 copy-paste command를 추가하되 지금 문서는 �
 - mock adapter network spy test.
 - Demo load/reset/live runs, report disclaimer.
 - monitoring contact와 recorded fallback.
-

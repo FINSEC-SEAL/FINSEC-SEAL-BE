@@ -46,7 +46,12 @@ Trace는 raw chain-of-thought가 아니라 관찰 가능한 model interaction �
 }
 ```
 
-`sequence`는 TestRun 전체에서 1부터 증가하며 `(run_id,sequence)` unique다. DB advisory lock/`run_event_counter FOR UPDATE`로 할당한다. `occurredAt`은 표현용이고 정렬 source는 sequence다. batch insert 실패 시 sequence gap은 허용하되 `EVENT_GAP` audit alert를 만들고 decision을 REVIEW로 제한한다.
+`sequence`는 TestRun 전체에서 1부터 빈틈없이 증가하며 `(run_id,sequence)` unique다.
+`run_event_counter FOR UPDATE`로 append를 직렬화한다. batch 실패 시 transaction 전체를 rollback해
+sequence를 소비하지 않는다. `occurredAt`은 표현용이고 정렬 source는 sequence다.
+
+Run 종료 순서는 `RUN_COMPLETED|RUN_FAILED` event commit이 먼저이고 TestRun terminal 상태 변경이
+마지막이다. terminal 상태가 된 뒤에는 Event append와 Run/Case 결과 변경이 모두 DB에서 거부된다.
 
 ## 4. Correlation
 
@@ -78,6 +83,7 @@ Redaction은 field classification registry와 pattern detector를 함께 쓴다.
 
 - application DB role은 INSERT/SELECT만, UPDATE/DELETE 불가.
 - 각 eventHash=`SHA256(canonical(event without hashes) || prevEventHash)`; Run complete 시 head hash를 decision input에 봉인.
+- TestRun/TestCaseRun terminal 결과도 append-only evidence로 취급하며, 수정이 필요하면 새 Run을 만든다.
 - 일 단위 event partition retention은 최소 대회 종료+90일, 설정 변경은 governance audit.
 - hash chain은 외부 공증이 아니므로 DB superuser 공격을 완전히 방어한다고 주장하지 않는다. P2에서 WORM/object lock 가능.
 

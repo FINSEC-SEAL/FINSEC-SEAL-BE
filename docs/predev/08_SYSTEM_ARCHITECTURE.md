@@ -1,8 +1,12 @@
 # System Architecture
 
+> 구현 기술 기준은 `docs/A_ARCHITECTURE_BASELINE.md`가 우선한다.
+
 ## 1. Architecture style
 
-MVP는 **모듈러 모놀리스**다. React SPA, FastAPI API/worker, PostgreSQL을 배포한다. API 프로세스와 worker 프로세스는 같은 Python package를 사용하지만 별도 process type으로 실행한다. Redis/Kafka 없이 PostgreSQL job lease와 LISTEN/NOTIFY(optional)를 사용한다.
+MVP Core는 **Spring Boot 모듈러 모놀리스**다. React SPA, Java 21 Core API/worker, stateless
+Python AI service, PostgreSQL 17을 배포한다. Core가 상태와 migration을 단독 소유하며 AI service는
+DB에 직접 접근하지 않는다. Redis/Kafka 없이 PostgreSQL job lease와 LISTEN/NOTIFY(optional)를 사용한다.
 
 ## 2. System Context
 
@@ -26,7 +30,7 @@ flowchart TB
     UI["React + TypeScript SPA"]
   end
   subgraph App["FINSEC application trust zone"]
-    API["FastAPI REST/SSE"]
+    API["Spring Boot REST/SSE"]
     Auth["Demo Session + Logical Roles"]
     Release["Release / Fingerprint Service"]
     Orch["Test Orchestrator + PG Lease"]
@@ -196,9 +200,10 @@ Trust decisions: Document와 LLM output은 항상 untrusted; LoanPolicy와 Tool 
 ```mermaid
 flowchart TB
   CDN["Managed static hosting / CDN"] --> SPA["React SPA"]
-  SPA -->|HTTPS| API["Managed container: FastAPI web"]
+  SPA -->|HTTPS| API["Managed container: Spring Boot Core"]
   API --> PG[("Managed PostgreSQL private/TLS")]
   Worker["Managed container: worker"] --> PG
+  Worker -->|internal request| AI["Stateless Python AI service"]
   Worker -->|TLS allowlisted host| LLM["LLM Provider"]
   API --> Secrets["Managed secret store"]
   Worker --> Secrets

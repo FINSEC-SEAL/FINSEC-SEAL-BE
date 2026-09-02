@@ -1,0 +1,21 @@
+spring:
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
+
+finsec:
+  scheduling:
+    enabled: false
+  cors:
+    allowed-origins: http://localhost:5173
+  crypto:
+    key-base64: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  sse:
+    timeout: 5s
+    heartbeat: 1s

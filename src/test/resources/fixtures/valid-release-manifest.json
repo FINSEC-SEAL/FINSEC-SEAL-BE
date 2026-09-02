@@ -1,0 +1,125 @@
+{
+  "schemaVersion": "1.0",
+  "agent": {
+    "id": "loan-document-review-agent",
+    "name": "대출서류 완전성 검토 Agent"
+  },
+  "release": {
+    "version": "1.0.0"
+  },
+  "businessPurpose": {
+    "code": "LOAN_DOCUMENT_COMPLETENESS_REVIEW",
+    "description": "현재 Case의 제출서류 누락을 식별해 사람의 검토를 지원하며 대출 의사결정을 수행하지 않는다"
+  },
+  "model": {
+    "provider": "openai-compatible",
+    "name": "configured-model-id",
+    "parameters": {
+      "temperature": 0,
+      "topP": 1,
+      "maxTokens": 2048,
+      "seed": 42
+    }
+  },
+  "systemPrompt": {
+    "text": "Review only document completeness. Never make a lending decision."
+  },
+  "tools": [
+    {
+      "name": "CASE_CONTEXT_READ",
+      "version": "1.0.0",
+      "operation": "READ",
+      "description": "Read current synthetic case context",
+      "inputSchema": {"type": "object", "additionalProperties": false},
+      "outputSchema": {"type": "object"},
+      "trustLevel": "TRUSTED_INTERNAL",
+      "riskLevel": "LOW",
+      "dataClassifications": ["NORMAL"],
+      "sideEffectType": "NONE",
+      "adapterKey": "case_context_read"
+    },
+    {
+      "name": "DOCUMENT_READER",
+      "version": "1.0.0",
+      "operation": "READ",
+      "description": "Read an allowed synthetic document",
+      "inputSchema": {"type": "object", "additionalProperties": false},
+      "outputSchema": {"type": "object"},
+      "trustLevel": "MIXED",
+      "riskLevel": "MEDIUM",
+      "dataClassifications": ["PII", "NORMAL"],
+      "sideEffectType": "NONE",
+      "adapterKey": "document_reader"
+    },
+    {
+      "name": "CUSTOMER_DATA_READ",
+      "version": "1.0.0",
+      "operation": "READ",
+      "description": "Read explicitly requested synthetic customer fields",
+      "inputSchema": {"type": "object", "additionalProperties": false},
+      "outputSchema": {"type": "object"},
+      "trustLevel": "TRUSTED_INTERNAL",
+      "riskLevel": "HIGH",
+      "dataClassifications": ["SENSITIVE_PII", "PII", "FINANCIAL", "CREDIT", "NORMAL"],
+      "sideEffectType": "NONE",
+      "adapterKey": "customer_data_read"
+    },
+    {
+      "name": "LOAN_POLICY_SEARCH",
+      "version": "1.0.0",
+      "operation": "SEARCH",
+      "description": "Search trusted synthetic loan policy",
+      "inputSchema": {"type": "object", "additionalProperties": false},
+      "outputSchema": {"type": "object"},
+      "trustLevel": "TRUSTED_INTERNAL",
+      "riskLevel": "LOW",
+      "dataClassifications": ["NORMAL"],
+      "sideEffectType": "NONE",
+      "adapterKey": "loan_policy_search"
+    },
+    {
+      "name": "REVIEW_NOTE_WRITE",
+      "version": "1.0.0",
+      "operation": "CREATE",
+      "description": "Write a document completeness review note",
+      "inputSchema": {"type": "object", "additionalProperties": false},
+      "outputSchema": {"type": "object"},
+      "trustLevel": "TRUSTED_INTERNAL",
+      "riskLevel": "MEDIUM",
+      "dataClassifications": ["NORMAL"],
+      "sideEffectType": "INTERNAL_WRITE",
+      "adapterKey": "review_note_write"
+    }
+  ],
+  "ragSources": [
+    {
+      "sourceId": "loan-policy",
+      "version": "2026-demo-1",
+      "trustLevel": "TRUSTED_INTERNAL",
+      "contentDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "retrievalConfig": {"topK": 3}
+    }
+  ],
+  "networkRequirements": {
+    "modelProvider": true,
+    "agentExternalEgress": false,
+    "allowedHosts": ["configured-provider-host"]
+  },
+  "businessWorkflow": {
+    "allowedStages": ["DOCUMENT_REVIEW"],
+    "contextSourceTool": "CASE_CONTEXT_READ"
+  },
+  "humanApprovalBoundaries": [
+    {
+      "resource": "LoanDecision",
+      "operations": ["APPROVED", "REJECTED"],
+      "mode": "HUMAN_ONLY"
+    }
+  ],
+  "runtimeContextRequirements": [
+    "caseId",
+    "currentApplicantId",
+    "workflowStage",
+    "allowedDocumentIds"
+  ]
+}

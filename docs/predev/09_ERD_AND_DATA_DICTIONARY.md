@@ -2,7 +2,7 @@
 
 ## 1. 물리 모델 원칙
 
-- PostgreSQL 16 기준. PK는 UUIDv7 `uuid`, 시간은 `timestamptz`, enum은 migration 부담을 줄이기 위해 validated `varchar` + CHECK.
+- PostgreSQL 17.11 기준. PK는 UUIDv7 `uuid`, 시간은 `timestamptz`, enum은 migration 부담을 줄이기 위해 validated `varchar` + CHECK.
 - 조회·관계·무결성·metric denominator가 필요한 값은 정규화한다. provider payload, policy/manifest snapshot, event body, evidence는 versioned JSONB를 사용한다.
 - 모든 tenant-facing table은 P0에서도 `workspace_id`를 가진다. Demo는 단일 workspace지만 쿼리 누락을 테스트한다.
 - 보안/감사 증거는 hard delete하지 않는다. 사용자 데이터가 합성이므로 retention 후 partition drop은 운영 정책으로 수행한다.
@@ -116,8 +116,9 @@ Held-out payload를 일반 repository DTO에서 제외한다. run worker 전용 
 
 ### release_decision / release_attestation
 
-- `release_decision`: `id PK`, `release_id FK`, `decision(PASS|REVIEW|BLOCKED)`, `gate_policy_version`, `input_snapshot_json`, `input_digest`, `proposed_at`, `confirmed_by`, `confirmed_at`, `invalidated_at`, `invalidation_reasons_json`; confirmed 후 immutable.
-- `release_attestation`: `id PK`, `release_decision_id UNIQUE FK`, `format_version`, `document_json`, `document_hash`, `html_location nullable`, `generated_at`, `disclaimer_version`. Decision당 1개, regenerate 시 같은 canonical JSON hash가 나와야 한다.
+- `release_decision`: `id PK`, `release_id FK`, `decision(PASS|REVIEW|BLOCKED)`, `gate_policy_version`, `input_snapshot_json`, `input_digest`, `proposed_at`, `confirmed_by`, `confirmed_at`; confirmed 후 immutable.
+- `decision_invalidation`: `id PK`, `release_decision_id FK`, `reasons_json`, `invalidated_by`, `invalidated_at`; 기존 Decision을 수정하지 않는 append-only 무효화 증거다.
+- `release_attestation`: `id PK`, `release_decision_id UNIQUE FK`, `format_version`, `document_json`, `document_hash`, `html_content`, `generated_at`, `disclaimer_version`. Decision당 1개, regenerate 시 같은 canonical JSON hash가 나와야 한다.
 
 ## 4. Sandbox dictionary
 
