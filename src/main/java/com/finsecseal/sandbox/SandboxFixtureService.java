@@ -3,12 +3,15 @@ package com.finsecseal.sandbox;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.TestRunStatus;
+import com.finsecseal.oracle.domain.SensitiveFieldPolicy;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -115,6 +118,73 @@ public class SandboxFixtureService {
         } catch (RuntimeException exception) {
             return false;
         }
+    }
+
+    public SensitiveFieldPolicy sensitiveFieldPolicy(UUID runId, String caseKey, String customerId) {
+        if (runId == null || caseKey == null || caseKey.isBlank() || customerId == null || customerId.isBlank()) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Sensitive-field policy requires run, case, and customer context"
+            );
+        }
+
+        List<JsonNode> caseContexts = jdbcTemplate.query("""
+                select context_json::text
+                  from sandbox_loan_cases
+                 where namespace_id = ? and case_key = ? and applicant_customer_key = ?
+                """, (resultSet, rowNumber) -> parseJson(resultSet.getString("context_json")),
+                runId, caseKey, customerId);
+        if (caseContexts.size() != 1) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Sensitive-field policy loan-case context is missing or duplicated"
+            );
+        }
+
+        List<JsonNode> classifications = jdbcTemplate.query("""
+                select classification_json::text
+                  from sandbox_customers
+                 where namespace_id = ? and customer_key = ?
+                """, (resultSet, rowNumber) -> parseJson(resultSet.getString("classification_json")),
+                runId, customerId);
+        if (classifications.size() != 1) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Sensitive-field policy customer classification is missing or duplicated"
+            );
+        }
+
+        Set<String> allowedFields = requireTextSet(
+                caseContexts.getFirst().path("allowedFields"),
+                "allowedFields"
+        );
+        // The golden fixture's sensitiveFields are the fields classified as critical
+        // for deterministic FA-03 evaluation.
+        Set<String> criticalFields = requireTextSet(
+                classifications.getFirst().path("sensitiveFields"),
+                "sensitiveFields"
+        );
+        return new SensitiveFieldPolicy(allowedFields, criticalFields);
+    }
+
+    private Set<String> requireTextSet(JsonNode node, String fieldName) {
+        if (node == null || !node.isArray()) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Sandbox " + fieldName + " classification is missing"
+            );
+        }
+        Set<String> values = new LinkedHashSet<>();
+        node.forEach(value -> {
+            if (!value.isString() || value.asString().isBlank()) {
+                throw new BusinessException(
+                        ErrorCode.EVIDENCE_INCOMPLETE,
+                        "Sandbox " + fieldName + " contains an invalid field name"
+                );
+            }
+            values.add(value.asString());
+        });
+        return Set.copyOf(values);
     }
 
     private ObjectNode databaseFixtureDocument(UUID runId) {
