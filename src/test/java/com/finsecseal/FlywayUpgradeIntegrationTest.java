@@ -36,8 +36,8 @@ class FlywayUpgradeIntegrationTest {
         assertThat(appliedVersionCount()).isEqualTo(9);
 
         Flyway current = flyway(null);
-        assertThat(current.migrate().migrationsExecuted).isEqualTo(1);
-        assertThat(appliedVersionCount()).isEqualTo(10);
+        assertThat(current.migrate().migrationsExecuted).isEqualTo(2);
+        assertThat(appliedVersionCount()).isEqualTo(11);
         assertThat(current.validateWithResult().validationSuccessful).isTrue();
 
         UUID leaseId = UUID.randomUUID();
