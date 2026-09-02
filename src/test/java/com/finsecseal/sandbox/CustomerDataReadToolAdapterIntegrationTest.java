@@ -1,8 +1,10 @@
 package com.finsecseal.sandbox;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.finsecseal.common.domain.TestRunMode;
+import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.evidence.TestRunPersistenceDto;
 import com.finsecseal.evidence.TestRunPersistenceService;
 import com.finsecseal.sandbox.tool.CustomerDataReadToolAdapter;
@@ -38,21 +40,15 @@ class CustomerDataReadToolAdapterIntegrationTest {
     @Autowired CustomerDataReadToolAdapter adapter;
 
     @Test
-    void ignoresUntrustedNamespaceArgumentAndReadsOnlyTrustedRunNamespace() {
-        UUID runA = seedQueuedRun("namespace-a");
-        UUID runB = seedQueuedRun("namespace-b");
+    void rejectsUntrustedNamespaceArgument() {
+        UUID runA = seedQueuedRun("namespace-reject");
         fixtureService.createOrReset(runA);
-        fixtureService.createOrReset(runB);
-        jdbcTemplate.update("""
-                update sandbox_customers
-                   set profile_json = jsonb_set(profile_json, '{incomeBand}', '"B_ONLY"'::jsonb)
-                 where namespace_id = ? and customer_key = 'CUST-1002'
-                """, runB);
 
         ObjectNode arguments = objectMapper.createObjectNode();
-        arguments.put("namespaceId", runB.toString());
+        arguments.put("namespaceId", UUID.randomUUID().toString());
         arguments.putArray("customerIds").add("CUST-1002");
         arguments.putArray("fields").add("incomeBand");
+
         SandboxExecutionContext context = new SandboxExecutionContext(
                 runA,
                 UUID.randomUUID(),
@@ -62,12 +58,62 @@ class CustomerDataReadToolAdapterIntegrationTest {
                 "CUST-1001"
         );
 
-        ToolAdapter.ToolExecutionResult result = adapter.execute(context, arguments);
+        assertThatThrownBy(() -> adapter.execute(context, arguments))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("unknown arguments");
+    }
 
-        assertThat(result.output().path("rows").path(0).path("customerId").asString())
-                .isEqualTo("CUST-1002");
-        assertThat(result.output().path("rows").path(0).path("fields").path("incomeBand").asString())
-                .isEqualTo("HIGH");
+    @Test
+    void readsOnlyTrustedRunNamespaceWithoutClientNamespaceArgument() {
+        UUID runA = seedQueuedRun("namespace-a");
+        UUID runB = seedQueuedRun("namespace-b");
+
+        fixtureService.createOrReset(runA);
+        fixtureService.createOrReset(runB);
+
+        jdbcTemplate.update("""
+            update sandbox_customers
+               set profile_json = jsonb_set(
+                   profile_json,
+                   '{incomeBand}',
+                   '"B_ONLY"'::jsonb
+               )
+             where namespace_id = ?
+               and customer_key = 'CUST-1002'
+            """, runB);
+
+        ObjectNode arguments = objectMapper.createObjectNode();
+        arguments.putArray("customerIds").add("CUST-1002");
+        arguments.putArray("fields").add("incomeBand");
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                runA,
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        ToolAdapter.ToolExecutionResult result =
+                adapter.execute(context, arguments);
+
+        assertThat(
+                result.output()
+                        .path("rows")
+                        .path(0)
+                        .path("customerId")
+                        .asString()
+        ).isEqualTo("CUST-1002");
+
+        assertThat(
+                result.output()
+                        .path("rows")
+                        .path(0)
+                        .path("fields")
+                        .path("incomeBand")
+                        .asString()
+        ).isEqualTo("HIGH");
     }
 
     private UUID seedQueuedRun(String suffix) {

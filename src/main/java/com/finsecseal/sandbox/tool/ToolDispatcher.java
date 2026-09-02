@@ -6,6 +6,7 @@ import com.finsecseal.common.domain.ExecutionEventType;
 import com.finsecseal.evidence.ExecutionEventDto;
 import com.finsecseal.evidence.ExecutionEventService;
 import com.finsecseal.runtime.ToolProposal;
+import com.finsecseal.runtime.ToolProposalValidator;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import java.util.HashMap;
 import java.util.List;
@@ -21,17 +22,20 @@ public class ToolDispatcher {
     private final List<ToolExecutionPolicy> policies;
     private final ExecutionEventService eventService;
     private final ObjectMapper objectMapper;
+    private final ToolProposalValidator proposalValidator;
 
     public ToolDispatcher(
             List<ToolAdapter> adapters,
             List<ToolExecutionPolicy> policies,
             ExecutionEventService eventService,
-            ObjectMapper objectMapper
+            ObjectMapper objectMapper,
+            ToolProposalValidator proposalValidator
     ) {
         this.adapters = indexAdapters(adapters);
         this.policies = List.copyOf(policies);
         this.eventService = eventService;
         this.objectMapper = objectMapper;
+        this.proposalValidator = proposalValidator;
     }
 
     public DispatchResult dispatch(
@@ -39,9 +43,10 @@ public class ToolDispatcher {
             ToolProposal proposal,
             String actorId
     ) {
-        ToolAdapter adapter = requireAdapter(proposal.toolName());
+        ToolProposal validated = proposalValidator.validate(proposal);
+        ToolAdapter adapter = requireAdapter(validated.toolName());
         ToolExecutionPolicy policy = requirePolicy(context);
-        ToolExecutionPolicy.PolicyDecision decision = policy.evaluate(context, proposal);
+        ToolExecutionPolicy.PolicyDecision decision = policy.evaluate(context, validated);
 
         ObjectNode policyJson = objectMapper.createObjectNode();
         policyJson.put("allowed", decision.allowed());
@@ -52,7 +57,7 @@ public class ToolDispatcher {
                         context.caseRunId(),
                         context.traceId(),
                         ExecutionEventType.POLICY_EVALUATED,
-                        proposal.toolName(),
+                        validated.toolName(),
                         null,
                         null,
                         policyJson,
@@ -72,8 +77,8 @@ public class ToolDispatcher {
                         context.caseRunId(),
                         context.traceId(),
                         ExecutionEventType.TOOL_REQUEST,
-                        proposal.toolName(),
-                        proposal.arguments(),
+                        validated.toolName(),
+                        validated.arguments(),
                         null,
                         null,
                         null,
@@ -82,9 +87,10 @@ public class ToolDispatcher {
                 actorId
         );
 
-        ToolAdapter.ToolExecutionResult execution = adapter.execute(context, proposal.arguments());
+        ToolAdapter.ToolExecutionResult execution = adapter.execute(context, validated.arguments());
         ObjectNode responseMetadata = objectMapper.createObjectNode();
-        responseMetadata.put("deliveredToAgent", true);
+        responseMetadata.put("deliveredToAgent", false);
+        responseMetadata.put("deliveryState", "PENDING");
         responseMetadata.put("stateChanged", execution.stateChanged());
         ExecutionEventDto.Event responseEvent = eventService.append(
                 context.runId(),
@@ -92,7 +98,7 @@ public class ToolDispatcher {
                         context.caseRunId(),
                         context.traceId(),
                         ExecutionEventType.TOOL_RESPONSE,
-                        proposal.toolName(),
+                        validated.toolName(),
                         null,
                         execution.output(),
                         null,

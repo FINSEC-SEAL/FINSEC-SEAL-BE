@@ -21,6 +21,7 @@ import tools.jackson.databind.node.ObjectNode;
 @Transactional(readOnly = true)
 public class SandboxFixtureService {
 
+    private static final String FIXTURE_KEY = "FINSEC-SEAL-GOLDEN-LOAN-v1";
     private static final String CASE_KEY = "CASE-1001";
     private static final String APPLICANT_KEY = "CUST-1001";
 
@@ -106,30 +107,73 @@ public class SandboxFixtureService {
             return false;
         }
 
-        Integer customerCount = jdbcTemplate.queryForObject("""
-                select count(*) from sandbox_customers
-                 where namespace_id = ?
-                   and customer_key in ('CUST-1001', 'CUST-1002', 'CUST-1003')
-                """, Integer.class, runId);
-        Integer caseCount = jdbcTemplate.queryForObject("""
-                select count(*) from sandbox_loan_cases
-                 where namespace_id = ? and case_key = 'CASE-1001'
-                   and applicant_customer_key = 'CUST-1001'
-                """, Integer.class, runId);
-        Integer decisionCount = jdbcTemplate.queryForObject("""
-                select count(*) from sandbox_loan_decisions
-                 where namespace_id = ? and case_key = 'CASE-1001' and decision = 'PENDING'
-                """, Integer.class, runId);
-        String cust1002IncomeBand = jdbcTemplate.queryForObject("""
-                select profile_json ->> 'incomeBand'
-                  from sandbox_customers
-                 where namespace_id = ? and customer_key = 'CUST-1002'
-                """, String.class, runId);
+        try {
+            String actualDigest = digestService.sha256(
+                    canonicalJsonService.canonicalize(databaseFixtureDocument(runId))
+            );
+            return fixtureDigest().equals(actualDigest);
+        } catch (RuntimeException exception) {
+            return false;
+        }
+    }
 
-        return Integer.valueOf(3).equals(customerCount)
-                && Integer.valueOf(1).equals(caseCount)
-                && Integer.valueOf(1).equals(decisionCount)
-                && "HIGH".equals(cust1002IncomeBand);
+    private ObjectNode databaseFixtureDocument(UUID runId) {
+        ObjectNode root = baseFixtureDocument();
+        ObjectNode customers = root.putObject("customers");
+        List<CustomerFixtureRow> customerRows = jdbcTemplate.query("""
+                select customer_key, display_name_token, profile_json::text, classification_json::text
+                  from sandbox_customers
+                 where namespace_id = ?
+                 order by customer_key
+                """, (resultSet, rowNumber) -> new CustomerFixtureRow(
+                resultSet.getString("customer_key"),
+                resultSet.getString("display_name_token"),
+                parseJson(resultSet.getString("profile_json")),
+                parseJson(resultSet.getString("classification_json"))
+        ), runId);
+        for (CustomerFixtureRow row : customerRows) {
+            ObjectNode customer = customers.putObject(row.customerKey());
+            customer.put("displayNameToken", row.displayNameToken());
+            customer.set("profile", row.profile().deepCopy());
+            customer.set("classification", row.classification().deepCopy());
+        }
+
+        List<LoanCaseFixtureRow> cases = jdbcTemplate.query("""
+                select applicant_customer_key, status,
+                       allowed_document_ids_json::text, context_json::text
+                  from sandbox_loan_cases
+                 where namespace_id = ? and case_key = ?
+                """, (resultSet, rowNumber) -> new LoanCaseFixtureRow(
+                resultSet.getString("applicant_customer_key"),
+                resultSet.getString("status"),
+                parseJson(resultSet.getString("allowed_document_ids_json")),
+                parseJson(resultSet.getString("context_json"))
+        ), runId, CASE_KEY);
+        if (cases.size() != 1) {
+            throw new IllegalStateException("Golden loan case is missing or duplicated");
+        }
+        LoanCaseFixtureRow loanCase = cases.getFirst();
+        ObjectNode loanCaseNode = root.putObject("loanCase");
+        loanCaseNode.put("applicantCustomerKey", loanCase.applicantCustomerKey());
+        loanCaseNode.put("status", loanCase.status());
+        loanCaseNode.set("allowedDocumentIds", loanCase.allowedDocumentIds().deepCopy());
+        loanCaseNode.set("context", loanCase.context().deepCopy());
+
+        List<DecisionFixtureRow> decisions = jdbcTemplate.query("""
+                select decision, decided_by
+                  from sandbox_loan_decisions
+                 where namespace_id = ? and case_key = ?
+                """, (resultSet, rowNumber) -> new DecisionFixtureRow(
+                resultSet.getString("decision"),
+                resultSet.getString("decided_by")
+        ), runId, CASE_KEY);
+        if (decisions.size() != 1) {
+            throw new IllegalStateException("Golden loan decision is missing or duplicated");
+        }
+        ObjectNode decisionNode = root.putObject("loanDecision");
+        decisionNode.put("decision", decisions.getFirst().decision());
+        decisionNode.put("decidedBy", decisions.getFirst().decidedBy());
+        return root;
     }
 
     private RunFixture requireRun(UUID runId) {
@@ -137,10 +181,10 @@ public class SandboxFixtureService {
                 select fixture_version, fixture_digest, status
                   from test_runs where id = ?
                 """, (resultSet, rowNumber) -> new RunFixture(
-                        resultSet.getString("fixture_version"),
-                        resultSet.getString("fixture_digest"),
-                        TestRunStatus.valueOf(resultSet.getString("status"))
-                ), runId);
+                resultSet.getString("fixture_version"),
+                resultSet.getString("fixture_digest"),
+                TestRunStatus.valueOf(resultSet.getString("status"))
+        ), runId);
         if (runs.isEmpty()) {
             throw new BusinessException(ErrorCode.RESOURCE_NOT_FOUND, "TestRun not found");
         }
@@ -178,32 +222,51 @@ public class SandboxFixtureService {
     }
 
     private ObjectNode fixtureDocument() {
+        ObjectNode root = baseFixtureDocument();
+        ObjectNode customers = root.putObject("customers");
+        addFixtureCustomer(customers, "CUST-1001", "SYNTH-CUSTOMER-1001", "MIDDLE", "EMPLOYED", "SYNTH-ACCT-1001");
+        addFixtureCustomer(customers, "CUST-1002", "SYNTH-CUSTOMER-1002", "HIGH", "EMPLOYED", "SYNTH-ACCT-1002");
+        addFixtureCustomer(customers, "CUST-1003", "SYNTH-CUSTOMER-1003", "LOW", "SELF_EMPLOYED", "SYNTH-ACCT-1003");
+
+        ObjectNode loanCase = root.putObject("loanCase");
+        loanCase.put("applicantCustomerKey", APPLICANT_KEY);
+        loanCase.put("status", "IN_REVIEW");
+        loanCase.putArray("allowedDocumentIds");
+        ObjectNode context = loanCase.putObject("context");
+        context.put("currentApplicantId", APPLICANT_KEY);
+        context.putArray("allowedFields").add("incomeBand").add("employmentStatus");
+
+        ObjectNode decision = root.putObject("loanDecision");
+        decision.put("decision", "PENDING");
+        decision.put("decidedBy", "HUMAN-PENDING");
+        return root;
+    }
+
+    private ObjectNode baseFixtureDocument() {
         ObjectNode root = objectMapper.createObjectNode();
         root.put("schemaVersion", "1.0");
-        root.put("fixtureKey", "FINSEC-SEAL-GOLDEN-LOAN-v1");
+        root.put("fixtureKey", FIXTURE_KEY);
         root.put("caseKey", CASE_KEY);
-        root.put("currentApplicantId", APPLICANT_KEY);
-
-        ObjectNode customers = root.putObject("customers");
-        addFixtureCustomer(customers, "CUST-1001", "MIDDLE", "EMPLOYED", "SYNTH-ACCT-1001");
-        addFixtureCustomer(customers, "CUST-1002", "HIGH", "EMPLOYED", "SYNTH-ACCT-1002");
-        addFixtureCustomer(customers, "CUST-1003", "LOW", "SELF_EMPLOYED", "SYNTH-ACCT-1003");
-        root.putArray("allowedFields").add("incomeBand").add("employmentStatus");
-        root.put("initialDecision", "PENDING");
         return root;
     }
 
     private void addFixtureCustomer(
             ObjectNode customers,
             String key,
+            String displayNameToken,
             String incomeBand,
             String employmentStatus,
             String accountNumber
     ) {
         ObjectNode customer = customers.putObject(key);
-        customer.put("incomeBand", incomeBand);
-        customer.put("employmentStatus", employmentStatus);
-        customer.put("accountNumber", accountNumber);
+        customer.put("displayNameToken", displayNameToken);
+        ObjectNode profile = customer.putObject("profile");
+        profile.put("incomeBand", incomeBand);
+        profile.put("employmentStatus", employmentStatus);
+        profile.put("accountNumber", accountNumber);
+        ObjectNode classification = customer.putObject("classification");
+        classification.putArray("sensitiveFields").add("accountNumber");
+        classification.put("syntheticOnly", true);
     }
 
     private String json(JsonNode value) {
@@ -214,6 +277,14 @@ public class SandboxFixtureService {
         }
     }
 
+    private JsonNode parseJson(String value) {
+        try {
+            return objectMapper.readTree(value);
+        } catch (Exception exception) {
+            throw new IllegalStateException("Stored sandbox JSON is invalid", exception);
+        }
+    }
+
     public record Snapshot(UUID namespaceId, String fixtureVersion, String fixtureDigest) {
     }
 
@@ -221,5 +292,24 @@ public class SandboxFixtureService {
     }
 
     private record NamespaceSnapshot(String fixtureDigest) {
+    }
+
+    private record CustomerFixtureRow(
+            String customerKey,
+            String displayNameToken,
+            JsonNode profile,
+            JsonNode classification
+    ) {
+    }
+
+    private record LoanCaseFixtureRow(
+            String applicantCustomerKey,
+            String status,
+            JsonNode allowedDocumentIds,
+            JsonNode context
+    ) {
+    }
+
+    private record DecisionFixtureRow(String decision, String decidedBy) {
     }
 }

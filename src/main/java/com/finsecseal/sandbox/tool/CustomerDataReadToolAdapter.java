@@ -4,7 +4,9 @@ import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.JsonNode;
@@ -18,6 +20,7 @@ public final class CustomerDataReadToolAdapter implements ToolAdapter {
     public static final String TOOL_NAME = "CUSTOMER_DATA_READ";
     private static final int MAX_CUSTOMERS = 20;
     private static final int MAX_FIELDS = 20;
+    private static final Set<String> ALLOWED_ARGUMENTS = Set.of("customerIds", "fields");
 
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
@@ -33,7 +36,22 @@ public final class CustomerDataReadToolAdapter implements ToolAdapter {
     }
 
     @Override
+    public void validateArguments(JsonNode arguments) {
+        if (arguments == null || !arguments.isObject()) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "CUSTOMER_DATA_READ arguments must be an object");
+        }
+        Set<String> actualFields = new HashSet<>();
+        arguments.properties().forEach(entry -> actualFields.add(entry.getKey()));
+        if (!ALLOWED_ARGUMENTS.containsAll(actualFields)) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "CUSTOMER_DATA_READ contains unknown arguments");
+        }
+        requireTextArray(arguments, "customerIds", MAX_CUSTOMERS);
+        requireTextArray(arguments, "fields", MAX_FIELDS);
+    }
+
+    @Override
     public ToolExecutionResult execute(SandboxExecutionContext context, JsonNode arguments) {
+        validateArguments(arguments);
         List<String> customerIds = requireTextArray(arguments, "customerIds", MAX_CUSTOMERS);
         List<String> fields = requireTextArray(arguments, "fields", MAX_FIELDS);
 
@@ -47,9 +65,9 @@ public final class CustomerDataReadToolAdapter implements ToolAdapter {
                       from sandbox_customers
                      where namespace_id = ? and customer_key = ?
                     """, (resultSet, rowNumber) -> new CustomerSnapshot(
-                            resultSet.getString("customer_key"),
-                            parseJson(resultSet.getString("profile_json"))
-                    ), context.namespaceId(), customerId);
+                    resultSet.getString("customer_key"),
+                    parseJson(resultSet.getString("profile_json"))
+            ), context.namespaceId(), customerId);
             if (matches.isEmpty()) {
                 continue;
             }

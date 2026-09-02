@@ -1,6 +1,6 @@
 package com.finsecseal.runtime;
 
-import com.finsecseal.attack.AttackSeed;
+import com.finsecseal.attack.AttackVariant;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.ExecutionEventType;
@@ -8,8 +8,10 @@ import com.finsecseal.evidence.ExecutionEventDto;
 import com.finsecseal.evidence.ExecutionEventService;
 import com.finsecseal.runtime.ai.AgentAiClient;
 import com.finsecseal.sandbox.SandboxExecutionContext;
+import java.util.UUID;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
@@ -19,32 +21,34 @@ public class AgentRuntimeService {
     private final ObjectProvider<AgentAiClient> aiClientProvider;
     private final ExecutionEventService eventService;
     private final ObjectMapper objectMapper;
+    private final ToolProposalValidator proposalValidator;
 
     public AgentRuntimeService(
             ObjectProvider<AgentAiClient> aiClientProvider,
             ExecutionEventService eventService,
-            ObjectMapper objectMapper
+            ObjectMapper objectMapper,
+            ToolProposalValidator proposalValidator
     ) {
         this.aiClientProvider = aiClientProvider;
         this.eventService = eventService;
         this.objectMapper = objectMapper;
+        this.proposalValidator = proposalValidator;
     }
 
     public RuntimeTurn proposeTool(
             SandboxExecutionContext context,
-            AttackSeed attackSeed,
+            AttackVariant attackVariant,
             String actorId
     ) {
-        AgentAiClient aiClient = aiClientProvider.getIfAvailable();
-        if (aiClient == null) {
-            throw new BusinessException(ErrorCode.CONFIGURATION_ERROR, "Agent AI client is not configured");
-        }
+        AgentAiClient aiClient = requireClient();
 
         ObjectNode requestMetadata = objectMapper.createObjectNode();
-        requestMetadata.put("attackCategory", attackSeed.category());
+        requestMetadata.put("turnType", "TOOL_PROPOSAL");
+        requestMetadata.put("attackCategory", attackVariant.category());
+        requestMetadata.put("variantHash", attackVariant.variantHash());
         requestMetadata.put("caseKey", context.caseKey());
         requestMetadata.put("currentApplicantId", context.currentApplicantId());
-        requestMetadata.put("targetTool", attackSeed.targetTool());
+        requestMetadata.put("targetTool", attackVariant.targetTool());
         eventService.append(
                 context.runId(),
                 new ExecutionEventDto.AppendRequest(
@@ -67,19 +71,20 @@ public class AgentRuntimeService {
                 context.traceId(),
                 context.caseKey(),
                 context.currentApplicantId(),
-                attackSeed
+                attackVariant
         ));
-        if (response == null || response.proposal() == null
-                || response.proposal().toolName() == null || response.proposal().arguments() == null) {
-            throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "AI client returned an invalid Tool Proposal");
+        if (response == null) {
+            throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "AI client returned an empty response");
         }
+        ToolProposal proposal = proposalValidator.validate(response.proposal());
 
         ObjectNode modelResponse = objectMapper.createObjectNode();
         modelResponse.put("provider", response.provider());
         modelResponse.put("model", response.model());
         modelResponse.put("finishReason", response.finishReason());
         modelResponse.put("latencyMs", response.latencyMs());
-        modelResponse.put("toolName", response.proposal().toolName());
+        modelResponse.put("toolName", proposal.toolName());
+        modelResponse.put("variantHash", attackVariant.variantHash());
         eventService.append(
                 context.runId(),
                 new ExecutionEventDto.AppendRequest(
@@ -91,7 +96,7 @@ public class AgentRuntimeService {
                         modelResponse,
                         null,
                         "AGENT_TURN_COMPLETED",
-                        objectMapper.createObjectNode()
+                        objectMapper.createObjectNode().put("turnType", "TOOL_PROPOSAL")
                 ),
                 actorId
         );
@@ -102,23 +107,129 @@ public class AgentRuntimeService {
                         context.caseRunId(),
                         context.traceId(),
                         ExecutionEventType.TOOL_PROPOSED,
-                        response.proposal().toolName(),
-                        response.proposal().arguments(),
+                        proposal.toolName(),
+                        proposal.arguments(),
                         null,
                         null,
                         "STRUCTURED_TOOL_PROPOSAL",
                         objectMapper.createObjectNode()
                                 .put("provider", response.provider())
                                 .put("model", response.model())
+                                .put("variantHash", attackVariant.variantHash())
                 ),
                 actorId
         );
-        return new RuntimeTurn(response, proposalEvent);
+        return new RuntimeTurn(
+                new AgentAiClient.AgentTurnResponse(
+                        response.provider(),
+                        response.model(),
+                        response.finishReason(),
+                        proposal,
+                        response.latencyMs()
+                ),
+                proposalEvent
+        );
+    }
+
+    public DeliveryReceipt deliverToolResult(
+            SandboxExecutionContext context,
+            AttackVariant attackVariant,
+            String toolName,
+            JsonNode toolOutput,
+            UUID sourceEventId,
+            long sourceSequence,
+            String actorId
+    ) {
+        AgentAiClient aiClient = requireClient();
+
+        ObjectNode requestMetadata = objectMapper.createObjectNode();
+        requestMetadata.put("turnType", "TOOL_RESULT_DELIVERY");
+        requestMetadata.put("sourceEventId", sourceEventId.toString());
+        requestMetadata.put("sourceSequence", sourceSequence);
+        requestMetadata.put("variantHash", attackVariant.variantHash());
+        eventService.append(
+                context.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        context.caseRunId(),
+                        context.traceId(),
+                        ExecutionEventType.MODEL_REQUEST,
+                        toolName,
+                        toolOutput,
+                        null,
+                        null,
+                        "AGENT_TOOL_RESULT_DELIVERY_REQUESTED",
+                        requestMetadata
+                ),
+                actorId
+        );
+
+        AgentAiClient.ToolResultDeliveryResponse response = aiClient.deliverToolResult(
+                new AgentAiClient.ToolResultDeliveryRequest(
+                        context.runId(),
+                        context.caseRunId(),
+                        context.traceId(),
+                        context.caseKey(),
+                        context.currentApplicantId(),
+                        attackVariant,
+                        toolName,
+                        toolOutput.deepCopy(),
+                        sourceEventId,
+                        sourceSequence
+                )
+        );
+        if (response == null || !response.accepted()) {
+            throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "Agent did not accept the Tool Response");
+        }
+
+        ObjectNode output = objectMapper.createObjectNode();
+        output.put("provider", response.provider());
+        output.put("model", response.model());
+        output.put("accepted", true);
+        output.put("latencyMs", response.latencyMs());
+        output.put("sourceEventId", sourceEventId.toString());
+        output.put("sourceSequence", sourceSequence);
+        ExecutionEventDto.Event deliveryEvent = eventService.append(
+                context.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        context.caseRunId(),
+                        context.traceId(),
+                        ExecutionEventType.MODEL_RESPONSE,
+                        toolName,
+                        null,
+                        output,
+                        null,
+                        "AGENT_TOOL_RESULT_DELIVERED",
+                        objectMapper.createObjectNode()
+                                .put("turnType", "TOOL_RESULT_DELIVERY")
+                                .put("variantHash", attackVariant.variantHash())
+                ),
+                actorId
+        );
+        return new DeliveryReceipt(true, deliveryEvent.eventId(), deliveryEvent.sequence(), response.latencyMs());
+    }
+
+    private AgentAiClient requireClient() {
+        AgentAiClient aiClient = aiClientProvider.getIfAvailable();
+        if (aiClient == null) {
+            throw new BusinessException(ErrorCode.CONFIGURATION_ERROR, "Agent AI client is not configured");
+        }
+        return aiClient;
     }
 
     public record RuntimeTurn(
             AgentAiClient.AgentTurnResponse aiResponse,
             ExecutionEventDto.Event proposalEvent
     ) {
+    }
+
+    public record DeliveryReceipt(
+            boolean deliveredToAgent,
+            UUID deliveryEventId,
+            long deliveryEventSequence,
+            long latencyMs
+    ) {
+        public static DeliveryReceipt notDelivered() {
+            return new DeliveryReceipt(false, null, 0L, 0L);
+        }
     }
 }

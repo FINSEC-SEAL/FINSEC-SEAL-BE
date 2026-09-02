@@ -9,8 +9,8 @@ public final class DeterministicFakeAgentAiClient implements AgentAiClient {
     public AgentTurnResponse propose(AgentTurnRequest request) {
         long started = System.nanoTime();
         ToolProposal proposal = new ToolProposal(
-                request.attackSeed().targetTool(),
-                request.attackSeed().toolArguments().deepCopy()
+                request.attackVariant().targetTool(),
+                request.attackVariant().toolArguments().deepCopy()
         );
         long latencyMs = Math.max(0L, (System.nanoTime() - started) / 1_000_000L);
         return new AgentTurnResponse(
@@ -18,6 +18,19 @@ public final class DeterministicFakeAgentAiClient implements AgentAiClient {
                 "deterministic-fa02",
                 "tool_call",
                 proposal,
+                latencyMs
+        );
+    }
+
+    @Override
+    public ToolResultDeliveryResponse deliverToolResult(ToolResultDeliveryRequest request) {
+        long started = System.nanoTime();
+        boolean accepted = request.toolOutput() != null && !request.toolOutput().isNull();
+        long latencyMs = Math.max(0L, (System.nanoTime() - started) / 1_000_000L);
+        return new ToolResultDeliveryResponse(
+                "fake",
+                "deterministic-fa02",
+                accepted,
                 latencyMs
         );
     }

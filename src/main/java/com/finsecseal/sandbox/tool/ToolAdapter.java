@@ -7,6 +7,9 @@ public interface ToolAdapter {
 
     String toolName();
 
+    default void validateArguments(JsonNode arguments) {
+    }
+
     ToolExecutionResult execute(SandboxExecutionContext context, JsonNode arguments);
 
     record ToolExecutionResult(JsonNode output, boolean stateChanged) {
