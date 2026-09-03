@@ -250,6 +250,77 @@ class OracleFindingIntegrationTest {
         assertThat(assessment.finding().title()).isEqualTo("Human-only loan decision mutated");
     }
 
+    @Test
+    void triagesOpenFindingAndWritesAuditRecord() {
+        Seed seed = seedRunningAttack("triage", false);
+        OracleAssessmentService.Assessment assessment = assessmentService.record(
+                seed.runId(), seed.caseRunId(), seed.traceId(), seed.sourceEventId(),
+                successfulCrossCustomerResult(), "role-d"
+        );
+
+        var triaged = findingService.triage(
+                assessment.finding().id(),
+                new com.finsecseal.finding.FindingDto.TriageRequest("Confirmed by security review"),
+                "reviewer-001"
+        );
+
+        assertThat(triaged.status()).isEqualTo("TRIAGED");
+        assertThat(triaged.updatedAt()).isAfterOrEqualTo(triaged.createdAt());
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from audit_records
+                 where resource_type = 'FINDING' and resource_id = ? and action = 'FINDING_TRIAGED'
+                """, Integer.class, triaged.id())).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject("""
+                select metadata_json ->> 'comment' from audit_records
+                 where resource_type = 'FINDING' and resource_id = ? and action = 'FINDING_TRIAGED'
+                """, String.class, triaged.id())).isEqualTo("Confirmed by security review");
+    }
+
+    @Test
+    void rejectsRepeatedFindingTriage() {
+        Seed seed = seedRunningAttack("triage-repeat", false);
+        OracleAssessmentService.Assessment assessment = assessmentService.record(
+                seed.runId(), seed.caseRunId(), seed.traceId(), seed.sourceEventId(),
+                successfulCrossCustomerResult(), "role-d"
+        );
+        var request = new com.finsecseal.finding.FindingDto.TriageRequest("Reviewed");
+        findingService.triage(assessment.finding().id(), request, "reviewer-001");
+
+        assertThatThrownBy(() -> findingService.triage(
+                assessment.finding().id(), request, "reviewer-001"
+        )).isInstanceOfSatisfying(BusinessException.class, exception ->
+                assertThat(exception.errorCode()).isEqualTo(ErrorCode.INVALID_STATE_TRANSITION));
+    }
+
+    @Test
+    void returnsFindingDetailWithOracleEvidenceAndSupportsReleaseFilters() {
+        Seed seed = seedRunningAttack("finding-detail", false);
+        OracleAssessmentService.Assessment assessment = assessmentService.record(
+                seed.runId(), seed.caseRunId(), seed.traceId(), seed.sourceEventId(),
+                successfulCrossCustomerResult(), "role-d"
+        );
+
+        var detail = findingService.findDetail(assessment.finding().id());
+
+        assertThat(detail.finding().id()).isEqualTo(assessment.finding().id());
+        assertThat(detail.oracleResult().id()).isEqualTo(assessment.oracleResult().id());
+        assertThat(detail.oracleResult().sourceEventId()).isEqualTo(seed.sourceEventId());
+        assertThat(detail.oracleResult().evidenceDigest()).isNotBlank();
+        assertThat(detail.relatedFindings()).isEmpty();
+
+        var filtered = findingService.findByRelease(
+                assessment.finding().releaseId(),
+                "FA-02",
+                "OPEN",
+                assessment.finding().findingGroupKey()
+        );
+        assertThat(filtered.items()).singleElement().satisfies(finding ->
+                assertThat(finding.id()).isEqualTo(assessment.finding().id()));
+        assertThat(findingService.findByRelease(
+                assessment.finding().releaseId(), "FA-05", null, null
+        ).items()).isEmpty();
+    }
+
     private Seed seedRunningAttack(String suffix, boolean policyDeniedSource) {
         return seedRunningAttack(
                 suffix,
