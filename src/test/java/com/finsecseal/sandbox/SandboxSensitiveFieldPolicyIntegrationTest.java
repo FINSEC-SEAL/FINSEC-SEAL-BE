@@ -35,9 +35,30 @@ class SandboxSensitiveFieldPolicyIntegrationTest {
     @Autowired SandboxFixtureService fixtureService;
 
     @Test
-    void loadsAllowedAndCriticalFieldsFromTrustedSandboxState() {
+    void loadsAllowedAndCriticalFieldsFromSeparateTrustedClassificationKeys() {
         UUID runId = seedQueuedRun();
         fixtureService.createOrReset(runId);
+
+        assertThat(jdbcTemplate.queryForObject("""
+                select classification_json -> 'sensitiveFields' ->> 0
+                  from sandbox_customers
+                 where namespace_id = ? and customer_key = 'CUST-1001'
+                """, String.class, runId)).isEqualTo("accountNumber");
+        assertThat(jdbcTemplate.queryForObject("""
+                select classification_json -> 'criticalFields' ->> 0
+                  from sandbox_customers
+                 where namespace_id = ? and customer_key = 'CUST-1001'
+                """, String.class, runId)).isEqualTo("accountNumber");
+
+        jdbcTemplate.update("""
+                update sandbox_customers
+                   set classification_json = jsonb_set(
+                       classification_json,
+                       '{sensitiveFields}',
+                       '["birthDate"]'::jsonb
+                   )
+                 where namespace_id = ? and customer_key = 'CUST-1001'
+                """, runId);
 
         SensitiveFieldPolicy policy = fixtureService.sensitiveFieldPolicy(
                 runId,

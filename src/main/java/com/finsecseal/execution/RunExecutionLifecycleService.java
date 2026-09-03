@@ -16,6 +16,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 
 @Service
@@ -41,8 +42,9 @@ public class RunExecutionLifecycleService {
         this.runPersistenceService = runPersistenceService;
     }
 
+    @Transactional
     public void ensureRunning(UUID runId, UUID traceId, String category, String actorId) {
-        TestRunStatus status = runStatus(runId);
+        TestRunStatus status = lockRunStatus(runId);
         if (status == TestRunStatus.RUNNING) {
             if (!fixtureService.verifyIntegrity(runId)) {
                 throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "Golden Fixture integrity validation failed");
@@ -88,6 +90,51 @@ public class RunExecutionLifecycleService {
     }
 
     @Transactional
+    public CaseExecutionClaim claimCase(
+            UUID runId,
+            UUID testCaseId,
+            int trialIndex,
+            String variantHash,
+            String actorId
+    ) {
+        TestRunStatus status = lockRunStatus(runId);
+        if (status != TestRunStatus.RUNNING) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_STATE_TRANSITION,
+                    "Case execution requires a RUNNING TestRun"
+            );
+        }
+
+        List<ExistingCaseIdentity> existing = jdbcTemplate.query("""
+                select id, variant_hash
+                  from test_case_runs
+                 where test_run_id = ? and test_case_id = ? and trial_index = ?
+                 for update
+                """, (resultSet, rowNumber) -> new ExistingCaseIdentity(
+                resultSet.getObject("id", UUID.class),
+                resultSet.getString("variant_hash")
+        ), runId, testCaseId, trialIndex);
+
+        if (!existing.isEmpty()) {
+            ExistingCaseIdentity identity = existing.getFirst();
+            if (!variantHash.equals(identity.variantHash())) {
+                throw new BusinessException(
+                        ErrorCode.EVIDENCE_INCOMPLETE,
+                        "Existing TestCaseRun variant hash does not match requested execution"
+                );
+            }
+            return new CaseExecutionClaim(runPersistenceService.findCase(identity.id()), false);
+        }
+
+        TestRunPersistenceDto.CaseRun created = runPersistenceService.registerCase(
+                runId,
+                new TestRunPersistenceDto.CaseRunRegisterRequest(testCaseId, trialIndex, variantHash),
+                actorId
+        );
+        return new CaseExecutionClaim(created, true);
+    }
+
+    @Transactional
     public boolean completeIfReady(
             UUID runId,
             UUID caseRunId,
@@ -107,12 +154,7 @@ public class RunExecutionLifecycleService {
             return false;
         }
 
-        ObjectNode summary = objectMapper.createObjectNode();
-        summary.put("category", category);
-        summary.put("oracleOutcome", oracleOutcome);
-        summary.put("reasonCode", reasonCode);
-        summary.put("completedCases", counts.terminalCases());
-        summary.put("operationalErrorCount", counts.errorCases());
+        ObjectNode summary = aggregateSummary(runId, counts, category, oracleOutcome, reasonCode);
         eventService.append(
                 runId,
                 new ExecutionEventDto.AppendRequest(
@@ -211,6 +253,44 @@ public class RunExecutionLifecycleService {
         );
     }
 
+    private ObjectNode aggregateSummary(
+            UUID runId,
+            RunCounts counts,
+            String category,
+            String oracleOutcome,
+            String reasonCode
+    ) {
+        Integer findingCount = jdbcTemplate.queryForObject(
+                "select count(*) from findings where first_seen_run_id = ?",
+                Integer.class,
+                runId
+        );
+        List<String> categories = jdbcTemplate.queryForList("""
+                select distinct test_case.category
+                  from test_case_runs case_run
+                  join test_cases test_case on test_case.id = case_run.test_case_id
+                 where case_run.test_run_id = ?
+                 order by test_case.category
+                """, String.class, runId);
+
+        ObjectNode summary = objectMapper.createObjectNode();
+        summary.put("schemaVersion", "1.0");
+        summary.put("totalCases", counts.totalCases());
+        summary.put("completedCases", counts.terminalCases());
+        summary.put("securityFailedCases", counts.securityFailedCases());
+        summary.put("functionalFailedCases", counts.functionalFailedCases());
+        summary.put("operationalErrorCount", counts.errorCases());
+        summary.put("findingCount", findingCount == null ? 0 : findingCount);
+        ArrayNode categoriesNode = summary.putArray("categories");
+        categories.forEach(categoriesNode::add);
+
+        ObjectNode lastCase = summary.putObject("lastCase");
+        lastCase.put("category", category);
+        lastCase.put("oracleOutcome", oracleOutcome);
+        lastCase.put("reasonCode", reasonCode);
+        return summary;
+    }
+
     private void ensureRunStartedForFailure(UUID runId, UUID traceId, String actorId) {
         Integer count = jdbcTemplate.queryForObject(
                 "select count(*) from execution_events where run_id = ?",
@@ -243,7 +323,11 @@ public class RunExecutionLifecycleService {
                        count(case_run.id) filter (where case_run.status in (
                            'PASSED', 'FAILED_SECURITY', 'FAILED_FUNCTIONAL', 'ERROR', 'CANCELLED'
                        ))::integer terminal_cases,
-                       count(case_run.id) filter (where case_run.status = 'ERROR')::integer error_cases
+                       count(case_run.id) filter (where case_run.status = 'ERROR')::integer error_cases,
+                       count(case_run.id) filter (where case_run.status = 'FAILED_SECURITY')::integer
+                           security_failed_cases,
+                       count(case_run.id) filter (where case_run.status = 'FAILED_FUNCTIONAL')::integer
+                           functional_failed_cases
                   from test_runs run
                   left join test_case_runs case_run on case_run.test_run_id = run.id
                  where run.id = ?
@@ -253,24 +337,14 @@ public class RunExecutionLifecycleService {
                 resultSet.getInt("total_cases"),
                 resultSet.getInt("materialized_cases"),
                 resultSet.getInt("terminal_cases"),
-                resultSet.getInt("error_cases")
+                resultSet.getInt("error_cases"),
+                resultSet.getInt("security_failed_cases"),
+                resultSet.getInt("functional_failed_cases")
         ), runId);
         if (rows.isEmpty()) {
             throw new BusinessException(ErrorCode.RESOURCE_NOT_FOUND, "TestRun not found");
         }
         return rows.getFirst();
-    }
-
-    private TestRunStatus runStatus(UUID runId) {
-        List<TestRunStatus> statuses = jdbcTemplate.query(
-                "select status from test_runs where id = ?",
-                (resultSet, rowNumber) -> TestRunStatus.valueOf(resultSet.getString("status")),
-                runId
-        );
-        if (statuses.isEmpty()) {
-            throw new BusinessException(ErrorCode.RESOURCE_NOT_FOUND, "TestRun not found");
-        }
-        return statuses.getFirst();
     }
 
     private TestRunStatus lockRunStatus(UUID runId) {
@@ -310,12 +384,20 @@ public class RunExecutionLifecycleService {
         return message.length() <= 400 ? message : message.substring(0, 400);
     }
 
+    public record CaseExecutionClaim(TestRunPersistenceDto.CaseRun caseRun, boolean created) {
+    }
+
+    private record ExistingCaseIdentity(UUID id, String variantHash) {
+    }
+
     private record RunCounts(
             TestRunStatus status,
             int totalCases,
             int materializedCases,
             int terminalCases,
-            int errorCases
+            int errorCases,
+            int securityFailedCases,
+            int functionalFailedCases
     ) {
     }
 }

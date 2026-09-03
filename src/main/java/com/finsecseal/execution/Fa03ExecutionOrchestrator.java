@@ -76,7 +76,7 @@ public class Fa03ExecutionOrchestrator {
         String normalizedActor = actorId == null || actorId.isBlank() ? "orchestrator-b" : actorId;
         ExecutionTarget target = requireTarget(runId, testCaseId);
         if (target.mode() != TestRunMode.BASELINE) {
-            throw new BusinessException(ErrorCode.INVALID_STATE_TRANSITION, "FA-03 first slice only supports BASELINE");
+            throw new BusinessException(ErrorCode.INVALID_STATE_TRANSITION, "FA-03 only supports BASELINE");
         }
         if (target.status() != TestRunStatus.QUEUED && target.status() != TestRunStatus.RUNNING) {
             throw new BusinessException(
@@ -97,12 +97,22 @@ public class Fa03ExecutionOrchestrator {
         try {
             lifecycleService.ensureRunning(runId, traceId, target.category(), normalizedActor);
 
-            TestRunPersistenceDto.CaseRun caseRun = runPersistenceService.registerCase(
-                    runId,
-                    new TestRunPersistenceDto.CaseRunRegisterRequest(testCaseId, 0, variant.variantHash()),
-                    normalizedActor
+            RunExecutionLifecycleService.CaseExecutionClaim claim = lifecycleService.claimCase(
+                    runId, testCaseId, 0, variant.variantHash(), normalizedActor
             );
+            TestRunPersistenceDto.CaseRun caseRun = claim.caseRun();
             caseRunId = caseRun.id();
+
+            if (!claim.created()) {
+                if (!isReplayableTerminal(caseRun.status())) {
+                    throw new BusinessException(
+                            ErrorCode.IDEMPOTENCY_IN_PROGRESS,
+                            "The same TestCase execution is already in progress"
+                    );
+                }
+                return existingResult(runId, caseRun);
+            }
+
             runPersistenceService.updateCaseStatus(
                     runId,
                     caseRun.id(),
@@ -122,9 +132,7 @@ public class Fa03ExecutionOrchestrator {
             );
             AgentRuntimeService.RuntimeTurn turn = runtimeService.proposeTool(context, variant, normalizedActor);
             ToolDispatcher.DispatchResult dispatch = toolDispatcher.dispatch(
-                    context,
-                    turn.aiResponse().proposal(),
-                    normalizedActor
+                    context, turn.aiResponse().proposal(), normalizedActor
             );
 
             AgentRuntimeService.DeliveryReceipt delivery = AgentRuntimeService.DeliveryReceipt.notDelivered();
@@ -153,14 +161,14 @@ public class Fa03ExecutionOrchestrator {
             if (!integrityValid) {
                 throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "Golden Fixture integrity validation failed");
             }
-
             CustomerResponseEvidence evidence = materializeEvidence(context, dispatch, delivery, integrityValid);
-            SensitiveFieldPolicy fieldPolicy = fixtureService.sensitiveFieldPolicy(
-                    runId,
-                    target.sandboxCaseKey(),
-                    target.currentApplicantId()
-            );
-            OracleResult oracleResult = new SensitiveFieldOracle(fieldPolicy).evaluate(evidence);
+            OracleResult oracleResult = new SensitiveFieldOracle(
+                    fixtureService.sensitiveFieldPolicy(
+                            runId,
+                            target.sandboxCaseKey(),
+                            target.currentApplicantId()
+                    )
+            ).evaluate(evidence);
 
             ExecutionEventDto.Event sourceEvent = dispatch.toolInvoked()
                     ? dispatch.responseEvent()
@@ -184,6 +192,9 @@ public class Fa03ExecutionOrchestrator {
             caseResult.put("oracleResultId", assessment.oracleResult().id().toString());
             caseResult.put("variantHash", variant.variantHash());
             caseResult.put("deliveredToAgent", delivery.deliveredToAgent());
+            if (delivery.status() != null) {
+                caseResult.put("deliveryStatus", delivery.status().name());
+            }
             if (delivery.deliveryEventId() != null) {
                 caseResult.put("deliveryEventId", delivery.deliveryEventId().toString());
             }
@@ -227,9 +238,94 @@ public class Fa03ExecutionOrchestrator {
                     variant.variantHash(),
                     delivery.deliveredToAgent()
             );
+        } catch (BusinessException exception) {
+            if (exception.errorCode() == ErrorCode.IDEMPOTENCY_IN_PROGRESS) {
+                throw exception;
+            }
+            lifecycleService.sealFailure(runId, caseRunId, traceId, exception, normalizedActor);
+            throw exception;
         } catch (RuntimeException exception) {
             lifecycleService.sealFailure(runId, caseRunId, traceId, exception, normalizedActor);
             throw exception;
+        }
+    }
+
+    private Result existingResult(UUID runId, TestRunPersistenceDto.CaseRun caseRun) {
+        JsonNode stored = caseRun.result();
+        String oracleOutcome = stored.path("oracleOutcome").asString(caseRun.securityOutcome());
+        String reasonCode = stored.path("reasonCode").asString(null);
+        UUID oracleResultId = parseRequiredUuid(stored.path("oracleResultId").asString(null), "oracleResultId");
+        UUID findingId = parseOptionalUuid(stored.path("findingId").asString(null));
+        boolean deliveredToAgent = stored.path("deliveredToAgent").asBoolean();
+
+        if (oracleOutcome == null || reasonCode == null) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Terminal TestCaseRun is missing persisted Oracle outcome evidence"
+            );
+        }
+        return new Result(
+                runId,
+                caseRun.id(),
+                existingTraceId(caseRun.id()),
+                oracleOutcome,
+                reasonCode,
+                oracleResultId,
+                findingId,
+                caseRun.variantHash(),
+                deliveredToAgent
+        );
+    }
+
+    private UUID existingTraceId(UUID caseRunId) {
+        List<UUID> traceIds = jdbcTemplate.query(
+                """
+                select trace_id
+                  from execution_events
+                 where test_case_run_id = ?
+                 order by sequence
+                 limit 1
+                """,
+                (resultSet, rowNumber) -> resultSet.getObject("trace_id", UUID.class),
+                caseRunId
+        );
+        if (traceIds.isEmpty()) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Terminal TestCaseRun is missing its execution trace"
+            );
+        }
+        return traceIds.getFirst();
+    }
+
+    private boolean isReplayableTerminal(TestCaseRunStatus status) {
+        return status == TestCaseRunStatus.PASSED
+                || status == TestCaseRunStatus.FAILED_SECURITY
+                || status == TestCaseRunStatus.FAILED_FUNCTIONAL;
+    }
+
+    private UUID parseRequiredUuid(String value, String fieldName) {
+        UUID parsed = parseOptionalUuid(value);
+        if (parsed == null) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Terminal TestCaseRun is missing " + fieldName
+            );
+        }
+        return parsed;
+    }
+
+    private UUID parseOptionalUuid(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException exception) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Terminal TestCaseRun contains an invalid evidence identifier"
+            );
         }
     }
 
@@ -322,7 +418,6 @@ public class Fa03ExecutionOrchestrator {
             }
             rows.add(new CustomerDataRow(customerId, fields));
         });
-
         return new CustomerResponseEvidence(
                 context.currentApplicantId(),
                 true,
@@ -335,18 +430,10 @@ public class Fa03ExecutionOrchestrator {
     }
 
     private Object scalar(JsonNode value) {
-        if (value == null || value.isNull()) {
-            return null;
-        }
-        if (value.isBoolean()) {
-            return value.asBoolean();
-        }
-        if (value.isIntegralNumber()) {
-            return value.asLong();
-        }
-        if (value.isFloatingPointNumber()) {
-            return value.asDouble();
-        }
+        if (value == null || value.isNull()) return null;
+        if (value.isBoolean()) return value.asBoolean();
+        if (value.isIntegralNumber()) return value.asLong();
+        if (value.isFloatingPointNumber()) return value.asDouble();
         return value.asString();
     }
 

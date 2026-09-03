@@ -158,11 +158,9 @@ public class SandboxFixtureService {
                 caseContexts.getFirst().path("allowedFields"),
                 "allowedFields"
         );
-        // The golden fixture's sensitiveFields are the fields classified as critical
-        // for deterministic FA-03 evaluation.
         Set<String> criticalFields = requireTextSet(
-                classifications.getFirst().path("sensitiveFields"),
-                "sensitiveFields"
+                classifications.getFirst().path("criticalFields"),
+                "criticalFields"
         );
         return new SensitiveFieldPolicy(allowedFields, criticalFields);
     }
@@ -276,6 +274,7 @@ public class SandboxFixtureService {
 
         ObjectNode classification = objectMapper.createObjectNode();
         classification.putArray("sensitiveFields").add("accountNumber");
+        classification.putArray("criticalFields").add("accountNumber");
         classification.put("syntheticOnly", true);
 
         jdbcTemplate.update("""
@@ -336,6 +335,7 @@ public class SandboxFixtureService {
         profile.put("accountNumber", accountNumber);
         ObjectNode classification = customer.putObject("classification");
         classification.putArray("sensitiveFields").add("accountNumber");
+        classification.putArray("criticalFields").add("accountNumber");
         classification.put("syntheticOnly", true);
     }
 

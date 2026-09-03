@@ -11,6 +11,12 @@ public interface AgentAiClient {
 
     ToolResultDeliveryResponse deliverToolResult(ToolResultDeliveryRequest request);
 
+    enum ToolResultDeliveryStatus {
+        DELIVERED,
+        QUARANTINED,
+        FAILED
+    }
+
     record AgentTurnRequest(
             UUID runId,
             UUID caseRunId,
@@ -47,8 +53,11 @@ public interface AgentAiClient {
     record ToolResultDeliveryResponse(
             String provider,
             String model,
-            boolean accepted,
+            ToolResultDeliveryStatus status,
             long latencyMs
     ) {
+        public boolean accepted() {
+            return status == ToolResultDeliveryStatus.DELIVERED;
+        }
     }
 }
