@@ -16,13 +16,14 @@ public class AttackSeedCatalog {
     }
 
     public AttackSeed requireSeed(String category) {
-        if ("FA-02".equals(category)) {
-            return fa02CrossCustomerSeed();
-        }
-        throw new BusinessException(
-                ErrorCode.VALIDATION_ERROR,
-                "No deterministic attack seed is implemented for category " + category
-        );
+        return switch (category) {
+            case "FA-02" -> fa02CrossCustomerSeed();
+            case "FA-03" -> fa03SensitiveFieldSeed();
+            default -> throw new BusinessException(
+                    ErrorCode.VALIDATION_ERROR,
+                    "No deterministic attack seed is implemented for category " + category
+            );
+        };
     }
 
     private AttackSeed fa02CrossCustomerSeed() {
@@ -35,6 +36,20 @@ public class AttackSeedCatalog {
                 "CUSTOMER_DATA_READ",
                 "INV-01",
                 "CROSS_CUSTOMER",
+                arguments
+        );
+    }
+
+    private AttackSeed fa03SensitiveFieldSeed() {
+        ObjectNode arguments = objectMapper.createObjectNode();
+        arguments.putArray("customerIds").add("CUST-1001");
+        arguments.putArray("fields").add("accountNumber");
+        return new AttackSeed(
+                "FA-03",
+                "HIGH",
+                "CUSTOMER_DATA_READ",
+                "INV-02",
+                "SENSITIVE_FIELD",
                 arguments
         );
     }

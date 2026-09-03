@@ -7,6 +7,7 @@ import com.finsecseal.common.domain.ExecutionEventType;
 import com.finsecseal.evidence.ExecutionEventDto;
 import com.finsecseal.evidence.ExecutionEventService;
 import com.finsecseal.runtime.ai.AgentAiClient;
+import com.finsecseal.runtime.ai.AgentAiClient.ToolResultDeliveryStatus;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import java.util.UUID;
 import org.springframework.beans.factory.ObjectProvider;
@@ -177,17 +178,33 @@ public class AgentRuntimeService {
                         sourceSequence
                 )
         );
-        if (response == null || !response.accepted()) {
-            throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "Agent did not accept the Tool Response");
+
+        if (response == null || response.status() == null) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Agent Tool Response delivery returned an invalid result"
+            );
+        }
+        if (response.status() == ToolResultDeliveryStatus.FAILED) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Agent Tool Response delivery failed"
+            );
         }
 
+        boolean delivered = response.status() == ToolResultDeliveryStatus.DELIVERED;
         ObjectNode output = objectMapper.createObjectNode();
         output.put("provider", response.provider());
         output.put("model", response.model());
-        output.put("accepted", true);
+        output.put("accepted", delivered);
+        output.put("deliveryStatus", response.status().name());
         output.put("latencyMs", response.latencyMs());
         output.put("sourceEventId", sourceEventId.toString());
         output.put("sourceSequence", sourceSequence);
+
+        String reasonCode = delivered
+                ? "AGENT_TOOL_RESULT_DELIVERED"
+                : "AGENT_TOOL_RESULT_QUARANTINED";
         ExecutionEventDto.Event deliveryEvent = eventService.append(
                 context.runId(),
                 new ExecutionEventDto.AppendRequest(
@@ -198,14 +215,20 @@ public class AgentRuntimeService {
                         null,
                         output,
                         null,
-                        "AGENT_TOOL_RESULT_DELIVERED",
+                        reasonCode,
                         objectMapper.createObjectNode()
                                 .put("turnType", "TOOL_RESULT_DELIVERY")
                                 .put("variantHash", attackVariant.variantHash())
                 ),
                 actorId
         );
-        return new DeliveryReceipt(true, deliveryEvent.eventId(), deliveryEvent.sequence(), response.latencyMs());
+        return new DeliveryReceipt(
+                delivered,
+                response.status(),
+                deliveryEvent.eventId(),
+                deliveryEvent.sequence(),
+                response.latencyMs()
+        );
     }
 
     private AgentAiClient requireClient() {
@@ -224,12 +247,13 @@ public class AgentRuntimeService {
 
     public record DeliveryReceipt(
             boolean deliveredToAgent,
+            ToolResultDeliveryStatus status,
             UUID deliveryEventId,
             long deliveryEventSequence,
             long latencyMs
     ) {
         public static DeliveryReceipt notDelivered() {
-            return new DeliveryReceipt(false, null, 0L, 0L);
+            return new DeliveryReceipt(false, null, null, 0L, 0L);
         }
     }
 }

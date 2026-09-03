@@ -17,7 +17,8 @@ import com.finsecseal.oracle.domain.CustomerDataRow;
 import com.finsecseal.oracle.domain.CustomerResponseEvidence;
 import com.finsecseal.oracle.domain.OracleOutcome;
 import com.finsecseal.oracle.domain.OracleResult;
-import com.finsecseal.oracle.evaluator.CrossCustomerOracle;
+import com.finsecseal.oracle.domain.SensitiveFieldPolicy;
+import com.finsecseal.oracle.evaluator.SensitiveFieldOracle;
 import com.finsecseal.runtime.AgentRuntimeService;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import com.finsecseal.sandbox.SandboxFixtureService;
@@ -34,7 +35,7 @@ import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
 @Service
-public class Fa02ExecutionOrchestrator {
+public class Fa03ExecutionOrchestrator {
 
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
@@ -47,7 +48,7 @@ public class Fa02ExecutionOrchestrator {
     private final OracleAssessmentService oracleAssessmentService;
     private final RunExecutionLifecycleService lifecycleService;
 
-    public Fa02ExecutionOrchestrator(
+    public Fa03ExecutionOrchestrator(
             JdbcTemplate jdbcTemplate,
             ObjectMapper objectMapper,
             AttackSeedCatalog attackSeedCatalog,
@@ -75,16 +76,16 @@ public class Fa02ExecutionOrchestrator {
         String normalizedActor = actorId == null || actorId.isBlank() ? "orchestrator-b" : actorId;
         ExecutionTarget target = requireTarget(runId, testCaseId);
         if (target.mode() != TestRunMode.BASELINE) {
-            throw new BusinessException(ErrorCode.INVALID_STATE_TRANSITION, "FA-02 only supports BASELINE");
+            throw new BusinessException(ErrorCode.INVALID_STATE_TRANSITION, "FA-03 only supports BASELINE");
         }
         if (target.status() != TestRunStatus.QUEUED && target.status() != TestRunStatus.RUNNING) {
             throw new BusinessException(
                     ErrorCode.INVALID_STATE_TRANSITION,
-                    "FA-02 execution requires a QUEUED or RUNNING TestRun"
+                    "FA-03 execution requires a QUEUED or RUNNING TestRun"
             );
         }
-        if (!"FA-02".equals(target.category())) {
-            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "TestCase is not FA-02");
+        if (!"FA-03".equals(target.category())) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "TestCase is not FA-03");
         }
 
         AttackSeed seed = attackSeedCatalog.requireSeed(target.category());
@@ -171,7 +172,13 @@ public class Fa02ExecutionOrchestrator {
                 throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "Golden Fixture integrity validation failed");
             }
             CustomerResponseEvidence evidence = materializeEvidence(context, dispatch, delivery, integrityValid);
-            OracleResult oracleResult = new CrossCustomerOracle().evaluate(evidence);
+            OracleResult oracleResult = new SensitiveFieldOracle(
+                    fixtureService.sensitiveFieldPolicy(
+                            runId,
+                            target.sandboxCaseKey(),
+                            target.currentApplicantId()
+                    )
+            ).evaluate(evidence);
 
             ExecutionEventDto.Event sourceEvent = dispatch.toolInvoked()
                     ? dispatch.responseEvent()
@@ -362,7 +369,7 @@ public class Fa02ExecutionOrchestrator {
         }
         ExecutionTarget target = targets.getFirst();
         if (target.sandboxCaseKey() == null || target.currentApplicantId() == null) {
-            throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "FA-02 preconditions are incomplete");
+            throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "FA-03 preconditions are incomplete");
         }
         return target;
     }
