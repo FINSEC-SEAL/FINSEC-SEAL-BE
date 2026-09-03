@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.finsecseal.attack.AttackSeedCatalog;
 import com.finsecseal.attack.AttackVariantFactory;
+import com.finsecseal.common.domain.TestCaseRunStatus;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.evidence.TestRunPersistenceDto;
 import com.finsecseal.evidence.TestRunPersistenceService;
@@ -44,6 +45,7 @@ class CaseExecutionRetryIntegrationTest {
     @Autowired TestRunPersistenceService runPersistenceService;
     @Autowired SandboxFixtureService fixtureService;
     @Autowired Fa02ExecutionOrchestrator orchestrator;
+    @Autowired RunExecutionLifecycleService lifecycleService;
     @Autowired AttackSeedCatalog attackSeedCatalog;
     @Autowired AttackVariantFactory attackVariantFactory;
 
@@ -80,6 +82,74 @@ class CaseExecutionRetryIntegrationTest {
         assertThat(jdbcTemplate.queryForObject(
                 "select completed_cases from test_runs where id = ?", Integer.class, seed.runId()
         )).isEqualTo(2);
+    }
+
+
+    @Test
+    void retryingTerminalCaseRecoversRunWhenCompletionStepWasMissed() {
+        Seed seed = seedQueuedFa02Run();
+
+        Fa02ExecutionOrchestrator.Result first = orchestrator.execute(
+                seed.runId(), seed.testCaseIds().get(0), "role-b"
+        );
+
+        RunExecutionLifecycleService.CaseExecutionClaim secondClaim = lifecycleService.claimCase(
+                seed.runId(),
+                seed.testCaseIds().get(1),
+                0,
+                fa02VariantHash(),
+                "role-b"
+        );
+        runPersistenceService.updateCaseStatus(
+                seed.runId(),
+                secondClaim.caseRun().id(),
+                new TestRunPersistenceDto.CaseRunStatusRequest(
+                        TestCaseRunStatus.PASSED,
+                        "ATTACK_BLOCKED",
+                        "NOT_EVALUATED",
+                        0L,
+                        objectMapper.createObjectNode(),
+                        null,
+                        objectMapper.createObjectNode()
+                                .put("oracleOutcome", "ATTACK_BLOCKED")
+                                .put("reasonCode", "SAFE_NO_SIDE_EFFECT")
+                                .put("oracleResultId", UUID.randomUUID().toString())
+                                .put("variantHash", fa02VariantHash())
+                                .put("deliveredToAgent", false)
+                ),
+                "role-b"
+        );
+
+        assertThat(jdbcTemplate.queryForObject(
+                "select status from test_runs where id = ?", String.class, seed.runId()
+        )).isEqualTo("RUNNING");
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from test_case_runs
+                 where test_run_id = ? and status in (
+                     'PASSED', 'FAILED_SECURITY', 'FAILED_FUNCTIONAL', 'ERROR', 'CANCELLED'
+                 )
+                """, Integer.class, seed.runId())).isEqualTo(2);
+
+        Fa02ExecutionOrchestrator.Result retry = orchestrator.execute(
+                seed.runId(), seed.testCaseIds().get(0), "role-b"
+        );
+
+        assertThat(retry.caseRunId()).isEqualTo(first.caseRunId());
+        assertThat(retry.oracleOutcome()).isEqualTo(first.oracleOutcome());
+        assertThat(jdbcTemplate.queryForObject(
+                "select status from test_runs where id = ?", String.class, seed.runId()
+        )).isEqualTo("COMPLETED");
+        assertThat(jdbcTemplate.queryForObject(
+                "select completed_cases from test_runs where id = ?", Integer.class, seed.runId()
+        )).isEqualTo(2);
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from execution_events
+                 where run_id = ? and event_type = 'RUN_COMPLETED'
+                """, Integer.class, seed.runId())).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from execution_events
+                 where run_id = ? and event_type = 'RUN_FAILED'
+                """, Integer.class, seed.runId())).isZero();
     }
 
     private Seed seedQueuedFa02Run() {

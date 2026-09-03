@@ -110,7 +110,17 @@ public class Fa03ExecutionOrchestrator {
                             "The same TestCase execution is already in progress"
                     );
                 }
-                return existingResult(runId, caseRun);
+                Result existing = existingResult(runId, caseRun);
+                lifecycleService.completeIfReady(
+                        runId,
+                        caseRun.id(),
+                        existing.traceId(),
+                        target.category(),
+                        existing.oracleOutcome(),
+                        existing.reasonCode(),
+                        normalizedActor
+                );
+                return existing;
             }
 
             runPersistenceService.updateCaseStatus(
