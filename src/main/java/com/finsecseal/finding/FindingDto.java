@@ -1,5 +1,6 @@
 package com.finsecseal.finding;
 
+import com.finsecseal.oracle.application.OracleResultDto;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -29,5 +30,18 @@ public final class FindingDto {
     }
 
     public record ListResponse(List<View> items) {
+    }
+
+    public record Detail(
+            View finding,
+            OracleResultDto.View oracleResult,
+            List<View> relatedFindings
+    ) {
+        public Detail {
+            relatedFindings = List.copyOf(relatedFindings);
+        }
+    }
+
+    public record TriageRequest(String comment) {
     }
 }

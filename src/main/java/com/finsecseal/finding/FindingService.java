@@ -4,7 +4,9 @@ import com.finsecseal.audit.AuditService;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.persistence.UuidV7;
+import com.finsecseal.evidence.RedactionService;
 import com.finsecseal.oracle.application.OracleResultDto;
+import com.finsecseal.oracle.application.OracleResultService;
 import com.finsecseal.oracle.domain.OracleOutcome;
 import com.finsecseal.oracle.domain.OracleReasonCode;
 import com.finsecseal.release.DigestService;
@@ -27,17 +29,23 @@ public class FindingService {
     private final ObjectMapper objectMapper;
     private final DigestService digestService;
     private final AuditService auditService;
+    private final RedactionService redactionService;
+    private final OracleResultService oracleResultService;
 
     public FindingService(
             JdbcTemplate jdbcTemplate,
             ObjectMapper objectMapper,
             DigestService digestService,
-            AuditService auditService
+            AuditService auditService,
+            RedactionService redactionService,
+            OracleResultService oracleResultService
     ) {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
         this.digestService = digestService;
         this.auditService = auditService;
+        this.redactionService = redactionService;
+        this.oracleResultService = oracleResultService;
     }
 
     @Transactional
@@ -116,6 +124,55 @@ public class FindingService {
         return findings.getFirst();
     }
 
+    public FindingDto.Detail findDetail(UUID findingId) {
+        FindingDto.View finding = find(findingId);
+        OracleResultDto.View oracleResult = oracleResultService.find(finding.sourceOracleResultId());
+        List<FindingDto.View> related = finding.findingGroupKey() == null
+                ? List.of()
+                : findByRelease(
+                        finding.releaseId(), null, null, finding.findingGroupKey()
+                ).items().stream()
+                        .filter(candidate -> !candidate.id().equals(finding.id()))
+                        .toList();
+        return new FindingDto.Detail(finding, oracleResult, related);
+    }
+
+    public FindingDto.ListResponse findByRelease(
+            UUID releaseId,
+            String category,
+            String status,
+            String findingGroupKey
+    ) {
+        if (releaseId == null) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "releaseId is required");
+        }
+        requireRelease(releaseId);
+        String normalizedCategory = normalizeOptionalFilter(category, "category", 80);
+        String normalizedStatus = normalizeOptionalFilter(status, "status", 30);
+        String normalizedGroupKey = normalizeOptionalFilter(findingGroupKey, "findingGroupKey", 100);
+
+        StringBuilder sql = new StringBuilder(selectSql()).append(" where finding.release_id = ?");
+        List<Object> arguments = new java.util.ArrayList<>();
+        arguments.add(releaseId);
+        if (normalizedCategory != null) {
+            sql.append(" and finding.category = ?");
+            arguments.add(normalizedCategory);
+        }
+        if (normalizedStatus != null) {
+            sql.append(" and finding.status = ?");
+            arguments.add(normalizedStatus);
+        }
+        if (normalizedGroupKey != null) {
+            sql.append(" and finding.finding_group_key = ?");
+            arguments.add(normalizedGroupKey);
+        }
+        sql.append(" order by finding.created_at, finding.id");
+        List<FindingDto.View> items = jdbcTemplate.query(
+                sql.toString(), this::mapFinding, arguments.toArray()
+        );
+        return new FindingDto.ListResponse(List.copyOf(items));
+    }
+
     public FindingDto.ListResponse findByRun(UUID runId) {
         requireRun(runId);
         List<FindingDto.View> items = jdbcTemplate.query(
@@ -129,6 +186,94 @@ public class FindingService {
                 runId
         );
         return new FindingDto.ListResponse(List.copyOf(items));
+    }
+
+    @Transactional
+    public FindingDto.View triage(
+            UUID findingId,
+            FindingDto.TriageRequest request,
+            String actorId
+    ) {
+        if (findingId == null || request == null) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Finding and triage request are required");
+        }
+        String reviewer = requireReviewer(actorId);
+        String comment = requireTriageComment(request.comment());
+        FindingDto.View before = findForUpdate(findingId);
+        if (!"OPEN".equals(before.status())) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_STATE_TRANSITION,
+                    "Only an OPEN Finding can be triaged"
+            );
+        }
+
+        Instant updatedAt = Instant.now();
+        int updated = jdbcTemplate.update("""
+                update findings
+                   set status = 'TRIAGED', updated_at = ?
+                 where id = ? and status = 'OPEN'
+                """, Timestamp.from(updatedAt), findingId);
+        if (updated != 1) {
+            throw new BusinessException(ErrorCode.RESOURCE_CONFLICT, "Finding was changed concurrently");
+        }
+
+        ObjectNode rawMetadata = objectMapper.createObjectNode();
+        rawMetadata.put("schemaVersion", "1.0");
+        rawMetadata.put("fromStatus", "OPEN");
+        rawMetadata.put("toStatus", "TRIAGED");
+        rawMetadata.put("comment", comment);
+        JsonNode safeMetadata = redactionService.redact(rawMetadata).redacted();
+        UUID workspaceId = findWorkspaceId(before.releaseId());
+        auditService.append(
+                workspaceId,
+                reviewer,
+                "FINDING_TRIAGED",
+                "FINDING",
+                findingId,
+                digestService.sha256("status=OPEN"),
+                digestService.sha256("status=TRIAGED"),
+                safeMetadata
+        );
+        return find(findingId);
+    }
+
+    private FindingDto.View findForUpdate(UUID findingId) {
+        List<FindingDto.View> findings = jdbcTemplate.query(
+                selectSql() + " where finding.id = ? for update",
+                this::mapFinding,
+                findingId
+        );
+        if (findings.isEmpty()) {
+            throw new BusinessException(ErrorCode.RESOURCE_NOT_FOUND, "Finding not found");
+        }
+        return findings.getFirst();
+    }
+
+    private UUID findWorkspaceId(UUID releaseId) {
+        return jdbcTemplate.queryForObject("""
+                select agent.workspace_id
+                  from agent_releases release
+                  join agents agent on agent.id = release.agent_id
+                 where release.id = ?
+                """, UUID.class, releaseId);
+    }
+
+    private String requireReviewer(String actorId) {
+        if (actorId == null || actorId.isBlank()) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "X-Actor-Id is required for triage");
+        }
+        return normalizeActor(actorId);
+    }
+
+    private String requireTriageComment(String comment) {
+        if (comment == null || comment.isBlank()) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Triage comment must not be blank");
+        }
+        String normalized = comment.strip();
+        if (normalized.length() > 2000) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Triage comment exceeds 2000 characters");
+        }
+        return normalized;
     }
 
     private FindingDto.View findByOracleResult(UUID oracleResultId) {
@@ -176,6 +321,31 @@ public class FindingService {
         if (count == null || count == 0) {
             throw new BusinessException(ErrorCode.RESOURCE_NOT_FOUND, "TestRun not found");
         }
+    }
+
+    private void requireRelease(UUID releaseId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "select count(*) from agent_releases where id = ?",
+                Integer.class,
+                releaseId
+        );
+        if (count == null || count == 0) {
+            throw new BusinessException(ErrorCode.RESOURCE_NOT_FOUND, "Release not found");
+        }
+    }
+
+    private String normalizeOptionalFilter(String value, String fieldName, int maxLength) {
+        if (value == null) {
+            return null;
+        }
+        String normalized = value.strip();
+        if (normalized.isEmpty() || normalized.length() > maxLength) {
+            throw new BusinessException(
+                    ErrorCode.VALIDATION_ERROR,
+                    fieldName + " must contain between 1 and " + maxLength + " characters"
+            );
+        }
+        return normalized;
     }
 
     private String selectSql() {
