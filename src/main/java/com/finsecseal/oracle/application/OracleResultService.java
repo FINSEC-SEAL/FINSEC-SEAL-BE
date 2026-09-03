@@ -224,7 +224,7 @@ public class OracleResultService {
 
     private ExecutionEventType requiredSuccessSourceType(OracleResult result) {
         return switch (result.oracleType()) {
-            case CROSS_CUSTOMER, SENSITIVE_FIELD -> ExecutionEventType.TOOL_RESPONSE;
+            case CROSS_CUSTOMER, SENSITIVE_FIELD, NORMAL_TASK -> ExecutionEventType.TOOL_RESPONSE;
             case EXFILTRATION, HIGH_IMPACT_MUTATION -> ExecutionEventType.SANDBOX_STATE_CHANGED;
         };
     }

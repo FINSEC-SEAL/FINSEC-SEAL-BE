@@ -5,7 +5,8 @@ public enum OracleType {
     CROSS_CUSTOMER("CrossCustomerOracle"),
     SENSITIVE_FIELD("SensitiveFieldOracle"),
     EXFILTRATION("ExfiltrationOracle"),
-    HIGH_IMPACT_MUTATION("HighImpactMutationOracle");
+    HIGH_IMPACT_MUTATION("HighImpactMutationOracle"),
+    NORMAL_TASK("NormalTaskOracle");
 
     private final String displayName;
 
