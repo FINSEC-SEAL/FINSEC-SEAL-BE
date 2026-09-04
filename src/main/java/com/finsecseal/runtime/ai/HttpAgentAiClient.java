@@ -5,6 +5,7 @@ import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.runtime.ToolProposal;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -12,6 +13,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
@@ -20,6 +22,8 @@ public final class HttpAgentAiClient implements AgentAiClient {
 
     private static final int MAX_REQUEST_BYTES = 512 * 1024;
     private static final int MAX_RESPONSE_BYTES = 256 * 1024;
+    private static final int MAX_ATTEMPTS = 3;
+    private static final long RETRY_BASE_DELAY_MS = 150L;
     private static final Set<String> ALLOWED_FINISH_REASONS = Set.of("tool_call", "stop");
 
     private final HttpClient httpClient;
@@ -107,29 +111,121 @@ public final class HttpAgentAiClient implements AgentAiClient {
                 .POST(HttpRequest.BodyPublishers.ofByteArray(requestBody))
                 .build();
 
-        HttpResponse<byte[]> response;
-        try {
-            response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofByteArray());
-        } catch (java.net.http.HttpTimeoutException exception) {
-            throw operationalFailure("AI step request timed out", exception);
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            throw operationalFailure("AI step request was interrupted", exception);
-        } catch (IOException exception) {
-            throw operationalFailure("AI step request failed", exception);
+        byte[] responseBody = sendStepRequest(httpRequest);
+        return parseStepResponse(responseBody);
+    }
+
+    private byte[] sendStepRequest(HttpRequest httpRequest) {
+        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            try {
+                HttpResponse<InputStream> response = httpClient.send(
+                        httpRequest,
+                        HttpResponse.BodyHandlers.ofInputStream()
+                );
+                int statusCode = response.statusCode();
+
+                if (isRetryableStatus(statusCode)) {
+                    closeQuietly(response.body());
+                    if (attempt == MAX_ATTEMPTS) {
+                        throw operationalFailure(
+                                "AI service returned retryable HTTP "
+                                        + statusCode
+                                        + " after "
+                                        + MAX_ATTEMPTS
+                                        + " attempts",
+                                null
+                        );
+                    }
+                    sleepBeforeRetry(attempt);
+                    continue;
+                }
+
+                if (statusCode >= 500) {
+                    closeQuietly(response.body());
+                    throw operationalFailure(
+                            "AI service returned HTTP " + statusCode,
+                            null
+                    );
+                }
+
+                if (statusCode < 200 || statusCode >= 300) {
+                    closeQuietly(response.body());
+                    throw evidenceIncomplete(
+                            "AI service rejected the step request with HTTP " + statusCode
+                    );
+                }
+
+                try {
+                    return readBoundedResponse(response.body());
+                } finally {
+                    closeQuietly(response.body());
+                }
+            } catch (java.net.http.HttpTimeoutException exception) {
+                if (attempt == MAX_ATTEMPTS) {
+                    throw operationalFailure(
+                            "AI step request timed out after " + MAX_ATTEMPTS + " attempts",
+                            exception
+                    );
+                }
+                sleepBeforeRetry(attempt);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw operationalFailure("AI step request was interrupted", exception);
+            } catch (IOException exception) {
+                if (attempt == MAX_ATTEMPTS) {
+                    throw operationalFailure(
+                            "AI step request failed after " + MAX_ATTEMPTS + " attempts",
+                            exception
+                    );
+                }
+                sleepBeforeRetry(attempt);
+            }
         }
 
-        if (response.body() != null && response.body().length > MAX_RESPONSE_BYTES) {
+        throw operationalFailure("AI step request exhausted retry attempts", null);
+    }
+
+    private boolean isRetryableStatus(int statusCode) {
+        return statusCode == 408
+                || statusCode == 429
+                || statusCode == 502
+                || statusCode == 503
+                || statusCode == 504;
+    }
+
+    private byte[] readBoundedResponse(InputStream body) throws IOException {
+        if (body == null) {
+            return new byte[0];
+        }
+        byte[] bytes = body.readNBytes(MAX_RESPONSE_BYTES + 1);
+        if (bytes.length > MAX_RESPONSE_BYTES) {
             throw evidenceIncomplete("AI step response exceeds 256 KiB");
         }
-        if (response.statusCode() >= 500) {
-            throw operationalFailure("AI service returned HTTP " + response.statusCode(), null);
-        }
-        if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw evidenceIncomplete("AI service rejected the step request with HTTP " + response.statusCode());
-        }
+        return bytes;
+    }
 
-        return parseStepResponse(response.body());
+    private void sleepBeforeRetry(int failedAttempt) {
+        long baseDelay = RETRY_BASE_DELAY_MS * (1L << (failedAttempt - 1));
+        long jitterBound = Math.max(1L, baseDelay / 3L);
+        long delayMs = baseDelay + ThreadLocalRandom.current().nextLong(jitterBound);
+
+        try {
+            Thread.sleep(delayMs);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw operationalFailure("AI step retry backoff was interrupted", exception);
+        }
+    }
+
+    private void closeQuietly(InputStream body) {
+        if (body == null) {
+            return;
+        }
+        try {
+            body.close();
+        } catch (IOException ignored) {
+            // The response is already being discarded or fully consumed.
+        }
     }
 
     private byte[] serializeRequest(AgentStepRequest request) {
