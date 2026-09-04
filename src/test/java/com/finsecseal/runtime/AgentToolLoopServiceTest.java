@@ -3,6 +3,7 @@ package com.finsecseal.runtime;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -81,6 +82,9 @@ class AgentToolLoopServiceTest {
         ToolDispatcher.DispatchResult secondDispatch = allowedDispatch(second, 21L);
 
         when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initialTurn);
+        when(runtimeService.recordFollowUpToolProposal(
+                eq(context), eq(variant), eq(second), any(), anyLong(), eq(ACTOR)
+        )).thenReturn(second);
         when(toolDispatcher.dispatch(context, first, ACTOR)).thenReturn(firstDispatch);
         when(toolDispatcher.dispatch(context, second, ACTOR)).thenReturn(secondDispatch);
         when(runtimeService.deliverToolResult(
@@ -110,6 +114,12 @@ class AgentToolLoopServiceTest {
         ToolDispatcher.DispatchResult secondDispatch = allowedDispatch(second, 41L);
 
         when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initialTurn(first));
+        when(runtimeService.recordFollowUpToolProposal(
+                eq(context), eq(variant), eq(second), any(), anyLong(), eq(ACTOR)
+        )).thenReturn(second);
+        when(runtimeService.recordFollowUpToolProposal(
+                eq(context), eq(variant), eq(third), any(), anyLong(), eq(ACTOR)
+        )).thenReturn(third);
         when(toolDispatcher.dispatch(context, first, ACTOR)).thenReturn(firstDispatch);
         when(toolDispatcher.dispatch(context, second, ACTOR)).thenReturn(secondDispatch);
         when(runtimeService.deliverToolResult(
@@ -140,6 +150,9 @@ class AgentToolLoopServiceTest {
         ToolDispatcher.DispatchResult secondDispatch = allowedDispatch(second, 61L);
 
         when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initialTurn(first));
+        when(runtimeService.recordFollowUpToolProposal(
+                eq(context), eq(variant), eq(second), any(), anyLong(), eq(ACTOR)
+        )).thenReturn(second);
         when(toolDispatcher.dispatch(context, first, ACTOR)).thenReturn(firstDispatch);
         when(toolDispatcher.dispatch(context, second, ACTOR)).thenReturn(secondDispatch);
         when(runtimeService.deliverToolResult(
@@ -159,6 +172,9 @@ class AgentToolLoopServiceTest {
         order.verify(runtimeService).deliverToolResult(
                 eq(context), eq(variant), eq(first.toolName()), any(),
                 eq(firstDispatch.responseEvent().eventId()), eq(firstDispatch.responseEvent().sequence()), eq(ACTOR)
+        );
+        order.verify(runtimeService).recordFollowUpToolProposal(
+                eq(context), eq(variant), eq(second), any(), anyLong(), eq(ACTOR)
         );
         order.verify(toolDispatcher).dispatch(context, second, ACTOR);
         order.verify(runtimeService).deliverToolResult(

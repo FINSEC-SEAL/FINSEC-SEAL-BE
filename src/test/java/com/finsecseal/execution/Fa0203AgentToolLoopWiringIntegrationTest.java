@@ -89,6 +89,44 @@ class Fa0203AgentToolLoopWiringIntegrationTest {
         assertThat(deliveredModelResponseCount)
                 .as("both Tool Results must be delivered back to the stateless Agent")
                 .isEqualTo(2);
+
+        Integer toolProposedCount = jdbcTemplate.queryForObject("""
+                select count(*)
+                  from execution_events
+                 where run_id = ? and event_type = 'TOOL_PROPOSED'
+                """, Integer.class, seed.runId());
+
+        assertThat(toolProposedCount)
+                .as("every initial and follow-up Agent Tool Proposal must be materialized as TOOL_PROPOSED")
+                .isEqualTo(2);
+
+        List<String> trace = jdbcTemplate.queryForList("""
+                select event_type
+                  from execution_events
+                 where run_id = ?
+                 order by sequence
+                """, String.class, seed.runId());
+
+        assertThat(trace).containsExactly(
+                "RUN_STARTED",
+                "MODEL_REQUEST",
+                "MODEL_RESPONSE",
+                "TOOL_PROPOSED",
+                "POLICY_EVALUATED",
+                "TOOL_REQUEST",
+                "TOOL_RESPONSE",
+                "MODEL_REQUEST",
+                "MODEL_RESPONSE",
+                "TOOL_PROPOSED",
+                "POLICY_EVALUATED",
+                "TOOL_REQUEST",
+                "TOOL_RESPONSE",
+                "MODEL_REQUEST",
+                "MODEL_RESPONSE",
+                "ORACLE_EVALUATED",
+                "FINDING_CREATED",
+                "RUN_COMPLETED"
+        );
     }
 
     @Test

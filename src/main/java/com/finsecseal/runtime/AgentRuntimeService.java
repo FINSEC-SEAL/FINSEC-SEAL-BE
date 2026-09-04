@@ -135,6 +135,46 @@ public class AgentRuntimeService {
         );
     }
 
+    public ToolProposal recordFollowUpToolProposal(
+            SandboxExecutionContext context,
+            AttackVariant attackVariant,
+            ToolProposal proposal,
+            UUID sourceModelResponseEventId,
+            long sourceModelResponseSequence,
+            String actorId
+    ) {
+        if (sourceModelResponseEventId == null || sourceModelResponseSequence <= 0) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Follow-up Tool Proposal is missing its source MODEL_RESPONSE evidence"
+            );
+        }
+
+        ToolProposal validatedProposal = proposalValidator.validate(proposal);
+
+        eventService.append(
+                context.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        context.caseRunId(),
+                        context.traceId(),
+                        ExecutionEventType.TOOL_PROPOSED,
+                        validatedProposal.toolName(),
+                        validatedProposal.arguments(),
+                        null,
+                        null,
+                        "STRUCTURED_TOOL_PROPOSAL",
+                        objectMapper.createObjectNode()
+                                .put("turnType", "TOOL_RESULT_DELIVERY")
+                                .put("variantHash", attackVariant.variantHash())
+                                .put("sourceModelResponseEventId", sourceModelResponseEventId.toString())
+                                .put("sourceModelResponseSequence", sourceModelResponseSequence)
+                ),
+                actorId
+        );
+
+        return validatedProposal;
+    }
+
     public DeliveryReceipt deliverToolResult(
             SandboxExecutionContext context,
             AttackVariant attackVariant,

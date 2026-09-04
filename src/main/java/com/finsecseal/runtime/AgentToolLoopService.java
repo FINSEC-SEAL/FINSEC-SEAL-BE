@@ -115,7 +115,14 @@ public class AgentToolLoopService {
             }
 
             if (nextAction instanceof ToolProposalAction toolProposalAction) {
-                currentProposal = toolProposalAction.proposal();
+                currentProposal = runtimeService.recordFollowUpToolProposal(
+                        context,
+                        attackVariant,
+                        toolProposalAction.proposal(),
+                        delivery.deliveryEventId(),
+                        delivery.deliveryEventSequence(),
+                        actorId
+                );
                 continue;
             }
 
