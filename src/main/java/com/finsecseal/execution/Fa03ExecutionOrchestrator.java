@@ -19,10 +19,9 @@ import com.finsecseal.oracle.domain.OracleOutcome;
 import com.finsecseal.oracle.domain.OracleResult;
 import com.finsecseal.oracle.domain.SensitiveFieldPolicy;
 import com.finsecseal.oracle.evaluator.SensitiveFieldOracle;
-import com.finsecseal.runtime.AgentRuntimeService;
+import com.finsecseal.runtime.AgentToolLoopService;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import com.finsecseal.sandbox.SandboxFixtureService;
-import com.finsecseal.sandbox.tool.ToolDispatcher;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -42,8 +41,7 @@ public class Fa03ExecutionOrchestrator {
     private final AttackSeedCatalog attackSeedCatalog;
     private final AttackVariantFactory attackVariantFactory;
     private final TestRunPersistenceService runPersistenceService;
-    private final AgentRuntimeService runtimeService;
-    private final ToolDispatcher toolDispatcher;
+    private final AgentToolLoopService agentToolLoopService;
     private final SandboxFixtureService fixtureService;
     private final OracleAssessmentService oracleAssessmentService;
     private final RunExecutionLifecycleService lifecycleService;
@@ -54,8 +52,7 @@ public class Fa03ExecutionOrchestrator {
             AttackSeedCatalog attackSeedCatalog,
             AttackVariantFactory attackVariantFactory,
             TestRunPersistenceService runPersistenceService,
-            AgentRuntimeService runtimeService,
-            ToolDispatcher toolDispatcher,
+            AgentToolLoopService agentToolLoopService,
             SandboxFixtureService fixtureService,
             OracleAssessmentService oracleAssessmentService,
             RunExecutionLifecycleService lifecycleService
@@ -65,8 +62,7 @@ public class Fa03ExecutionOrchestrator {
         this.attackSeedCatalog = attackSeedCatalog;
         this.attackVariantFactory = attackVariantFactory;
         this.runPersistenceService = runPersistenceService;
-        this.runtimeService = runtimeService;
-        this.toolDispatcher = toolDispatcher;
+        this.agentToolLoopService = agentToolLoopService;
         this.fixtureService = fixtureService;
         this.oracleAssessmentService = oracleAssessmentService;
         this.lifecycleService = lifecycleService;
@@ -140,23 +136,12 @@ public class Fa03ExecutionOrchestrator {
                     target.sandboxCaseKey(),
                     target.currentApplicantId()
             );
-            AgentRuntimeService.RuntimeTurn turn = runtimeService.proposeTool(context, variant, normalizedActor);
-            ToolDispatcher.DispatchResult dispatch = toolDispatcher.dispatch(
-                    context, turn.aiResponse().proposal(), normalizedActor
+            AgentToolLoopService.LoopResult loop = agentToolLoopService.execute(
+                    context,
+                    variant,
+                    normalizedActor
             );
-
-            AgentRuntimeService.DeliveryReceipt delivery = AgentRuntimeService.DeliveryReceipt.notDelivered();
-            if (dispatch.toolInvoked()) {
-                delivery = runtimeService.deliverToolResult(
-                        context,
-                        variant,
-                        turn.aiResponse().proposal().toolName(),
-                        dispatch.execution().output(),
-                        dispatch.responseEvent().eventId(),
-                        dispatch.responseEvent().sequence(),
-                        normalizedActor
-                );
-            }
+            AgentToolLoopService.ToolStep oracleStep = loop.toolSteps().getFirst();
 
             runPersistenceService.updateCaseStatus(
                     runId,
@@ -171,7 +156,7 @@ public class Fa03ExecutionOrchestrator {
             if (!integrityValid) {
                 throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "Golden Fixture integrity validation failed");
             }
-            CustomerResponseEvidence evidence = materializeEvidence(context, dispatch, delivery, integrityValid);
+            CustomerResponseEvidence evidence = materializeEvidence(context, oracleStep, integrityValid);
             OracleResult oracleResult = new SensitiveFieldOracle(
                     fixtureService.sensitiveFieldPolicy(
                             runId,
@@ -180,9 +165,9 @@ public class Fa03ExecutionOrchestrator {
                     )
             ).evaluate(evidence);
 
-            ExecutionEventDto.Event sourceEvent = dispatch.toolInvoked()
-                    ? dispatch.responseEvent()
-                    : dispatch.policyEvent();
+            ExecutionEventDto.Event sourceEvent = oracleStep.dispatch().toolInvoked()
+                    ? oracleStep.dispatch().responseEvent()
+                    : oracleStep.dispatch().policyEvent();
             OracleAssessmentService.Assessment assessment = oracleAssessmentService.record(
                     runId,
                     caseRun.id(),
@@ -201,12 +186,12 @@ public class Fa03ExecutionOrchestrator {
             caseResult.put("reasonCode", oracleResult.reasonCode().name());
             caseResult.put("oracleResultId", assessment.oracleResult().id().toString());
             caseResult.put("variantHash", variant.variantHash());
-            caseResult.put("deliveredToAgent", delivery.deliveredToAgent());
-            if (delivery.status() != null) {
-                caseResult.put("deliveryStatus", delivery.status().name());
+            caseResult.put("deliveredToAgent", oracleStep.delivery().deliveredToAgent());
+            if (oracleStep.delivery().status() != null) {
+                caseResult.put("deliveryStatus", oracleStep.delivery().status().name());
             }
-            if (delivery.deliveryEventId() != null) {
-                caseResult.put("deliveryEventId", delivery.deliveryEventId().toString());
+            if (oracleStep.delivery().deliveryEventId() != null) {
+                caseResult.put("deliveryEventId", oracleStep.delivery().deliveryEventId().toString());
             }
             if (assessment.finding() != null) {
                 caseResult.put("findingId", assessment.finding().id().toString());
@@ -219,7 +204,7 @@ public class Fa03ExecutionOrchestrator {
                             terminalCaseStatus,
                             oracleResult.outcome().name(),
                             "NOT_EVALUATED",
-                            turn.aiResponse().latencyMs() + delivery.latencyMs(),
+                            loop.latencyMs(),
                             objectMapper.createObjectNode(),
                             errorCode,
                             caseResult
@@ -246,7 +231,7 @@ public class Fa03ExecutionOrchestrator {
                     assessment.oracleResult().id(),
                     assessment.finding() == null ? null : assessment.finding().id(),
                     variant.variantHash(),
-                    delivery.deliveredToAgent()
+                    oracleStep.delivery().deliveredToAgent()
             );
         } catch (BusinessException exception) {
             if (exception.errorCode() == ErrorCode.IDEMPOTENCY_IN_PROGRESS) {
@@ -395,10 +380,11 @@ public class Fa03ExecutionOrchestrator {
 
     private CustomerResponseEvidence materializeEvidence(
             SandboxExecutionContext context,
-            ToolDispatcher.DispatchResult dispatch,
-            AgentRuntimeService.DeliveryReceipt delivery,
+            AgentToolLoopService.ToolStep oracleStep,
             boolean integrityValid
     ) {
+        var dispatch = oracleStep.dispatch();
+        var delivery = oracleStep.delivery();
         if (!dispatch.toolInvoked()) {
             return new CustomerResponseEvidence(
                     context.currentApplicantId(),

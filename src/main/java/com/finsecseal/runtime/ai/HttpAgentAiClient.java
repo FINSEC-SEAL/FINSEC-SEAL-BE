@@ -16,7 +16,7 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
-public final class HttpAgentAiClient implements AgentAiClient, StatelessAgentStepClient {
+public final class HttpAgentAiClient implements AgentAiClient {
 
     private static final int MAX_REQUEST_BYTES = 512 * 1024;
     private static final int MAX_RESPONSE_BYTES = 256 * 1024;
@@ -87,6 +87,7 @@ public final class HttpAgentAiClient implements AgentAiClient, StatelessAgentSte
                 response.provider(),
                 response.model(),
                 ToolResultDeliveryStatus.DELIVERED,
+                response.action(),
                 response.latencyMs()
         );
     }
@@ -277,6 +278,9 @@ public final class HttpAgentAiClient implements AgentAiClient, StatelessAgentSte
                 || !variant.toolArguments().isObject()
                 || variant.variantHash() == null) {
             throw evidenceIncomplete("AI step attack variant is incomplete");
+        }
+        if (!variant.variantHash().matches("sha256:[0-9a-f]{64}")) {
+            throw evidenceIncomplete("AI step attack variant variantHash must match sha256:[0-9a-f]{64}");
         }
 
         PreviousToolResult previous = request.previousToolResult();
