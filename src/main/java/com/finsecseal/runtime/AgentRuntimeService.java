@@ -8,6 +8,9 @@ import com.finsecseal.evidence.ExecutionEventDto;
 import com.finsecseal.evidence.ExecutionEventService;
 import com.finsecseal.runtime.ai.AgentAiClient;
 import com.finsecseal.runtime.ai.AgentAiClient.ToolResultDeliveryStatus;
+import com.finsecseal.runtime.ai.StatelessAgentStepClient.AgentAction;
+import com.finsecseal.runtime.ai.StatelessAgentStepClient.FinalResponseAction;
+import com.finsecseal.runtime.ai.StatelessAgentStepClient.ToolProposalAction;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import java.util.UUID;
 import org.springframework.beans.factory.ObjectProvider;
@@ -132,6 +135,46 @@ public class AgentRuntimeService {
         );
     }
 
+    public ToolProposal recordFollowUpToolProposal(
+            SandboxExecutionContext context,
+            AttackVariant attackVariant,
+            ToolProposal proposal,
+            UUID sourceModelResponseEventId,
+            long sourceModelResponseSequence,
+            String actorId
+    ) {
+        if (sourceModelResponseEventId == null || sourceModelResponseSequence <= 0) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Follow-up Tool Proposal is missing its source MODEL_RESPONSE evidence"
+            );
+        }
+
+        ToolProposal validatedProposal = proposalValidator.validate(proposal);
+
+        eventService.append(
+                context.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        context.caseRunId(),
+                        context.traceId(),
+                        ExecutionEventType.TOOL_PROPOSED,
+                        validatedProposal.toolName(),
+                        validatedProposal.arguments(),
+                        null,
+                        null,
+                        "STRUCTURED_TOOL_PROPOSAL",
+                        objectMapper.createObjectNode()
+                                .put("turnType", "TOOL_RESULT_DELIVERY")
+                                .put("variantHash", attackVariant.variantHash())
+                                .put("sourceModelResponseEventId", sourceModelResponseEventId.toString())
+                                .put("sourceModelResponseSequence", sourceModelResponseSequence)
+                ),
+                actorId
+        );
+
+        return validatedProposal;
+    }
+
     public DeliveryReceipt deliverToolResult(
             SandboxExecutionContext context,
             AttackVariant attackVariant,
@@ -191,6 +234,12 @@ public class AgentRuntimeService {
                     "Agent Tool Response delivery failed"
             );
         }
+        if (response.status() == ToolResultDeliveryStatus.DELIVERED && response.nextAction() == null) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Delivered Agent Tool Response is missing the next Agent action"
+            );
+        }
 
         boolean delivered = response.status() == ToolResultDeliveryStatus.DELIVERED;
         ObjectNode output = objectMapper.createObjectNode();
@@ -201,6 +250,12 @@ public class AgentRuntimeService {
         output.put("latencyMs", response.latencyMs());
         output.put("sourceEventId", sourceEventId.toString());
         output.put("sourceSequence", sourceSequence);
+
+        if (response.nextAction() instanceof ToolProposalAction) {
+            output.put("nextActionType", "TOOL_PROPOSAL");
+        } else if (response.nextAction() instanceof FinalResponseAction) {
+            output.put("nextActionType", "FINAL_RESPONSE");
+        }
 
         String reasonCode = delivered
                 ? "AGENT_TOOL_RESULT_DELIVERED"
@@ -222,11 +277,13 @@ public class AgentRuntimeService {
                 ),
                 actorId
         );
+
         return new DeliveryReceipt(
                 delivered,
                 response.status(),
                 deliveryEvent.eventId(),
                 deliveryEvent.sequence(),
+                response.nextAction(),
                 response.latencyMs()
         );
     }
@@ -250,10 +307,29 @@ public class AgentRuntimeService {
             ToolResultDeliveryStatus status,
             UUID deliveryEventId,
             long deliveryEventSequence,
+            AgentAction nextAction,
             long latencyMs
     ) {
+        /** Source-compatible constructor for existing callers. */
+        public DeliveryReceipt(
+                boolean deliveredToAgent,
+                ToolResultDeliveryStatus status,
+                UUID deliveryEventId,
+                long deliveryEventSequence,
+                long latencyMs
+        ) {
+            this(
+                    deliveredToAgent,
+                    status,
+                    deliveryEventId,
+                    deliveryEventSequence,
+                    null,
+                    latencyMs
+            );
+        }
+
         public static DeliveryReceipt notDelivered() {
-            return new DeliveryReceipt(false, null, null, 0L, 0L);
+            return new DeliveryReceipt(false, null, null, 0L, null, 0L);
         }
     }
 }

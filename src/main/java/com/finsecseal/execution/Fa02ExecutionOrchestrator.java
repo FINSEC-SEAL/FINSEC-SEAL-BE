@@ -13,19 +13,12 @@ import com.finsecseal.evidence.ExecutionEventDto;
 import com.finsecseal.evidence.TestRunPersistenceDto;
 import com.finsecseal.evidence.TestRunPersistenceService;
 import com.finsecseal.oracle.application.OracleAssessmentService;
-import com.finsecseal.oracle.domain.CustomerDataRow;
-import com.finsecseal.oracle.domain.CustomerResponseEvidence;
 import com.finsecseal.oracle.domain.OracleOutcome;
 import com.finsecseal.oracle.domain.OracleResult;
-import com.finsecseal.oracle.evaluator.CrossCustomerOracle;
-import com.finsecseal.runtime.AgentRuntimeService;
+import com.finsecseal.runtime.AgentToolLoopService;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import com.finsecseal.sandbox.SandboxFixtureService;
-import com.finsecseal.sandbox.tool.ToolDispatcher;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -41,9 +34,9 @@ public class Fa02ExecutionOrchestrator {
     private final AttackSeedCatalog attackSeedCatalog;
     private final AttackVariantFactory attackVariantFactory;
     private final TestRunPersistenceService runPersistenceService;
-    private final AgentRuntimeService runtimeService;
-    private final ToolDispatcher toolDispatcher;
+    private final AgentToolLoopService agentToolLoopService;
     private final SandboxFixtureService fixtureService;
+    private final CustomerToolLoopOracleEvaluator customerToolLoopOracleEvaluator;
     private final OracleAssessmentService oracleAssessmentService;
     private final RunExecutionLifecycleService lifecycleService;
 
@@ -53,9 +46,9 @@ public class Fa02ExecutionOrchestrator {
             AttackSeedCatalog attackSeedCatalog,
             AttackVariantFactory attackVariantFactory,
             TestRunPersistenceService runPersistenceService,
-            AgentRuntimeService runtimeService,
-            ToolDispatcher toolDispatcher,
+            AgentToolLoopService agentToolLoopService,
             SandboxFixtureService fixtureService,
+            CustomerToolLoopOracleEvaluator customerToolLoopOracleEvaluator,
             OracleAssessmentService oracleAssessmentService,
             RunExecutionLifecycleService lifecycleService
     ) {
@@ -64,9 +57,9 @@ public class Fa02ExecutionOrchestrator {
         this.attackSeedCatalog = attackSeedCatalog;
         this.attackVariantFactory = attackVariantFactory;
         this.runPersistenceService = runPersistenceService;
-        this.runtimeService = runtimeService;
-        this.toolDispatcher = toolDispatcher;
+        this.agentToolLoopService = agentToolLoopService;
         this.fixtureService = fixtureService;
+        this.customerToolLoopOracleEvaluator = customerToolLoopOracleEvaluator;
         this.oracleAssessmentService = oracleAssessmentService;
         this.lifecycleService = lifecycleService;
     }
@@ -139,23 +132,11 @@ public class Fa02ExecutionOrchestrator {
                     target.sandboxCaseKey(),
                     target.currentApplicantId()
             );
-            AgentRuntimeService.RuntimeTurn turn = runtimeService.proposeTool(context, variant, normalizedActor);
-            ToolDispatcher.DispatchResult dispatch = toolDispatcher.dispatch(
-                    context, turn.aiResponse().proposal(), normalizedActor
+            AgentToolLoopService.LoopResult loop = agentToolLoopService.execute(
+                    context,
+                    variant,
+                    normalizedActor
             );
-
-            AgentRuntimeService.DeliveryReceipt delivery = AgentRuntimeService.DeliveryReceipt.notDelivered();
-            if (dispatch.toolInvoked()) {
-                delivery = runtimeService.deliverToolResult(
-                        context,
-                        variant,
-                        turn.aiResponse().proposal().toolName(),
-                        dispatch.execution().output(),
-                        dispatch.responseEvent().eventId(),
-                        dispatch.responseEvent().sequence(),
-                        normalizedActor
-                );
-            }
 
             runPersistenceService.updateCaseStatus(
                     runId,
@@ -170,12 +151,15 @@ public class Fa02ExecutionOrchestrator {
             if (!integrityValid) {
                 throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "Golden Fixture integrity validation failed");
             }
-            CustomerResponseEvidence evidence = materializeEvidence(context, dispatch, delivery, integrityValid);
-            OracleResult oracleResult = new CrossCustomerOracle().evaluate(evidence);
-
-            ExecutionEventDto.Event sourceEvent = dispatch.toolInvoked()
-                    ? dispatch.responseEvent()
-                    : dispatch.policyEvent();
+            CustomerToolLoopOracleEvaluator.Evaluation oracleEvaluation =
+                    customerToolLoopOracleEvaluator.evaluateCrossCustomer(
+                            context,
+                            loop.toolSteps(),
+                            integrityValid
+                    );
+            AgentToolLoopService.ToolStep oracleStep = oracleEvaluation.sourceStep();
+            OracleResult oracleResult = oracleEvaluation.oracleResult();
+            ExecutionEventDto.Event sourceEvent = oracleEvaluation.sourceEvent();
             OracleAssessmentService.Assessment assessment = oracleAssessmentService.record(
                     runId,
                     caseRun.id(),
@@ -194,12 +178,12 @@ public class Fa02ExecutionOrchestrator {
             caseResult.put("reasonCode", oracleResult.reasonCode().name());
             caseResult.put("oracleResultId", assessment.oracleResult().id().toString());
             caseResult.put("variantHash", variant.variantHash());
-            caseResult.put("deliveredToAgent", delivery.deliveredToAgent());
-            if (delivery.status() != null) {
-                caseResult.put("deliveryStatus", delivery.status().name());
+            caseResult.put("deliveredToAgent", oracleStep.delivery().deliveredToAgent());
+            if (oracleStep.delivery().status() != null) {
+                caseResult.put("deliveryStatus", oracleStep.delivery().status().name());
             }
-            if (delivery.deliveryEventId() != null) {
-                caseResult.put("deliveryEventId", delivery.deliveryEventId().toString());
+            if (oracleStep.delivery().deliveryEventId() != null) {
+                caseResult.put("deliveryEventId", oracleStep.delivery().deliveryEventId().toString());
             }
             if (assessment.finding() != null) {
                 caseResult.put("findingId", assessment.finding().id().toString());
@@ -212,7 +196,7 @@ public class Fa02ExecutionOrchestrator {
                             terminalCaseStatus,
                             oracleResult.outcome().name(),
                             "NOT_EVALUATED",
-                            turn.aiResponse().latencyMs() + delivery.latencyMs(),
+                            loop.latencyMs(),
                             objectMapper.createObjectNode(),
                             errorCode,
                             caseResult
@@ -239,7 +223,7 @@ public class Fa02ExecutionOrchestrator {
                     assessment.oracleResult().id(),
                     assessment.finding() == null ? null : assessment.finding().id(),
                     variant.variantHash(),
-                    delivery.deliveredToAgent()
+                    oracleStep.delivery().deliveredToAgent()
             );
         } catch (BusinessException exception) {
             if (exception.errorCode() == ErrorCode.IDEMPOTENCY_IN_PROGRESS) {
@@ -384,60 +368,6 @@ public class Fa02ExecutionOrchestrator {
                     "Executed attack variant hash does not match TestCase payload_hash"
             );
         }
-    }
-
-    private CustomerResponseEvidence materializeEvidence(
-            SandboxExecutionContext context,
-            ToolDispatcher.DispatchResult dispatch,
-            AgentRuntimeService.DeliveryReceipt delivery,
-            boolean integrityValid
-    ) {
-        if (!dispatch.toolInvoked()) {
-            return new CustomerResponseEvidence(
-                    context.currentApplicantId(),
-                    false,
-                    false,
-                    !dispatch.policyDecision().allowed(),
-                    integrityValid,
-                    null,
-                    List.of()
-            );
-        }
-
-        List<CustomerDataRow> rows = new ArrayList<>();
-        JsonNode responseRows = dispatch.execution().output().path("rows");
-        if (!responseRows.isArray()) {
-            throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "CUSTOMER_DATA_READ response rows are missing");
-        }
-        responseRows.forEach(row -> {
-            String customerId = row.path("customerId").asString(null);
-            if (customerId == null) {
-                throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "CUSTOMER_DATA_READ row customerId is missing");
-            }
-            Map<String, Object> fields = new LinkedHashMap<>();
-            JsonNode fieldNode = row.path("fields");
-            if (fieldNode.isObject()) {
-                fieldNode.properties().forEach(entry -> fields.put(entry.getKey(), scalar(entry.getValue())));
-            }
-            rows.add(new CustomerDataRow(customerId, fields));
-        });
-        return new CustomerResponseEvidence(
-                context.currentApplicantId(),
-                true,
-                delivery.deliveredToAgent(),
-                false,
-                integrityValid,
-                dispatch.responseEvent().sequence(),
-                rows
-        );
-    }
-
-    private Object scalar(JsonNode value) {
-        if (value == null || value.isNull()) return null;
-        if (value.isBoolean()) return value.asBoolean();
-        if (value.isIntegralNumber()) return value.asLong();
-        if (value.isFloatingPointNumber()) return value.asDouble();
-        return value.asString();
     }
 
     private TestCaseRunStatus caseStatus(OracleOutcome outcome) {

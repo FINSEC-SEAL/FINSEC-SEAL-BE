@@ -12,28 +12,63 @@ public final class DeterministicFakeAgentAiClient implements AgentAiClient {
                 request.attackVariant().targetTool(),
                 request.attackVariant().toolArguments().deepCopy()
         );
-        long latencyMs = Math.max(0L, (System.nanoTime() - started) / 1_000_000L);
         return new AgentTurnResponse(
                 "fake",
                 "deterministic-baseline",
                 "tool_call",
                 proposal,
-                latencyMs
+                elapsedMs(started)
         );
     }
 
     @Override
     public ToolResultDeliveryResponse deliverToolResult(ToolResultDeliveryRequest request) {
         long started = System.nanoTime();
-        ToolResultDeliveryStatus status = request.toolOutput() != null && !request.toolOutput().isNull()
+        boolean delivered = request.toolOutput() != null && !request.toolOutput().isNull();
+        ToolResultDeliveryStatus status = delivered
                 ? ToolResultDeliveryStatus.DELIVERED
                 : ToolResultDeliveryStatus.FAILED;
-        long latencyMs = Math.max(0L, (System.nanoTime() - started) / 1_000_000L);
+        AgentAction nextAction = delivered
+                ? new FinalResponseAction("Tool result received; agent step completed.")
+                : null;
+
         return new ToolResultDeliveryResponse(
                 "fake",
                 "deterministic-baseline",
                 status,
-                latencyMs
+                nextAction,
+                elapsedMs(started)
         );
+    }
+
+    @Override
+    public AgentStepResponse executeStep(AgentStepRequest request) {
+        long started = System.nanoTime();
+
+        if (request.previousToolResult() == null) {
+            ToolProposal proposal = new ToolProposal(
+                    request.attackVariant().targetTool(),
+                    request.attackVariant().toolArguments().deepCopy()
+            );
+            return new AgentStepResponse(
+                    "fake",
+                    "deterministic-baseline",
+                    "tool_call",
+                    new ToolProposalAction(proposal),
+                    elapsedMs(started)
+            );
+        }
+
+        return new AgentStepResponse(
+                "fake",
+                "deterministic-baseline",
+                "stop",
+                new FinalResponseAction("Tool result received; agent step completed."),
+                elapsedMs(started)
+        );
+    }
+
+    private long elapsedMs(long started) {
+        return Math.max(0L, (System.nanoTime() - started) / 1_000_000L);
     }
 }
