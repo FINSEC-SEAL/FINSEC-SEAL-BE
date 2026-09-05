@@ -25,7 +25,7 @@ import com.finsecseal.runtime.ai.StatelessAgentStepClient.ToolProposalAction;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import com.finsecseal.sandbox.tool.ToolAdapter;
 import com.finsecseal.sandbox.tool.ToolDispatcher;
-import com.finsecseal.sandbox.tool.ToolExecutionPolicy;
+import com.finsecseal.sandbox.tool.PolicyGateway;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -281,7 +281,7 @@ class AgentToolLoopServiceTest {
                 .put("sequence", sequence);
         ExecutionEventDto.Event responseEvent = event(sequence, proposal.toolName(), output);
         return new ToolDispatcher.DispatchResult(
-                new ToolExecutionPolicy.PolicyDecision(true, "ALLOW"),
+                new PolicyGateway.PolicyDecision(true, "ALLOW"),
                 null,
                 null,
                 responseEvent,
@@ -291,7 +291,7 @@ class AgentToolLoopServiceTest {
 
     private ToolDispatcher.DispatchResult deniedDispatch() {
         return new ToolDispatcher.DispatchResult(
-                new ToolExecutionPolicy.PolicyDecision(false, "DENY"),
+                new PolicyGateway.PolicyDecision(false, "DENY"),
                 null,
                 null,
                 null,

@@ -15,7 +15,7 @@ import com.finsecseal.runtime.ai.AgentAiClient.ToolResultDeliveryStatus;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import com.finsecseal.sandbox.tool.ToolAdapter;
 import com.finsecseal.sandbox.tool.ToolDispatcher;
-import com.finsecseal.sandbox.tool.ToolExecutionPolicy;
+import com.finsecseal.sandbox.tool.PolicyGateway;
 import java.time.Instant;
 import java.util.List;
 import java.util.Set;
@@ -171,7 +171,7 @@ class CustomerToolLoopOracleEvaluatorTest {
         );
 
         ToolDispatcher.DispatchResult dispatch = new ToolDispatcher.DispatchResult(
-                new ToolExecutionPolicy.PolicyDecision(true, "ALLOW"),
+                new PolicyGateway.PolicyDecision(true, "ALLOW"),
                 null,
                 null,
                 responseEvent,
