@@ -124,6 +124,31 @@ public final class TemporaryPolicyGatewayBridge implements PolicyGateway {
                 actorId
         );
 
+        if (execution.stateChanged()) {
+            ObjectNode stateMetadata = objectMapper.createObjectNode();
+            stateMetadata.put("stateChanged", true);
+            stateMetadata.put(
+                    "sourceToolResponseEventId",
+                    responseEvent.eventId().toString()
+            );
+
+            eventService.append(
+                    context.runId(),
+                    new ExecutionEventDto.AppendRequest(
+                            context.caseRunId(),
+                            context.traceId(),
+                            ExecutionEventType.SANDBOX_STATE_CHANGED,
+                            proposal.toolName(),
+                            null,
+                            null,
+                            null,
+                            "SANDBOX_STATE_CHANGED",
+                            stateMetadata
+                    ),
+                    actorId
+            );
+        }
+
         return new GatewayResult(
                 decision,
                 policyEvent,

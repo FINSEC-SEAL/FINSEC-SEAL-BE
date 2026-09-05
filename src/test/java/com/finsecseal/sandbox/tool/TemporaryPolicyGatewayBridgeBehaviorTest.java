@@ -111,6 +111,87 @@ class TemporaryPolicyGatewayBridgeBehaviorTest {
     }
 
     @Test
+    void stateChangingAllowAppendsSandboxStateChangedAfterToolResponse() {
+        ToolAdapter.ToolExecutionResult execution =
+                new ToolAdapter.ToolExecutionResult(
+                        objectMapper.createObjectNode().put("accepted", true),
+                        true
+                );
+
+        when(adapter.execute(baselineContext, proposal.arguments()))
+                .thenReturn(execution);
+
+        ExecutionEventDto.Event policyEvent =
+                event(baselineContext, 20L, ExecutionEventType.POLICY_EVALUATED);
+        ExecutionEventDto.Event requestEvent =
+                event(baselineContext, 21L, ExecutionEventType.TOOL_REQUEST);
+        ExecutionEventDto.Event responseEvent =
+                event(baselineContext, 22L, ExecutionEventType.TOOL_RESPONSE);
+        ExecutionEventDto.Event stateEvent =
+                event(baselineContext, 23L, ExecutionEventType.SANDBOX_STATE_CHANGED);
+
+        when(eventService.append(
+                eq(baselineContext.runId()),
+                any(ExecutionEventDto.AppendRequest.class),
+                eq(ACTOR)
+        )).thenReturn(
+                policyEvent,
+                requestEvent,
+                responseEvent,
+                stateEvent
+        );
+
+        TemporaryPolicyGatewayBridge bridge = new TemporaryPolicyGatewayBridge(
+                List.of(adapter),
+                List.of(new BaselineToolExecutionPolicy()),
+                eventService,
+                objectMapper
+        );
+
+        PolicyGateway.GatewayResult result =
+                bridge.invoke(baselineContext, proposal, ACTOR);
+
+        assertThat(result.responseEvent()).isSameAs(responseEvent);
+        assertThat(result.execution()).isSameAs(execution);
+
+        ArgumentCaptor<ExecutionEventDto.AppendRequest> requestCaptor =
+                ArgumentCaptor.forClass(ExecutionEventDto.AppendRequest.class);
+
+        verify(eventService, times(4)).append(
+                eq(baselineContext.runId()),
+                requestCaptor.capture(),
+                eq(ACTOR)
+        );
+
+        List<ExecutionEventDto.AppendRequest> requests =
+                requestCaptor.getAllValues();
+
+        assertThat(requests)
+                .extracting(ExecutionEventDto.AppendRequest::eventType)
+                .containsExactly(
+                        ExecutionEventType.POLICY_EVALUATED,
+                        ExecutionEventType.TOOL_REQUEST,
+                        ExecutionEventType.TOOL_RESPONSE,
+                        ExecutionEventType.SANDBOX_STATE_CHANGED
+                );
+
+        ExecutionEventDto.AppendRequest stateChange = requests.getLast();
+        assertThat(stateChange.testCaseRunId())
+                .isEqualTo(baselineContext.caseRunId());
+        assertThat(stateChange.toolName())
+                .isEqualTo(proposal.toolName());
+        assertThat(stateChange.reasonCode())
+                .isEqualTo("SANDBOX_STATE_CHANGED");
+        assertThat(stateChange.metadata().path("stateChanged").asBoolean())
+                .isTrue();
+        assertThat(
+                stateChange.metadata()
+                        .path("sourceToolResponseEventId")
+                        .asString()
+        ).isEqualTo(responseEvent.eventId().toString());
+    }
+
+    @Test
     void unsupportedEnforcementModeFailsClosedBeforeAnyEvidenceOrAdapterInvocation() {
         SandboxExecutionContext sealReplay = context(TestRunMode.SEAL_REPLAY);
 
