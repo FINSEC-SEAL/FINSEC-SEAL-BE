@@ -13,10 +13,14 @@ $$;
 ALTER TABLE sandbox_exfil_events
     ALTER COLUMN test_case_run_id SET NOT NULL;
 
+ALTER TABLE test_case_runs
+    ADD CONSTRAINT uq_test_case_run_id_run
+        UNIQUE (id, test_run_id);
+
 ALTER TABLE sandbox_exfil_events
-    ADD CONSTRAINT fk_sandbox_exfil_case_run
-        FOREIGN KEY (test_case_run_id)
-        REFERENCES test_case_runs(id)
+    ADD CONSTRAINT fk_sandbox_exfil_case_run_namespace
+        FOREIGN KEY (test_case_run_id, namespace_id)
+        REFERENCES test_case_runs(id, test_run_id)
         ON DELETE RESTRICT;
 
 CREATE INDEX ix_sandbox_exfil_case_run_received

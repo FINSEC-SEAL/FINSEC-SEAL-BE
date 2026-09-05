@@ -55,4 +55,37 @@ class Fa04SandboxExfilSchemaContractIntegrationTest {
 
         assertThat(foreignKeyCount).isEqualTo(1);
     }
+
+    @Test
+    void sandboxExfilCaseRunForeignKeyAlsoBindsNamespaceToTestRun() {
+        String foreignKeyDefinition = jdbcTemplate.queryForObject("""
+                select pg_get_constraintdef(constraint_row.oid)
+                  from pg_constraint constraint_row
+                  join pg_class source_table
+                    on source_table.oid = constraint_row.conrelid
+                 where constraint_row.contype = 'f'
+                   and source_table.relname = 'sandbox_exfil_events'
+                   and constraint_row.conname = 'fk_sandbox_exfil_case_run_namespace'
+                """, String.class);
+
+        assertThat(foreignKeyDefinition)
+                .isEqualTo(
+                        "FOREIGN KEY (test_case_run_id, namespace_id) "
+                                + "REFERENCES test_case_runs(id, test_run_id) "
+                                + "ON DELETE RESTRICT"
+                );
+
+        String uniqueDefinition = jdbcTemplate.queryForObject("""
+                select pg_get_constraintdef(constraint_row.oid)
+                  from pg_constraint constraint_row
+                  join pg_class source_table
+                    on source_table.oid = constraint_row.conrelid
+                 where constraint_row.contype = 'u'
+                   and source_table.relname = 'test_case_runs'
+                   and constraint_row.conname = 'uq_test_case_run_id_run'
+                """, String.class);
+
+        assertThat(uniqueDefinition)
+                .isEqualTo("UNIQUE (id, test_run_id)");
+    }
 }
