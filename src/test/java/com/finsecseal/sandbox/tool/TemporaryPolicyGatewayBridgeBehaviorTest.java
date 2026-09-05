@@ -125,7 +125,7 @@ class TemporaryPolicyGatewayBridgeBehaviorTest {
                 .isInstanceOfSatisfying(BusinessException.class, exception -> {
                     assertThat(exception.errorCode()).isEqualTo(ErrorCode.CONFIGURATION_ERROR);
                     assertThat(exception.getMessage())
-                            .contains("Exactly one ToolExecutionPolicy must support mode SEAL_REPLAY");
+                            .contains("Temporary Policy Gateway only supports BASELINE");
                 });
 
         verify(adapter, never()).execute(any(), any());

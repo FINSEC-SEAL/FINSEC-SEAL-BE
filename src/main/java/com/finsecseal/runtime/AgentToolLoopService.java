@@ -62,7 +62,14 @@ public class AgentToolLoopService {
                     actorId
             );
 
-            if (!dispatch.toolInvoked()) {
+            if (dispatch.policyDecision() == null) {
+                throw new BusinessException(
+                        ErrorCode.EVIDENCE_INCOMPLETE,
+                        "Tool dispatch is missing a Policy Gateway decision"
+                );
+            }
+
+            if (!dispatch.policyDecision().allowed()) {
                 steps.add(new ToolStep(
                         currentProposal,
                         dispatch,
@@ -73,6 +80,15 @@ public class AgentToolLoopService {
                         null,
                         TerminationReason.POLICY_DENIED,
                         totalLatencyMs
+                );
+            }
+
+            if (!dispatch.toolInvoked()
+                    || dispatch.execution() == null
+                    || dispatch.responseEvent() == null) {
+                throw new BusinessException(
+                        ErrorCode.EVIDENCE_INCOMPLETE,
+                        "Allowed Tool dispatch is missing execution evidence"
                 );
             }
 

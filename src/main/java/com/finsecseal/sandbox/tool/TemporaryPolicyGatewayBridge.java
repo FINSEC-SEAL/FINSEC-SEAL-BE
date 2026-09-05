@@ -3,6 +3,7 @@ package com.finsecseal.sandbox.tool;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.ExecutionEventType;
+import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.evidence.ExecutionEventDto;
 import com.finsecseal.evidence.ExecutionEventService;
 import com.finsecseal.runtime.ToolProposal;
@@ -40,6 +41,8 @@ public final class TemporaryPolicyGatewayBridge implements PolicyGateway {
             ToolProposal proposal,
             String actorId
     ) {
+        requireBaselineMode(context);
+
         ToolAdapter adapter = requireAdapter(proposal.toolName());
         ToolExecutionPolicy policy = requirePolicy(context);
         ToolExecutionPolicy.PolicyDecision legacyDecision =
@@ -128,6 +131,15 @@ public final class TemporaryPolicyGatewayBridge implements PolicyGateway {
                 responseEvent,
                 execution
         );
+    }
+
+    private void requireBaselineMode(SandboxExecutionContext context) {
+        if (context.mode() != TestRunMode.BASELINE) {
+            throw new BusinessException(
+                    ErrorCode.CONFIGURATION_ERROR,
+                    "Temporary Policy Gateway only supports BASELINE"
+            );
+        }
     }
 
     private ToolAdapter requireAdapter(String toolName) {

@@ -1,5 +1,7 @@
 package com.finsecseal.sandbox.tool;
 
+import com.finsecseal.common.api.BusinessException;
+import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.evidence.ExecutionEventDto;
 import com.finsecseal.runtime.ToolProposal;
 import com.finsecseal.runtime.ToolProposalValidator;
@@ -45,6 +47,33 @@ public class ToolDispatcher {
             ExecutionEventDto.Event responseEvent,
             ToolAdapter.ToolExecutionResult execution
     ) {
+        public DispatchResult {
+            if (policyDecision == null) {
+                throw new BusinessException(
+                        ErrorCode.EVIDENCE_INCOMPLETE,
+                        "Tool dispatch requires a Policy Gateway decision"
+                );
+            }
+
+            if (!policyDecision.allowed()
+                    && (requestEvent != null
+                    || responseEvent != null
+                    || execution != null)) {
+                throw new BusinessException(
+                        ErrorCode.EVIDENCE_INCOMPLETE,
+                        "Denied Tool dispatch must not contain Tool execution evidence"
+                );
+            }
+
+            if (policyDecision.allowed()
+                    && (responseEvent == null || execution == null)) {
+                throw new BusinessException(
+                        ErrorCode.EVIDENCE_INCOMPLETE,
+                        "Allowed Tool dispatch requires Tool response evidence"
+                );
+            }
+        }
+
         public boolean toolInvoked() {
             return responseEvent != null;
         }
