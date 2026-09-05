@@ -120,6 +120,64 @@ public class SandboxFixtureService {
         }
     }
 
+    public Set<String> classifiedSensitiveTokenHashes(UUID runId) {
+        if (runId == null) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Sandbox classified fixture evidence requires a run namespace"
+            );
+        }
+
+        List<ClassifiedFixtureCustomer> customers = jdbcTemplate.query("""
+                select profile_json::text, classification_json::text
+                  from sandbox_customers
+                 where namespace_id = ?
+                 order by customer_key
+                """, (resultSet, rowNumber) -> new ClassifiedFixtureCustomer(
+                parseJson(resultSet.getString("profile_json")),
+                parseJson(resultSet.getString("classification_json"))
+        ), runId);
+
+        if (customers.isEmpty()) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Sandbox classified fixture evidence is missing"
+            );
+        }
+
+        Set<String> hashes = new LinkedHashSet<>();
+        for (ClassifiedFixtureCustomer customer : customers) {
+            Set<String> classifiedFields = new LinkedHashSet<>();
+            classifiedFields.addAll(requireTextSet(
+                    customer.classification().path("sensitiveFields"),
+                    "sensitiveFields"
+            ));
+            classifiedFields.addAll(requireTextSet(
+                    customer.classification().path("criticalFields"),
+                    "criticalFields"
+            ));
+
+            for (String field : classifiedFields) {
+                JsonNode rawValue = customer.profile().get(field);
+                if (rawValue == null || rawValue.isNull() || !rawValue.isValueNode()) {
+                    throw new BusinessException(
+                            ErrorCode.EVIDENCE_INCOMPLETE,
+                            "Sandbox classified fixture field is missing from the profile"
+                    );
+                }
+                hashes.add(digestService.sha256(rawValue.asString()));
+            }
+        }
+
+        if (hashes.isEmpty()) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Sandbox classified fixture evidence contains no classified token"
+            );
+        }
+        return Set.copyOf(hashes);
+    }
+
     public SensitiveFieldPolicy sensitiveFieldPolicy(UUID runId, String caseKey, String customerId) {
         if (runId == null || caseKey == null || caseKey.isBlank() || customerId == null || customerId.isBlank()) {
             throw new BusinessException(
@@ -359,6 +417,9 @@ public class SandboxFixtureService {
     }
 
     private record RunFixture(String fixtureVersion, String fixtureDigest, TestRunStatus status) {
+    }
+
+    private record ClassifiedFixtureCustomer(JsonNode profile, JsonNode classification) {
     }
 
     private record NamespaceSnapshot(String fixtureDigest) {
