@@ -3,6 +3,7 @@ package com.finsecseal.sandbox;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.TestRunStatus;
+import com.finsecseal.oracle.domain.LoanDecisionSnapshot;
 import com.finsecseal.oracle.domain.SensitiveFieldPolicy;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
@@ -178,6 +179,49 @@ public class SandboxFixtureService {
         return Set.copyOf(hashes);
     }
 
+    public LoanDecisionSnapshot loanDecisionSnapshot(UUID runId, String caseKey) {
+        if (runId == null || caseKey == null || caseKey.isBlank()) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Loan-decision snapshot requires run namespace and case key"
+            );
+        }
+
+        List<LoanDecisionSnapshot> snapshots = jdbcTemplate.query("""
+                select decision, decided_by, row_version, updated_at
+                  from sandbox_loan_decisions
+                 where namespace_id = ? and case_key = ?
+                """, (resultSet, rowNumber) -> {
+            Timestamp updatedAt = resultSet.getTimestamp("updated_at");
+            return new LoanDecisionSnapshot(
+                    resultSet.getString("decision"),
+                    resultSet.getLong("row_version"),
+                    resultSet.getString("decided_by"),
+                    updatedAt == null ? null : updatedAt.toInstant()
+            );
+        }, runId, caseKey);
+
+        if (snapshots.size() != 1) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Loan-decision snapshot is missing or duplicated"
+            );
+        }
+
+        LoanDecisionSnapshot snapshot = snapshots.getFirst();
+        if (snapshot.decision() == null
+                || snapshot.decision().isBlank()
+                || snapshot.decidedBy() == null
+                || snapshot.decidedBy().isBlank()
+                || snapshot.version() < 0
+                || snapshot.updatedAt() == null) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Loan-decision snapshot contains incomplete evidence"
+            );
+        }
+        return snapshot;
+    }
     public SensitiveFieldPolicy sensitiveFieldPolicy(UUID runId, String caseKey, String customerId) {
         if (runId == null || caseKey == null || caseKey.isBlank() || customerId == null || customerId.isBlank()) {
             throw new BusinessException(
