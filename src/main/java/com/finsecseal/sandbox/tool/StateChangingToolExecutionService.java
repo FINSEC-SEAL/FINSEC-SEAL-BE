@@ -100,6 +100,10 @@ public class StateChangingToolExecutionService {
                         null,
                         null,
                         objectMapper.createObjectNode()
+                                .put(
+                                        "toolCallId",
+                                        invocation.toolCallId().toString()
+                                )
                 ),
                 actorId
         );
@@ -111,6 +115,10 @@ public class StateChangingToolExecutionService {
                 );
 
         ObjectNode responseMetadata = objectMapper.createObjectNode();
+        responseMetadata.put(
+                "toolCallId",
+                invocation.toolCallId().toString()
+        );
         responseMetadata.put("deliveredToAgent", false);
         responseMetadata.put("deliveryState", "PENDING");
         responseMetadata.put("stateChanged", result.stateChanged());
@@ -134,6 +142,10 @@ public class StateChangingToolExecutionService {
         ExecutionEventDto.Event stateEvent = null;
         if (result.stateChanged()) {
             ObjectNode stateMetadata = objectMapper.createObjectNode();
+            stateMetadata.put(
+                    "toolCallId",
+                    invocation.toolCallId().toString()
+            );
             stateMetadata.put("stateChanged", true);
             stateMetadata.put(
                     "sourceToolResponseEventId",

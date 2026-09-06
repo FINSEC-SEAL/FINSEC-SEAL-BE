@@ -576,6 +576,119 @@ class StateChangingToolIdempotencyIntegrationTest {
         return false;
     }
 
+    @Test
+    void stateChangingEvidenceCarriesCanonicalToolCallId() {
+        Seed seed = seedRunWithSandbox();
+        UUID traceId = UUID.randomUUID();
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(),
+                seed.caseRunId(),
+                traceId,
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        null,
+                        traceId,
+                        ExecutionEventType.RUN_STARTED,
+                        null,
+                        null,
+                        null,
+                        null,
+                        "RUN_STARTED",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ObjectNode arguments = objectMapper.createObjectNode();
+        arguments.put("caseId", "CASE-1001");
+        arguments.put("decision", "APPROVED");
+
+        ToolProposal proposal = new ToolProposal(
+                LoanDecisionUpdateMockToolAdapter.TOOL_NAME,
+                arguments
+        );
+
+        ExecutionEventDto.Event proposalEvent = eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        seed.caseRunId(),
+                        traceId,
+                        ExecutionEventType.TOOL_PROPOSED,
+                        proposal.toolName(),
+                        proposal.arguments(),
+                        null,
+                        null,
+                        "STRUCTURED_TOOL_PROPOSAL",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ToolInvocation invocation = new ToolInvocation(
+                proposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
+
+        StateChangingToolExecutionService.Execution execution =
+                transactionalExecutor.execute(
+                        context,
+                        invocation,
+                        adapter,
+                        ACTOR
+                );
+
+        assertToolCallIdMetadata(
+                execution.requestEvent(),
+                invocation.toolCallId()
+        );
+        assertToolCallIdMetadata(
+                execution.responseEvent(),
+                invocation.toolCallId()
+        );
+        assertToolCallIdMetadata(
+                execution.stateEvent(),
+                invocation.toolCallId()
+        );
+
+        assertThat(
+                execution.stateEvent()
+                        .metadata()
+                        .path("sourceToolResponseEventId")
+                        .asText()
+        ).isEqualTo(
+                execution.responseEvent()
+                        .eventId()
+                        .toString()
+        );
+    }
+
+    private void assertToolCallIdMetadata(
+            ExecutionEventDto.Event event,
+            UUID expectedToolCallId
+    ) {
+        assertThat(event).isNotNull();
+        assertThat(event.metadata()).isNotNull();
+
+        assertThat(
+                event.metadata()
+                        .path("toolCallId")
+                        .asText()
+        )
+                .as(
+                        event.eventType()
+                                + " must carry canonical metadata.toolCallId"
+                )
+                .isEqualTo(expectedToolCallId.toString());
+    }
+
     private StateChangingToolExecutionService executor() {
         try {
             Constructor<?> noArg = Arrays.stream(
