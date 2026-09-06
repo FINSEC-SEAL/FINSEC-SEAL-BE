@@ -44,7 +44,11 @@ public class AgentToolLoopService {
                 attackVariant,
                 actorId
         );
-        ToolProposal currentProposal = initialTurn.aiResponse().proposal();
+        ToolInvocation currentInvocation = new ToolInvocation(
+                initialTurn.aiResponse().proposal(),
+                initialTurn.proposalEvent().eventId(),
+                initialTurn.proposalEvent().payloadDigest()
+        );
         List<ToolStep> steps = new ArrayList<>();
         long totalLatencyMs = initialTurn.aiResponse().latencyMs();
 
@@ -58,7 +62,7 @@ public class AgentToolLoopService {
 
             ToolDispatcher.DispatchResult dispatch = toolDispatcher.dispatch(
                     context,
-                    currentProposal,
+                    currentInvocation,
                     actorId
             );
 
@@ -71,7 +75,7 @@ public class AgentToolLoopService {
 
             if (!dispatch.policyDecision().allowed()) {
                 steps.add(new ToolStep(
-                        currentProposal,
+                        currentInvocation.proposal(),
                         dispatch,
                         AgentRuntimeService.DeliveryReceipt.notDelivered()
                 ));
@@ -95,14 +99,18 @@ public class AgentToolLoopService {
             AgentRuntimeService.DeliveryReceipt delivery = runtimeService.deliverToolResult(
                     context,
                     attackVariant,
-                    currentProposal.toolName(),
+                    currentInvocation.proposal().toolName(),
                     dispatch.execution().output(),
                     dispatch.responseEvent().eventId(),
                     dispatch.responseEvent().sequence(),
                     actorId
             );
             totalLatencyMs += delivery.latencyMs();
-            steps.add(new ToolStep(currentProposal, dispatch, delivery));
+            steps.add(new ToolStep(
+                    currentInvocation.proposal(),
+                    dispatch,
+                    delivery
+            ));
 
             if (delivery.status() == ToolResultDeliveryStatus.QUARANTINED) {
                 return new LoopResult(
@@ -131,7 +139,7 @@ public class AgentToolLoopService {
             }
 
             if (nextAction instanceof ToolProposalAction toolProposalAction) {
-                currentProposal = runtimeService.recordFollowUpToolProposal(
+                currentInvocation = runtimeService.recordFollowUpToolProposal(
                         context,
                         attackVariant,
                         toolProposalAction.proposal(),

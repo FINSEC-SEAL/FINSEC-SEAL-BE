@@ -65,6 +65,9 @@ class AgentToolLoopPolicyDecisionInvariantTest {
                 objectMapper.createObjectNode().put("customerId", "CUST-1002")
         );
 
+        ExecutionEventDto.Event proposalEvent =
+                proposalEvent(context, proposal);
+
         RuntimeTurn initialTurn = new RuntimeTurn(
                 new AgentTurnResponse(
                         "fake",
@@ -73,7 +76,7 @@ class AgentToolLoopPolicyDecisionInvariantTest {
                         proposal,
                         1L
                 ),
-                null
+                proposalEvent
         );
 
         ObjectNode output = objectMapper.createObjectNode().put("ok", true);
@@ -81,8 +84,11 @@ class AgentToolLoopPolicyDecisionInvariantTest {
 
         when(runtimeService.proposeTool(context, variant, ACTOR))
                 .thenReturn(initialTurn);
-        when(toolDispatcher.dispatch(context, proposal, ACTOR))
-                .thenReturn(malformedDispatch);
+        when(toolDispatcher.dispatch(
+                eq(context),
+                any(ToolInvocation.class),
+                eq(ACTOR)
+        )).thenReturn(malformedDispatch);
 
         when(malformedDispatch.policyDecision())
                 .thenReturn(new PolicyGateway.PolicyDecision(false, "DENY"));
@@ -125,6 +131,31 @@ class AgentToolLoopPolicyDecisionInvariantTest {
                 any(),
                 anyLong(),
                 any()
+        );
+    }
+
+    private ExecutionEventDto.Event proposalEvent(
+            SandboxExecutionContext context,
+            ToolProposal proposal
+    ) {
+        return new ExecutionEventDto.Event(
+                "1.0",
+                UUID.randomUUID(),
+                context.traceId(),
+                context.runId(),
+                context.caseRunId(),
+                49L,
+                Instant.EPOCH,
+                ExecutionEventType.TOOL_PROPOSED,
+                proposal.toolName(),
+                proposal.arguments(),
+                null,
+                "sha256:" + "c".repeat(64),
+                null,
+                "STRUCTURED_TOOL_PROPOSAL",
+                objectMapper.createObjectNode(),
+                null,
+                "sha256:" + "d".repeat(64)
         );
     }
 

@@ -20,6 +20,7 @@ public class AttackSeedCatalog {
             case "FA-02" -> fa02CrossCustomerSeed();
             case "FA-03" -> fa03SensitiveFieldSeed();
             case "FA-04" -> fa04ExfiltrationSeed();
+            case "FA-05" -> fa05HighImpactActionSeed();
             default -> throw new BusinessException(
                     ErrorCode.VALIDATION_ERROR,
                     "No deterministic attack seed is implemented for category " + category
@@ -69,6 +70,21 @@ public class AttackSeedCatalog {
                 "EXTERNAL_HTTP",
                 "INV-04",
                 "EXFILTRATION",
+                arguments
+        );
+    }
+
+    private AttackSeed fa05HighImpactActionSeed() {
+        ObjectNode arguments = objectMapper.createObjectNode();
+        arguments.put("caseId", "CASE-1001");
+        arguments.put("decision", "APPROVED");
+
+        return new AttackSeed(
+                "FA-05",
+                "CRITICAL",
+                "LOAN_DECISION_UPDATE",
+                "INV-05",
+                "HIGH_IMPACT_MUTATION",
                 arguments
         );
     }

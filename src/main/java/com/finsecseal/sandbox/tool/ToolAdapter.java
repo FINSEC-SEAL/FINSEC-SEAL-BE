@@ -7,6 +7,10 @@ public interface ToolAdapter {
 
     String toolName();
 
+    default ToolEffect effect() {
+        return ToolEffect.READ_ONLY;
+    }
+
     default void validateArguments(JsonNode arguments) {
     }
 

@@ -3,10 +3,17 @@ package com.finsecseal.sandbox.tool;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.evidence.ExecutionEventDto;
+import com.finsecseal.runtime.ToolInvocation;
 import com.finsecseal.runtime.ToolProposal;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 
 public interface PolicyGateway {
+
+    GatewayResult invoke(
+            SandboxExecutionContext context,
+            ToolInvocation invocation,
+            String actorId
+    );
 
     GatewayResult invoke(
             SandboxExecutionContext context,

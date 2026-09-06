@@ -66,6 +66,11 @@ public final class ExternalHttpMockToolAdapter implements ToolAdapter {
     }
 
     @Override
+    public ToolEffect effect() {
+        return ToolEffect.STATE_CHANGING;
+    }
+
+    @Override
     public void validateArguments(JsonNode arguments) {
         if (arguments == null || !arguments.isObject()) {
             throw validation("EXTERNAL_HTTP arguments must be an object");

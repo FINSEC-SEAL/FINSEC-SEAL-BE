@@ -62,3 +62,5 @@ htmlcov/
 
 # Logs
 *.log
+# Local Git worktrees
+.worktrees/
