@@ -16,6 +16,7 @@ import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 
 public final class HttpAgentAiClient implements AgentAiClient {
@@ -229,8 +230,12 @@ public final class HttpAgentAiClient implements AgentAiClient {
     }
 
     private byte[] serializeRequest(AgentStepRequest request) {
-        AgentRunContextResolver.ResolvedRunContext trustedContext =
-                runContextResolver.resolve(request.runId());
+        AgentRunContextResolver.ResolvedAgentExecutionContext trustedContext =
+                runContextResolver.resolve(
+                        request.runId(),
+                        request.caseKey(),
+                        request.currentApplicantId()
+                );
 
         ObjectNode root = objectMapper.createObjectNode();
         root.put("releaseId", trustedContext.releaseId().toString());
@@ -239,6 +244,7 @@ public final class HttpAgentAiClient implements AgentAiClient {
         root.put("traceId", request.traceId().toString());
         root.put("caseKey", request.caseKey());
         root.put("currentApplicantId", request.currentApplicantId());
+        root.set("agentContext", agentContextJson(trustedContext));
         root.set("attackVariant", attackVariantJson(request.attackVariant()));
 
         if (request.previousToolResult() == null) {
@@ -257,6 +263,55 @@ public final class HttpAgentAiClient implements AgentAiClient {
         } catch (Exception exception) {
             throw evidenceIncomplete("AI step request could not be serialized");
         }
+    }
+
+    private ObjectNode agentContextJson(
+            AgentRunContextResolver.ResolvedAgentExecutionContext context
+    ) {
+        ObjectNode node = objectMapper.createObjectNode();
+
+        ObjectNode modelNode = node.putObject("model");
+        modelNode.put("provider", context.model().provider());
+        modelNode.put("name", context.model().name());
+        modelNode.set("parameters", context.model().parameters().deepCopy());
+
+        node.put("systemPrompt", context.systemPrompt());
+
+        ObjectNode businessPurposeNode = node.putObject("businessPurpose");
+        businessPurposeNode.put("code", context.businessContext().code());
+        businessPurposeNode.put("description", context.businessContext().description());
+
+        node.set("workflow", context.workflow().deepCopy());
+
+        ArrayNode toolsNode = node.putArray("tools");
+        for (AgentRunContextResolver.ToolContext tool : context.tools()) {
+            ObjectNode toolNode = toolsNode.addObject();
+            toolNode.put("name", tool.name());
+            toolNode.put("description", tool.description());
+            toolNode.set("inputSchema", tool.inputSchema().deepCopy());
+        }
+
+        AgentRunContextResolver.RuntimeCaseContext runtime = context.runtime();
+        ObjectNode runtimeNode = node.putObject("runtime");
+        runtimeNode.put("caseKey", runtime.caseKey());
+        runtimeNode.put("currentApplicantId", runtime.currentApplicantId());
+        runtimeNode.put("status", runtime.status());
+        runtimeNode.set("context", runtime.context().deepCopy());
+        ArrayNode allowedDocumentsNode = runtimeNode.putArray("allowedDocumentIds");
+        runtime.allowedDocumentIds().forEach(allowedDocumentsNode::add);
+
+        ArrayNode documentsNode = node.putArray("documents");
+        for (AgentRunContextResolver.DocumentContext document : context.documents()) {
+            ObjectNode documentNode = documentsNode.addObject();
+            documentNode.put("documentId", document.documentId());
+            documentNode.put("documentType", document.documentType());
+            documentNode.put("content", document.content());
+            documentNode.put("contentDigest", document.contentDigest());
+            documentNode.put("trustLevel", document.trustLevel());
+            documentNode.set("classification", document.classification().deepCopy());
+        }
+
+        return node;
     }
 
     private ObjectNode attackVariantJson(AttackVariant variant) {
