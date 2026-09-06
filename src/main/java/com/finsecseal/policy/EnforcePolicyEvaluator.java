@@ -6,19 +6,25 @@ import static com.finsecseal.policy.PolicyEvaluationReason.CONTEXT_INTEGRITY_FAI
 import static com.finsecseal.policy.PolicyEvaluationStage.PREFLIGHT;
 
 import com.finsecseal.policy.PolicyEvaluationDecision.StageOutcome;
+import com.finsecseal.policy.PolicyEvaluationSequence.PolicyEvaluationException;
 import com.finsecseal.policy.PolicyEvaluationSequence.PreflightEvaluator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 /**
  * Composes the existing policy judgments. The caller must provide authoritative preflight;
  * local consistency checks cannot prove stored approval or the provenance of supplied facts.
  * This class does not activate a gateway or invoke an adapter.
+ * Expired results are suppressed; synchronous callbacks still need their own I/O deadlines.
  */
 public final class EnforcePolicyEvaluator {
+
+    private static final long EVALUATION_BUDGET_NANOS = 100_000_000L;
 
     private final PolicyToolAuthorizationEvaluator authorization;
     private final PolicyBusinessContextEvaluator businessContext;
@@ -29,6 +35,7 @@ public final class EnforcePolicyEvaluator {
     private final PolicyWorkflowEvaluator workflow;
     private final PolicyHumanBoundaryEvaluator humanBoundary;
     private final PolicyToolTrustEvaluator toolTrust;
+    private final LongSupplier nanoTime;
 
     public EnforcePolicyEvaluator() {
         this(new PolicyToolAuthorizationEvaluator(), new PolicyBusinessContextEvaluator(),
@@ -49,6 +56,22 @@ public final class EnforcePolicyEvaluator {
             PolicyHumanBoundaryEvaluator humanBoundary,
             PolicyToolTrustEvaluator toolTrust
     ) {
+        this(authorization, businessContext, objectScope, fieldScope, cardinality, egress,
+                workflow, humanBoundary, toolTrust, System::nanoTime);
+    }
+
+    EnforcePolicyEvaluator(
+            PolicyToolAuthorizationEvaluator authorization,
+            PolicyBusinessContextEvaluator businessContext,
+            PolicyObjectScopeEvaluator objectScope,
+            PolicyFieldScopeEvaluator fieldScope,
+            PolicyCardinalityEvaluator cardinality,
+            PolicyEgressEvaluator egress,
+            PolicyWorkflowEvaluator workflow,
+            PolicyHumanBoundaryEvaluator humanBoundary,
+            PolicyToolTrustEvaluator toolTrust,
+            LongSupplier nanoTime
+    ) {
         this.authorization = Objects.requireNonNull(authorization, "authorization");
         this.businessContext = Objects.requireNonNull(businessContext, "businessContext");
         this.objectScope = Objects.requireNonNull(objectScope, "objectScope");
@@ -58,6 +81,7 @@ public final class EnforcePolicyEvaluator {
         this.workflow = Objects.requireNonNull(workflow, "workflow");
         this.humanBoundary = Objects.requireNonNull(humanBoundary, "humanBoundary");
         this.toolTrust = Objects.requireNonNull(toolTrust, "toolTrust");
+        this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
     }
 
     public PolicyEvaluationDecision evaluate(
@@ -66,17 +90,21 @@ public final class EnforcePolicyEvaluator {
     ) {
         Objects.requireNonNull(preflight, "preflight");
         Objects.requireNonNull(facts, "facts");
-        return PolicyEvaluationSequence.evaluate(
-                () -> {
+        long started = nanoTime.getAsLong();
+        PolicyEvaluationDecision decision;
+        try {
+            decision = PolicyEvaluationSequence.evaluate(
+                () -> withinBudget(started, () -> {
                     StageOutcome outcome = preflight.evaluate();
+                    checkDeadline(started);
                     if (outcome == null || outcome.stage() != PREFLIGHT
                             || outcome.outcomeType() != PASS) {
                         return outcome;
                     }
                     return consistent(facts) ? outcome
                             : StageOutcome.error(PREFLIGHT, CONTEXT_INTEGRITY_FAILURE);
-                },
-                stage -> switch (stage) {
+                }),
+                stage -> withinBudget(started, () -> switch (stage) {
                     case TOOL, OPERATION -> authorization.evaluate(stage, facts.authorization());
                     case BUSINESS_CONTEXT -> businessContext.evaluate(stage, facts.businessContext());
                     case OBJECT_SCOPE -> objectScope.evaluate(stage, facts.objectScope());
@@ -87,8 +115,41 @@ public final class EnforcePolicyEvaluator {
                     case HUMAN_BOUNDARY -> humanBoundary.evaluate(stage, facts.humanBoundary());
                     case TOOL_TRUST -> toolTrust.evaluate(stage, facts.toolTrust());
                     case PREFLIGHT -> throw new IllegalArgumentException("preflight is not a policy stage");
-                }
-        );
+                })
+            );
+        } catch (PolicyEvaluationException exception) {
+            if (exception.getCause() instanceof PolicyEvaluationTimeoutException timeout) {
+                throw timeout;
+            }
+            throw exception;
+        }
+        checkDeadline(started);
+        return decision;
+    }
+
+    private StageOutcome withinBudget(long started, Supplier<StageOutcome> evaluation) {
+        checkDeadline(started);
+        StageOutcome outcome = evaluation.get();
+        checkDeadline(started);
+        return outcome;
+    }
+
+    private void checkDeadline(long started) {
+        // Subtraction supports nanoTime's arbitrary origin and signed counter wrap.
+        if (nanoTime.getAsLong() - started >= EVALUATION_BUDGET_NANOS) {
+            throw new PolicyEvaluationTimeoutException();
+        }
+    }
+
+    /** Operational failure with no decision or fabricated evaluated-stage evidence. */
+    public static final class PolicyEvaluationTimeoutException extends RuntimeException {
+        private PolicyEvaluationTimeoutException() {
+            super(PolicyEvaluationReason.POLICY_EVALUATION_TIMEOUT.name());
+        }
+
+        public PolicyEvaluationReason reason() {
+            return PolicyEvaluationReason.POLICY_EVALUATION_TIMEOUT;
+        }
     }
 
     private static boolean consistent(EnforcePolicyEvaluationFacts facts) {

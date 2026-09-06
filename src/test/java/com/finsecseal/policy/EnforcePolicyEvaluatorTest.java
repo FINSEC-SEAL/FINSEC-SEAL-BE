@@ -9,19 +9,27 @@ import static org.mockito.Mockito.*;
 
 import com.finsecseal.policy.PolicyEvaluationDecision.DecisionType;
 import com.finsecseal.policy.PolicyEvaluationDecision.StageOutcome;
+import com.finsecseal.policy.EnforcePolicyEvaluator.PolicyEvaluationTimeoutException;
 import com.finsecseal.policy.PolicyEvaluationSequence.PolicyEvaluationException;
 import com.finsecseal.policy.PolicyEvaluationSequence.PreflightEvaluator;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
+import org.mockito.stubbing.Answer;
 
 /** Judgment composition evidence only; the preflight stub is not production source verification. */
 class EnforcePolicyEvaluatorTest {
@@ -46,6 +54,7 @@ class EnforcePolicyEvaluatorTest {
     private PolicyToolTrustEvaluator trust;
     private PreflightEvaluator preflight;
     private EnforcePolicyEvaluator evaluator;
+    private AtomicLong nanos;
 
     @BeforeEach
     void setUp() {
@@ -60,9 +69,8 @@ class EnforcePolicyEvaluatorTest {
         trust = spy(new PolicyToolTrustEvaluator());
         preflight = mock(PreflightEvaluator.class);
         when(preflight.evaluate()).thenReturn(StageOutcome.pass(PREFLIGHT));
-        evaluator = new EnforcePolicyEvaluator(
-                authorization, business, object, field, cardinality, egress, workflow, human, trust
-        );
+        nanos = new AtomicLong();
+        evaluator = evaluatorWithClock(nanos::get);
     }
 
     @Test
@@ -185,6 +193,158 @@ class EnforcePolicyEvaluatorTest {
         verifyExactInvocations(facts, decision);
     }
 
+    @Test
+    void expiredBeforePreflightInvokesNoCallbacks() {
+        AtomicInteger reads = new AtomicInteger();
+        evaluator = evaluatorWithClock(() -> reads.getAndIncrement() == 0 ? 0 : 100_000_000L);
+
+        assertTimeout(new Fixture().build());
+
+        verifyNoInteractions(allEvaluators());
+    }
+
+    @Test
+    void slowPreflightCannotReturnPassOrInvokePolicy() {
+        when(preflight.evaluate()).thenAnswer(call -> {
+            nanos.set(100_000_000L);
+            return StageOutcome.pass(PREFLIGHT);
+        });
+        EnforcePolicyEvaluationFacts facts = new Fixture().build();
+
+        assertTimeout(facts);
+
+        verifyInvocations(facts, List.of(PREFLIGHT));
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = PolicyEvaluationStage.class, names = "PREFLIGHT", mode = EnumSource.Mode.EXCLUDE)
+    void latePassingStageCannotAllowOrInvokeLaterStages(PolicyEvaluationStage stage) {
+        advanceClockAfterStage(stage, 100_000_000L);
+        EnforcePolicyEvaluationFacts facts = new Fixture().build();
+
+        assertTimeout(facts);
+
+        verifyInvocations(facts, prefixThrough(stage));
+    }
+
+    @Test
+    void lateDenialIsAnOperationalTimeoutWithoutSecurityBlockResult() {
+        Fixture fixture = new Fixture();
+        fixture.object = objectFacts(Optional.of(CASE), Optional.of(APPLICANT),
+                Optional.of(DOCUMENTS), List.of("CUST-OTHER"));
+        advanceClockAfterStage(OBJECT_SCOPE, 100_000_000L);
+        EnforcePolicyEvaluationFacts facts = fixture.build();
+
+        assertTimeout(facts);
+
+        verifyInvocations(facts, prefixThrough(OBJECT_SCOPE));
+    }
+
+    @Test
+    void timelyFirstDenialRetainsItsReasonAndExactPrefix() {
+        Fixture fixture = new Fixture();
+        fixture.object = objectFacts(Optional.of(CASE), Optional.of(APPLICANT),
+                Optional.of(DOCUMENTS), List.of("CUST-OTHER"));
+        fixture.field = fieldFacts(List.of("accountNumber"));
+        advanceClockAfterStage(OBJECT_SCOPE, 99_999_999L);
+        EnforcePolicyEvaluationFacts facts = fixture.build();
+
+        PolicyEvaluationDecision decision = evaluator.evaluate(preflight, facts);
+
+        assertThat(decision.decisionType()).isEqualTo(DecisionType.DENY);
+        assertThat(decision.reason()).contains(CUSTOMER_SCOPE_VIOLATION);
+        assertThat(decision.successfulSecurityBlock()).isTrue();
+        assertThat(decision.evaluatedStages()).isEqualTo(prefixThrough(OBJECT_SCOPE));
+        verifyExactInvocations(facts, decision);
+    }
+
+    @Test
+    void finalReturnFenceRejectsExpiryAfterLastStagePostCheck() {
+        AtomicBoolean trustFinished = new AtomicBoolean();
+        AtomicInteger readsAfterTrust = new AtomicInteger();
+        evaluator = evaluatorWithClock(() -> !trustFinished.get() ? 0
+                : readsAfterTrust.getAndIncrement() == 0 ? 99_999_999L : 100_000_000L);
+        doAnswer(call -> {
+            StageOutcome outcome = (StageOutcome) call.callRealMethod();
+            trustFinished.set(true);
+            return outcome;
+        }).when(trust).evaluate(eq(TOOL_TRUST), any());
+        EnforcePolicyEvaluationFacts facts = new Fixture().build();
+
+        assertTimeout(facts);
+
+        verifyInvocations(facts, PolicyEvaluationStage.completeOrder());
+        assertThat(readsAfterTrust).hasValue(2);
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {0, 17, -100_000_001L, Long.MIN_VALUE, Long.MAX_VALUE - 50_000_000L})
+    void elapsedSubtractionSupportsArbitraryOriginsAndSignedWrap(long origin) {
+        nanos.set(origin);
+        doAnswer(call -> {
+            nanos.set(origin + 99_999_999L);
+            return StageOutcome.pass(PREFLIGHT);
+        }).when(preflight).evaluate();
+        assertThat(evaluator.evaluate(preflight, new Fixture().build()).decisionType()).isEqualTo(DecisionType.ALLOW);
+
+        nanos.set(origin);
+        doAnswer(call -> {
+            nanos.set(origin + 100_000_000L);
+            return StageOutcome.pass(PREFLIGHT);
+        }).when(preflight).evaluate();
+        assertTimeout(new Fixture().build());
+    }
+
+    @Test
+    void eachInvocationStartsItsOwnBudget() {
+        when(preflight.evaluate()).thenAnswer(call -> {
+            nanos.addAndGet(50_000_000L);
+            return StageOutcome.pass(PREFLIGHT);
+        });
+        assertThat(evaluator.evaluate(preflight, new Fixture().build()).decisionType()).isEqualTo(DecisionType.ALLOW);
+        nanos.set(5_000_000_000L);
+        assertThat(evaluator.evaluate(preflight, new Fixture().build()).decisionType()).isEqualTo(DecisionType.ALLOW);
+    }
+
+    private EnforcePolicyEvaluator evaluatorWithClock(LongSupplier clock) {
+        return new EnforcePolicyEvaluator(authorization, business, object, field, cardinality,
+                egress, workflow, human, trust, clock);
+    }
+
+    private void assertTimeout(EnforcePolicyEvaluationFacts facts) {
+        assertThatThrownBy(() -> evaluator.evaluate(preflight, facts))
+                .isInstanceOfSatisfying(PolicyEvaluationTimeoutException.class, exception -> {
+                    assertThat(exception.reason()).isEqualTo(POLICY_EVALUATION_TIMEOUT);
+                    assertThat(exception.getMessage()).isEqualTo("POLICY_EVALUATION_TIMEOUT");
+                    assertThat(exception.getCause()).isNull();
+                });
+    }
+
+    private void advanceClockAfterStage(PolicyEvaluationStage stage, long time) {
+        Answer<StageOutcome> answer = call -> {
+            StageOutcome result = (StageOutcome) call.callRealMethod();
+            nanos.set(time);
+            return result;
+        };
+        switch (stage) {
+            case TOOL, OPERATION -> doAnswer(answer).when(authorization).evaluate(eq(stage), any());
+            case BUSINESS_CONTEXT -> doAnswer(answer).when(business).evaluate(eq(stage), any());
+            case OBJECT_SCOPE -> doAnswer(answer).when(object).evaluate(eq(stage), any());
+            case FIELD_SCOPE -> doAnswer(answer).when(field).evaluate(eq(stage), any());
+            case CARDINALITY -> doAnswer(answer).when(cardinality).evaluate(eq(stage), any());
+            case EGRESS -> doAnswer(answer).when(egress).evaluate(eq(stage), any());
+            case WORKFLOW -> doAnswer(answer).when(workflow).evaluate(eq(stage), any());
+            case HUMAN_BOUNDARY -> doAnswer(answer).when(human).evaluate(eq(stage), any());
+            case TOOL_TRUST -> doAnswer(answer).when(trust).evaluate(eq(stage), any());
+            case PREFLIGHT -> throw new IllegalArgumentException("Use preflight callback clock control");
+        }
+    }
+
+    private static List<PolicyEvaluationStage> prefixThrough(PolicyEvaluationStage stage) {
+        List<PolicyEvaluationStage> order = PolicyEvaluationStage.completeOrder();
+        return order.subList(0, order.indexOf(stage) + 1);
+    }
+
     private static Stream<StageOutcome> malformedPreflight() {
         return Stream.of(null, StageOutcome.pass(TOOL), StageOutcome.deny(TOOL, TOOL_NOT_ALLOWED));
     }
@@ -274,9 +434,13 @@ class EnforcePolicyEvaluatorTest {
     }
 
     private void verifyExactInvocations(EnforcePolicyEvaluationFacts facts, PolicyEvaluationDecision decision) {
+        verifyInvocations(facts, decision.evaluatedStages());
+    }
+
+    private void verifyInvocations(EnforcePolicyEvaluationFacts facts, List<PolicyEvaluationStage> stages) {
         InOrder order = inOrder(allEvaluators());
         order.verify(preflight).evaluate();
-        for (PolicyEvaluationStage stage : decision.evaluatedStages()) {
+        for (PolicyEvaluationStage stage : stages) {
             switch (stage) {
                 case PREFLIGHT -> { }
                 case TOOL, OPERATION -> order.verify(authorization).evaluate(stage, facts.authorization());
