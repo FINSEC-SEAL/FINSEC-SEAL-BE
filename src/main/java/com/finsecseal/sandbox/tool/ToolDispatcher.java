@@ -3,6 +3,7 @@ package com.finsecseal.sandbox.tool;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.evidence.ExecutionEventDto;
+import com.finsecseal.runtime.ToolInvocation;
 import com.finsecseal.runtime.ToolProposal;
 import com.finsecseal.runtime.ToolProposalValidator;
 import com.finsecseal.sandbox.SandboxExecutionContext;
@@ -20,6 +21,36 @@ public class ToolDispatcher {
     ) {
         this.policyGateway = policyGateway;
         this.proposalValidator = proposalValidator;
+    }
+
+    public DispatchResult dispatch(
+            SandboxExecutionContext context,
+            ToolInvocation invocation,
+            String actorId
+    ) {
+        if (invocation == null) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Tool dispatch requires Spring-owned invocation identity"
+            );
+        }
+
+        ToolProposal validated = proposalValidator.validate(invocation.proposal());
+        ToolInvocation validatedInvocation = new ToolInvocation(
+                validated,
+                invocation.toolCallId(),
+                invocation.requestDigest()
+        );
+        PolicyGateway.GatewayResult gatewayResult =
+                policyGateway.invoke(context, validatedInvocation, actorId);
+
+        return new DispatchResult(
+                gatewayResult.policyDecision(),
+                gatewayResult.policyEvent(),
+                gatewayResult.requestEvent(),
+                gatewayResult.responseEvent(),
+                gatewayResult.execution()
+        );
     }
 
     public DispatchResult dispatch(

@@ -135,7 +135,7 @@ public class AgentRuntimeService {
         );
     }
 
-    public ToolProposal recordFollowUpToolProposal(
+    public ToolInvocation recordFollowUpToolProposal(
             SandboxExecutionContext context,
             AttackVariant attackVariant,
             ToolProposal proposal,
@@ -152,7 +152,7 @@ public class AgentRuntimeService {
 
         ToolProposal validatedProposal = proposalValidator.validate(proposal);
 
-        eventService.append(
+        ExecutionEventDto.Event proposalEvent = eventService.append(
                 context.runId(),
                 new ExecutionEventDto.AppendRequest(
                         context.caseRunId(),
@@ -172,7 +172,11 @@ public class AgentRuntimeService {
                 actorId
         );
 
-        return validatedProposal;
+        return new ToolInvocation(
+                validatedProposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
     }
 
     public DeliveryReceipt deliverToolResult(

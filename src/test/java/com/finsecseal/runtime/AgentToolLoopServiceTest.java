@@ -78,15 +78,17 @@ class AgentToolLoopServiceTest {
         ToolProposal second = proposal("customer_data_read", "customer-third");
 
         RuntimeTurn initialTurn = initialTurn(first);
+        ToolInvocation firstInvocation = invocation(initialTurn);
+        ToolInvocation secondInvocation = invocation(second, 2L);
         ToolDispatcher.DispatchResult firstDispatch = allowedDispatch(first, 11L);
         ToolDispatcher.DispatchResult secondDispatch = allowedDispatch(second, 21L);
 
         when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initialTurn);
         when(runtimeService.recordFollowUpToolProposal(
                 eq(context), eq(variant), eq(second), any(), anyLong(), eq(ACTOR)
-        )).thenReturn(second);
-        when(toolDispatcher.dispatch(context, first, ACTOR)).thenReturn(firstDispatch);
-        when(toolDispatcher.dispatch(context, second, ACTOR)).thenReturn(secondDispatch);
+        )).thenReturn(secondInvocation);
+        when(toolDispatcher.dispatch(context, firstInvocation, ACTOR)).thenReturn(firstDispatch);
+        when(toolDispatcher.dispatch(context, secondInvocation, ACTOR)).thenReturn(secondDispatch);
         when(runtimeService.deliverToolResult(
                 eq(context), eq(variant), eq(first.toolName()), any(),
                 eq(firstDispatch.responseEvent().eventId()), eq(firstDispatch.responseEvent().sequence()), eq(ACTOR)
@@ -100,7 +102,7 @@ class AgentToolLoopServiceTest {
         Object result = execute(service);
 
         assertThat(result).isNotNull();
-        verify(toolDispatcher, times(2)).dispatch(any(), any(), eq(ACTOR));
+        verify(toolDispatcher, times(2)).dispatch(any(), any(ToolInvocation.class), eq(ACTOR));
         verify(runtimeService, times(2)).deliverToolResult(any(), any(), any(), any(), any(), any(Long.class), eq(ACTOR));
     }
 
@@ -110,18 +112,22 @@ class AgentToolLoopServiceTest {
         ToolProposal second = proposal("customer_data_read", "customer-2");
         ToolProposal third = proposal("customer_data_read", "customer-3");
 
+        RuntimeTurn initialTurn = initialTurn(first);
+        ToolInvocation firstInvocation = invocation(initialTurn);
+        ToolInvocation secondInvocation = invocation(second, 2L);
+        ToolInvocation thirdInvocation = invocation(third, 3L);
         ToolDispatcher.DispatchResult firstDispatch = allowedDispatch(first, 31L);
         ToolDispatcher.DispatchResult secondDispatch = allowedDispatch(second, 41L);
 
-        when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initialTurn(first));
+        when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initialTurn);
         when(runtimeService.recordFollowUpToolProposal(
                 eq(context), eq(variant), eq(second), any(), anyLong(), eq(ACTOR)
-        )).thenReturn(second);
+        )).thenReturn(secondInvocation);
         when(runtimeService.recordFollowUpToolProposal(
                 eq(context), eq(variant), eq(third), any(), anyLong(), eq(ACTOR)
-        )).thenReturn(third);
-        when(toolDispatcher.dispatch(context, first, ACTOR)).thenReturn(firstDispatch);
-        when(toolDispatcher.dispatch(context, second, ACTOR)).thenReturn(secondDispatch);
+        )).thenReturn(thirdInvocation);
+        when(toolDispatcher.dispatch(context, firstInvocation, ACTOR)).thenReturn(firstDispatch);
+        when(toolDispatcher.dispatch(context, secondInvocation, ACTOR)).thenReturn(secondDispatch);
         when(runtimeService.deliverToolResult(
                 eq(context), eq(variant), eq(first.toolName()), any(),
                 eq(firstDispatch.responseEvent().eventId()), eq(firstDispatch.responseEvent().sequence()), eq(ACTOR)
@@ -137,8 +143,8 @@ class AgentToolLoopServiceTest {
                 .isInstanceOf(RuntimeException.class)
                 .hasMessageContaining("step");
 
-        verify(toolDispatcher, times(2)).dispatch(any(), any(), eq(ACTOR));
-        verify(toolDispatcher, never()).dispatch(context, third, ACTOR);
+        verify(toolDispatcher, times(2)).dispatch(any(), any(ToolInvocation.class), eq(ACTOR));
+        verify(toolDispatcher, never()).dispatch(context, thirdInvocation, ACTOR);
     }
 
     @Test
@@ -146,15 +152,18 @@ class AgentToolLoopServiceTest {
         ToolProposal first = proposal("customer_data_read", "customer-a");
         ToolProposal second = proposal("customer_data_read", "customer-b");
 
+        RuntimeTurn initialTurn = initialTurn(first);
+        ToolInvocation firstInvocation = invocation(initialTurn);
+        ToolInvocation secondInvocation = invocation(second, 2L);
         ToolDispatcher.DispatchResult firstDispatch = allowedDispatch(first, 51L);
         ToolDispatcher.DispatchResult secondDispatch = allowedDispatch(second, 61L);
 
-        when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initialTurn(first));
+        when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initialTurn);
         when(runtimeService.recordFollowUpToolProposal(
                 eq(context), eq(variant), eq(second), any(), anyLong(), eq(ACTOR)
-        )).thenReturn(second);
-        when(toolDispatcher.dispatch(context, first, ACTOR)).thenReturn(firstDispatch);
-        when(toolDispatcher.dispatch(context, second, ACTOR)).thenReturn(secondDispatch);
+        )).thenReturn(secondInvocation);
+        when(toolDispatcher.dispatch(context, firstInvocation, ACTOR)).thenReturn(firstDispatch);
+        when(toolDispatcher.dispatch(context, secondInvocation, ACTOR)).thenReturn(secondDispatch);
         when(runtimeService.deliverToolResult(
                 eq(context), eq(variant), eq(first.toolName()), any(),
                 eq(firstDispatch.responseEvent().eventId()), eq(firstDispatch.responseEvent().sequence()), eq(ACTOR)
@@ -168,7 +177,7 @@ class AgentToolLoopServiceTest {
 
         InOrder order = inOrder(runtimeService, toolDispatcher);
         order.verify(runtimeService).proposeTool(context, variant, ACTOR);
-        order.verify(toolDispatcher).dispatch(context, first, ACTOR);
+        order.verify(toolDispatcher).dispatch(context, firstInvocation, ACTOR);
         order.verify(runtimeService).deliverToolResult(
                 eq(context), eq(variant), eq(first.toolName()), any(),
                 eq(firstDispatch.responseEvent().eventId()), eq(firstDispatch.responseEvent().sequence()), eq(ACTOR)
@@ -176,7 +185,7 @@ class AgentToolLoopServiceTest {
         order.verify(runtimeService).recordFollowUpToolProposal(
                 eq(context), eq(variant), eq(second), any(), anyLong(), eq(ACTOR)
         );
-        order.verify(toolDispatcher).dispatch(context, second, ACTOR);
+        order.verify(toolDispatcher).dispatch(context, secondInvocation, ACTOR);
         order.verify(runtimeService).deliverToolResult(
                 eq(context), eq(variant), eq(second.toolName()), any(),
                 eq(secondDispatch.responseEvent().eventId()), eq(secondDispatch.responseEvent().sequence()), eq(ACTOR)
@@ -186,10 +195,12 @@ class AgentToolLoopServiceTest {
     @Test
     void finalResponseTerminatesTheLoopWithoutAnotherDispatch() {
         ToolProposal first = proposal("customer_data_read", "customer-only");
+        RuntimeTurn initialTurn = initialTurn(first);
+        ToolInvocation firstInvocation = invocation(initialTurn);
         ToolDispatcher.DispatchResult dispatch = allowedDispatch(first, 71L);
 
-        when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initialTurn(first));
-        when(toolDispatcher.dispatch(context, first, ACTOR)).thenReturn(dispatch);
+        when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initialTurn);
+        when(toolDispatcher.dispatch(context, firstInvocation, ACTOR)).thenReturn(dispatch);
         when(runtimeService.deliverToolResult(
                 eq(context), eq(variant), eq(first.toolName()), any(),
                 eq(dispatch.responseEvent().eventId()), eq(dispatch.responseEvent().sequence()), eq(ACTOR)
@@ -198,15 +209,17 @@ class AgentToolLoopServiceTest {
         Object result = execute(newService(8));
 
         assertThat(result).isNotNull();
-        verify(toolDispatcher, times(1)).dispatch(any(), any(), eq(ACTOR));
+        verify(toolDispatcher, times(1)).dispatch(any(), any(ToolInvocation.class), eq(ACTOR));
         verify(runtimeService, times(1)).deliverToolResult(any(), any(), any(), any(), any(), any(Long.class), eq(ACTOR));
     }
 
     @Test
     void deniedAndQuarantinedPathsTerminateWithoutBreakingExistingSemantics() {
         ToolProposal deniedProposal = proposal("customer_data_read", "customer-denied");
-        when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initialTurn(deniedProposal));
-        when(toolDispatcher.dispatch(context, deniedProposal, ACTOR)).thenReturn(deniedDispatch());
+        RuntimeTurn deniedTurn = initialTurn(deniedProposal);
+        ToolInvocation deniedInvocation = invocation(deniedTurn);
+        when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(deniedTurn);
+        when(toolDispatcher.dispatch(context, deniedInvocation, ACTOR)).thenReturn(deniedDispatch());
 
         Object deniedResult = execute(newService(8));
         assertThat(deniedResult).isNotNull();
@@ -216,9 +229,11 @@ class AgentToolLoopServiceTest {
         toolDispatcher = mock(ToolDispatcher.class);
 
         ToolProposal quarantinedProposal = proposal("customer_data_read", "customer-quarantined");
+        RuntimeTurn quarantinedTurn = initialTurn(quarantinedProposal);
+        ToolInvocation quarantinedInvocation = invocation(quarantinedTurn);
         ToolDispatcher.DispatchResult quarantinedDispatch = allowedDispatch(quarantinedProposal, 81L);
-        when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initialTurn(quarantinedProposal));
-        when(toolDispatcher.dispatch(context, quarantinedProposal, ACTOR)).thenReturn(quarantinedDispatch);
+        when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(quarantinedTurn);
+        when(toolDispatcher.dispatch(context, quarantinedInvocation, ACTOR)).thenReturn(quarantinedDispatch);
         when(runtimeService.deliverToolResult(
                 eq(context), eq(variant), eq(quarantinedProposal.toolName()), any(),
                 eq(quarantinedDispatch.responseEvent().eventId()),
@@ -235,7 +250,7 @@ class AgentToolLoopServiceTest {
 
         Object quarantinedResult = execute(newService(8));
         assertThat(quarantinedResult).isNotNull();
-        verify(toolDispatcher, times(1)).dispatch(context, quarantinedProposal, ACTOR);
+        verify(toolDispatcher, times(1)).dispatch(context, quarantinedInvocation, ACTOR);
         verify(runtimeService, times(1)).deliverToolResult(
                 eq(context), eq(variant), eq(quarantinedProposal.toolName()), any(),
                 eq(quarantinedDispatch.responseEvent().eventId()),
@@ -260,7 +275,50 @@ class AgentToolLoopServiceTest {
                         proposal,
                         1L
                 ),
-                null
+                proposalEvent(proposal, 1L)
+        );
+    }
+
+    private ToolInvocation invocation(RuntimeTurn turn) {
+        return new ToolInvocation(
+                turn.aiResponse().proposal(),
+                turn.proposalEvent().eventId(),
+                turn.proposalEvent().payloadDigest()
+        );
+    }
+
+    private ToolInvocation invocation(ToolProposal proposal, long sequence) {
+        ExecutionEventDto.Event proposalEvent =
+                proposalEvent(proposal, sequence);
+        return new ToolInvocation(
+                proposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
+    }
+
+    private ExecutionEventDto.Event proposalEvent(
+            ToolProposal proposal,
+            long sequence
+    ) {
+        return new ExecutionEventDto.Event(
+                "1.0",
+                UUID.randomUUID(),
+                context.traceId(),
+                context.runId(),
+                context.caseRunId(),
+                sequence,
+                Instant.now(),
+                ExecutionEventType.TOOL_PROPOSED,
+                proposal.toolName(),
+                proposal.arguments(),
+                null,
+                "sha256:" + "c".repeat(64),
+                null,
+                "STRUCTURED_TOOL_PROPOSAL",
+                objectMapper.createObjectNode(),
+                "prev-hash",
+                "event-hash"
         );
     }
 

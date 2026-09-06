@@ -6,6 +6,7 @@ import com.finsecseal.common.domain.ExecutionEventType;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.evidence.ExecutionEventDto;
 import com.finsecseal.evidence.ExecutionEventService;
+import com.finsecseal.runtime.ToolInvocation;
 import com.finsecseal.runtime.ToolProposal;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import java.util.HashMap;
@@ -37,6 +38,29 @@ public final class TemporaryPolicyGatewayBridge implements PolicyGateway {
 
     @Override
     public GatewayResult invoke(
+            SandboxExecutionContext context,
+            ToolInvocation invocation,
+            String actorId
+    ) {
+        if (invocation == null) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Policy Gateway requires Spring-owned Tool invocation identity"
+            );
+        }
+        return invokeInternal(context, invocation.proposal(), actorId);
+    }
+
+    @Override
+    public GatewayResult invoke(
+            SandboxExecutionContext context,
+            ToolProposal proposal,
+            String actorId
+    ) {
+        return invokeInternal(context, proposal, actorId);
+    }
+
+    private GatewayResult invokeInternal(
             SandboxExecutionContext context,
             ToolProposal proposal,
             String actorId
