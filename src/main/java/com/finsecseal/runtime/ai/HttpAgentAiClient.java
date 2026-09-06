@@ -32,19 +32,22 @@ public final class HttpAgentAiClient implements AgentAiClient {
     private final AgentRunContextResolver runContextResolver;
     private final URI stepEndpoint;
     private final Duration requestTimeout;
+    private final String apiKey;
 
     public HttpAgentAiClient(
             HttpClient httpClient,
             ObjectMapper objectMapper,
             AgentRunContextResolver runContextResolver,
             URI baseUrl,
-            Duration requestTimeout
+            Duration requestTimeout,
+            String apiKey
     ) {
         this.httpClient = requireNonNull(httpClient, "HTTP client");
         this.objectMapper = requireNonNull(objectMapper, "ObjectMapper");
         this.runContextResolver = requireNonNull(runContextResolver, "Agent run context resolver");
         this.stepEndpoint = stepEndpoint(requireNonNull(baseUrl, "AI base URL"));
         this.requestTimeout = requirePositive(requestTimeout, "AI request timeout");
+        this.apiKey = apiKey == null || apiKey.isBlank() ? null : apiKey;
     }
 
     @Override
@@ -105,12 +108,17 @@ public final class HttpAgentAiClient implements AgentAiClient {
             throw evidenceIncomplete("AI step request exceeds 512 KiB");
         }
 
-        HttpRequest httpRequest = HttpRequest.newBuilder(stepEndpoint)
-                .timeout(requestTimeout)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofByteArray(requestBody))
-                .build();
+        HttpRequest.Builder builder = HttpRequest.newBuilder(stepEndpoint)
+            .timeout(requestTimeout)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofByteArray(requestBody));
+
+        if (apiKey != null) {
+            builder.header("Authorization", "Bearer " + apiKey);
+        }
+
+        HttpRequest httpRequest = builder.build();
 
         byte[] responseBody = sendStepRequest(httpRequest);
         return parseStepResponse(responseBody);

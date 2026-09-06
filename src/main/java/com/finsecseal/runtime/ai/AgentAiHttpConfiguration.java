@@ -27,12 +27,21 @@ public class AgentAiHttpConfiguration {
                 .version(HttpClient.Version.HTTP_1_1)
                 .connectTimeout(connectTimeout)
                 .build();
+        String apiKey = System.getenv("OPENAI_API_KEY");
+        // allow overriding via finsec.ai.api-key property
+        // Spring will not inject empty nested placeholders cleanly in all cases, so check system properties too
+        String configured = System.getProperty("finsec.ai.api-key");
+        if (configured != null && !configured.isBlank()) {
+            apiKey = configured;
+        }
+
         return new HttpAgentAiClient(
                 httpClient,
                 objectMapper,
                 runContextResolver,
                 baseUrl,
-                requestTimeout
+                requestTimeout,
+                apiKey
         );
     }
 }

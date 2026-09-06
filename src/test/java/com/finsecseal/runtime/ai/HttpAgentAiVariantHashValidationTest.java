@@ -96,14 +96,15 @@ class HttpAgentAiVariantHashValidationTest {
                 testRunId -> new AgentRunContextResolver.ResolvedRunContext(RELEASE_ID);
 
         return new HttpAgentAiClient(
-                HttpClient.newBuilder()
-                        .connectTimeout(Duration.ofSeconds(1))
-                        .version(HttpClient.Version.HTTP_1_1)
-                        .build(),
-                objectMapper,
-                resolver,
-                URI.create("http://127.0.0.1:" + server.getAddress().getPort()),
-                Duration.ofSeconds(2)
+            HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(1))
+                .version(HttpClient.Version.HTTP_1_1)
+                .build(),
+            objectMapper,
+            resolver,
+            URI.create("http://127.0.0.1:" + server.getAddress().getPort()),
+            Duration.ofSeconds(2),
+            null
         );
     }
 
