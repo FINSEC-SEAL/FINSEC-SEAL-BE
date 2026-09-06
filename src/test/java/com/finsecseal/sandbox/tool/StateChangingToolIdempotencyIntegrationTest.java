@@ -1,7 +1,10 @@
 package com.finsecseal.sandbox.tool;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.finsecseal.common.api.BusinessException;
+import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.ExecutionEventType;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.evidence.ExecutionEventDto;
@@ -198,6 +201,139 @@ class StateChangingToolIdempotencyIntegrationTest {
                 ExecutionEventType.SANDBOX_STATE_CHANGED,
                 1
         );
+    }
+
+    @Test
+    void sameToolCallIdWithDifferentRequestIsRejectedAsIdempotencyConflict() {
+        Seed seed = seedRunWithSandbox();
+        UUID traceId = UUID.randomUUID();
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(),
+                seed.caseRunId(),
+                traceId,
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        null,
+                        traceId,
+                        ExecutionEventType.RUN_STARTED,
+                        null,
+                        null,
+                        null,
+                        null,
+                        "RUN_STARTED",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ObjectNode originalArguments = objectMapper.createObjectNode();
+        originalArguments.put("caseId", "CASE-1001");
+        originalArguments.put("decision", "APPROVED");
+
+        ToolProposal originalProposal = new ToolProposal(
+                LoanDecisionUpdateMockToolAdapter.TOOL_NAME,
+                originalArguments
+        );
+
+        ExecutionEventDto.Event proposalEvent = eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        seed.caseRunId(),
+                        traceId,
+                        ExecutionEventType.TOOL_PROPOSED,
+                        originalProposal.toolName(),
+                        originalProposal.arguments(),
+                        null,
+                        null,
+                        "STRUCTURED_TOOL_PROPOSAL",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ToolInvocation originalInvocation = new ToolInvocation(
+                originalProposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
+
+        StateChangingToolExecutionService executor = executor();
+
+        executor.execute(
+                context,
+                originalInvocation,
+                adapter,
+                ACTOR
+        );
+
+        ObjectNode conflictingArguments = objectMapper.createObjectNode();
+        conflictingArguments.put("caseId", "CASE-1001");
+        conflictingArguments.put("decision", "REJECTED");
+
+        ToolInvocation conflictingInvocation = new ToolInvocation(
+                new ToolProposal(
+                        LoanDecisionUpdateMockToolAdapter.TOOL_NAME,
+                        conflictingArguments
+                ),
+                originalInvocation.toolCallId(),
+                "sha256:" + "d".repeat(64)
+        );
+
+        assertThatThrownBy(() ->
+                executor.execute(
+                        context,
+                        conflictingInvocation,
+                        adapter,
+                        ACTOR
+                )
+        )
+                .as(
+                        "same toolCallId with a different request "
+                                + "must never replay the original result"
+                )
+                .isInstanceOfSatisfying(
+                        BusinessException.class,
+                        exception -> assertThat(exception.errorCode())
+                                .isEqualTo(ErrorCode.IDEMPOTENCY_CONFLICT)
+                );
+
+        Long rowVersion = jdbcTemplate.queryForObject("""
+                select row_version
+                  from sandbox_loan_decisions
+                 where namespace_id = ?
+                   and case_key = 'CASE-1001'
+                """, Long.class, seed.runId());
+
+        assertThat(rowVersion).isEqualTo(1L);
+
+        String decision = jdbcTemplate.queryForObject("""
+                select decision
+                  from sandbox_loan_decisions
+                 where namespace_id = ?
+                   and case_key = 'CASE-1001'
+                """, String.class, seed.runId());
+
+        assertThat(decision).isEqualTo("APPROVED");
+
+        Integer receiptCount = jdbcTemplate.queryForObject("""
+                select count(*)
+                  from sandbox_tool_idempotency_records
+                 where test_case_run_id = ?
+                   and tool_call_id = ?
+                """,
+                Integer.class,
+                seed.caseRunId(),
+                originalInvocation.toolCallId()
+        );
+
+        assertThat(receiptCount).isEqualTo(1);
     }
 
     private StateChangingToolExecutionService executor() {

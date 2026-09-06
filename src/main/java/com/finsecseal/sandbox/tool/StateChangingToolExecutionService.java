@@ -48,8 +48,12 @@ public class StateChangingToolExecutionService {
                 invocation.toolCallId()
         );
 
-        if (existing != null && "COMPLETED".equals(existing.state())) {
-            return replay(existing);
+        if (existing != null) {
+            requireSameIdentity(existing, invocation);
+
+            if ("COMPLETED".equals(existing.state())) {
+                return replay(existing);
+            }
         }
 
         reserve(context, invocation);
@@ -197,6 +201,24 @@ public class StateChangingToolExecutionService {
         );
 
         return receipts.isEmpty() ? null : receipts.getFirst();
+    }
+
+    private void requireSameIdentity(
+            Receipt existing,
+            ToolInvocation invocation
+    ) {
+        if (!java.util.Objects.equals(
+                existing.toolName(),
+                invocation.proposal().toolName()
+        ) || !java.util.Objects.equals(
+                existing.requestDigest(),
+                invocation.requestDigest()
+        )) {
+            throw new BusinessException(
+                    ErrorCode.IDEMPOTENCY_CONFLICT,
+                    "toolCallId is already bound to a different Tool request"
+            );
+        }
     }
 
     private void reserve(
