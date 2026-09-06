@@ -80,6 +80,15 @@ public class ReleaseController {
         return ApiResponse.success(releaseService.diff(releaseId, against, actorId), TraceIdFilter.currentTraceId());
     }
 
+    @GetMapping("/releases/{releaseId}/tool-catalog")
+    // C consumes the verified source catalog through this boundary, not the request body.
+    ApiResponse<ReleaseDto.ToolCatalogResponse> toolCatalog(
+            @PathVariable UUID releaseId,
+            @RequestHeader(value = "X-Actor-Id", required = false) String actorId
+    ) {
+        return ApiResponse.success(releaseService.toolCatalog(releaseId, actorId), TraceIdFilter.currentTraceId());
+    }
+
     @PostMapping("/releases/{releaseId}:invalidate")
     ApiResponse<ReleaseDto.Response> invalidate(
             @PathVariable UUID releaseId,

@@ -32,6 +32,7 @@ public class ReleaseService {
             Map.entry("modelHash", List.of("/model")),
             Map.entry("systemPromptHash", List.of("/systemPrompt/text")),
             Map.entry("toolSetHash", List.of("/tools")),
+            Map.entry("serverToolCatalogHash", List.of("/serverToolCatalog")),
             Map.entry("ragConfigHash", List.of("/ragSources")),
             Map.entry("networkRequirementsHash", List.of("/networkRequirements")),
             Map.entry("workflowHash", List.of("/businessWorkflow")),
@@ -232,6 +233,27 @@ public class ReleaseService {
     }
 
     @Transactional
+    public ReleaseDto.ToolCatalogResponse toolCatalog(UUID releaseId, String actorId) {
+        AgentReleaseEntity release = getRequiredForUpdate(releaseId);
+        if (!LoanReviewToolCatalog.MANIFEST_VERSION.equals(release.getManifestSchemaVersion())) {
+            throw new BusinessException(ErrorCode.MANIFEST_INVALID,
+                    "A policy-ready catalog requires a new Manifest 1.1 Release; legacy 1.0 is preserved");
+        }
+        JsonNode manifest = verifiedManifest(release, actorId, "TOOL_CATALOG_INTEGRITY_CHECK");
+        requireValid(validationService.validate(manifest));
+        FingerprintService.Result fingerprint = fingerprintService.fingerprint(manifest, release.getSafetyContractHash());
+        if (!fingerprint.agentArtifactFingerprint().equals(release.getAgentArtifactFingerprint())
+                || !fingerprint.releaseFingerprint().equals(release.getReleaseFingerprint())) {
+            throw new BusinessException(ErrorCode.RELEASE_CHANGED, "Release fingerprint integrity check failed");
+        }
+        return new ReleaseDto.ToolCatalogResponse(
+                releaseId, release.getManifestSchemaVersion(), release.getAgentArtifactFingerprint(),
+                release.getReleaseFingerprint(), fingerprint.componentDigests().get("serverToolCatalogHash"),
+                manifest.path("tools").deepCopy(), manifest.path("serverToolCatalog").deepCopy()
+        );
+    }
+
+    @Transactional
     public ReleaseDto.DiffResponse diff(UUID releaseId, UUID againstId, String actorId) {
         AgentReleaseEntity release = getRequired(releaseId);
         AgentReleaseEntity against = getRequired(againstId);
@@ -416,6 +438,10 @@ public class ReleaseService {
         artifacts.add(jsonArtifact(releaseId, ArtifactType.RAG_CONFIG, "rag-sources", manifest.path("ragSources")));
         artifacts.add(jsonArtifact(releaseId, ArtifactType.BUSINESS_WORKFLOW, "business-workflow", manifest.path("businessWorkflow")));
         artifacts.add(jsonArtifact(releaseId, ArtifactType.HUMAN_BOUNDARY, "human-boundaries", manifest.path("humanApprovalBoundaries")));
+        if (manifest.has("serverToolCatalog")) {
+            artifacts.add(jsonArtifact(releaseId, ArtifactType.TOOL_SCHEMA,
+                    "server-tool-catalog", manifest.path("serverToolCatalog")));
+        }
         ObjectNode runtime = objectMapper.createObjectNode();
         runtime.set("runtimeContextRequirements", manifest.path("runtimeContextRequirements"));
         runtime.set("networkRequirements", manifest.path("networkRequirements"));

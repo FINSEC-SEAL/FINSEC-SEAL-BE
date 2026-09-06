@@ -1,5 +1,9 @@
 # Agent Release Manifest Specification
 
+구현 기준 추가(2026-09-06): 새 정책 통합용 Release는 Manifest `1.1`을 사용한다.
+기존 `1.0`은 과거 Release/hash 재현용으로 유지한다. 버전별 schema, non-executable server catalog,
+조회 API 및 C 인계 조건은 [`../A_MANIFEST_CONTRACT_HANDOFF.md`](../A_MANIFEST_CONTRACT_HANDOFF.md)를 따른다.
+
 ## 1. 목적과 lifecycle
 
 Manifest는 “무엇을 시험했는가”의 immutable 입력이다. `DRAFT`에서만 교체 가능하며 analyze 이후 변경은 새 AgentRelease를 만든다. 원문과 derived artifact/hash를 모두 저장한다.
@@ -10,7 +14,7 @@ JSON Schema draft 2020-12 수준으로 다음을 요구한다. `additionalProper
 
 | 경로 | 타입/필수 | 규칙 |
 |---|---|---|
-| `schemaVersion` | string/필수 | `1.0` |
+| `schemaVersion` | string/필수 | `1.0` legacy / `1.1` 정책 통합용 |
 | `agent.id` | string/필수 | stable business key |
 | `agent.name` | string/필수 | 1~100자 |
 | `release.version` | semver/필수 | Agent 내 unique |
@@ -22,6 +26,7 @@ JSON Schema draft 2020-12 수준으로 다음을 요구한다. `additionalProper
 | `systemPrompt.text` | string/필수 | 1~100,000 UTF-8 chars |
 | `systemPrompt.declaredSha256` | digest/선택 | server recompute와 일치해야 함 |
 | `tools[]` | array/필수 | 1~50, unique tool name |
+| `serverToolCatalog` | object/1.1 필수 | 서버에 등록된 versioned 고위험 카탈로그 snapshot; 일반 실행 권한 없음 |
 | `ragSources[]` | array/필수 | 없으면 `[]` |
 | `networkRequirements` | object/필수 | P0 provider만; Agent tool egress 별도 |
 | `businessWorkflow` | object/필수 | stages/current context source |
@@ -65,7 +70,9 @@ JSON Schema draft 2020-12 수준으로 다음을 요구한다. `additionalProper
 }
 ```
 
-예시는 Tool 1개만 축약한 것이다. 실제 P0 manifest는 `05`의 7개 catalog를 모두 선언한다.
+위 예시는 legacy 형식의 Tool 1개를 축약한 것으로 등록용 완전한 fixture가 아니다.
+정상 `tools`는 5개이며, 고위험 Tool은 1.1의 `serverToolCatalog`에 별도로 표현한다.
+등록 가능한 완전한 예시는 `src/test/resources/fixtures/valid-release-manifest-v1.1.json`이다.
 
 ## 4. Tool item semantics
 
