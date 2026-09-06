@@ -50,6 +50,7 @@ public class StateChangingToolExecutionService {
 
         if (existing != null) {
             requireSameIdentity(existing, invocation);
+            requireCanonicalInvocationProvenance(context, invocation);
 
             if ("COMPLETED".equals(existing.state())) {
                 return replay(existing);
@@ -57,6 +58,8 @@ public class StateChangingToolExecutionService {
 
             throw idempotencyInProgress(invocation);
         }
+
+        requireCanonicalInvocationProvenance(context, invocation);
 
         boolean reservationWon =
                 reserve(context, invocation);
@@ -185,6 +188,49 @@ public class StateChangingToolExecutionService {
                 result,
                 false
         );
+    }
+
+    private void requireCanonicalInvocationProvenance(
+            SandboxExecutionContext context,
+            ToolInvocation invocation
+    ) {
+        ExecutionEventDto.Event proposalEvent =
+                eventService.findById(invocation.toolCallId());
+
+        boolean valid = proposalEvent.eventType()
+                        == ExecutionEventType.TOOL_PROPOSED
+                && java.util.Objects.equals(
+                        proposalEvent.runId(),
+                        context.runId()
+                )
+                && java.util.Objects.equals(
+                        proposalEvent.testCaseRunId(),
+                        context.caseRunId()
+                )
+                && java.util.Objects.equals(
+                        proposalEvent.traceId(),
+                        context.traceId()
+                )
+                && java.util.Objects.equals(
+                        proposalEvent.toolName(),
+                        invocation.proposal().toolName()
+                )
+                && java.util.Objects.equals(
+                        proposalEvent.payloadDigest(),
+                        invocation.requestDigest()
+                )
+                && eventService.matchesRedactedInput(
+                        proposalEvent,
+                        invocation.proposal().arguments()
+                );
+
+        if (!valid) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "State-changing Tool invocation does not match canonical "
+                            + "TOOL_PROPOSED provenance"
+            );
+        }
     }
 
     private void requireExecution(

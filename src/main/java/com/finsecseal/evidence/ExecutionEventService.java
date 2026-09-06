@@ -180,6 +180,25 @@ public class ExecutionEventService {
         );
     }
 
+    public boolean matchesRedactedInput(
+            ExecutionEventDto.Event event,
+            JsonNode rawInput
+    ) {
+        if (event == null) {
+            return false;
+        }
+
+        JsonNode redactedInput =
+                redactionService.redact(
+                        nullToJson(rawInput)
+                ).redacted();
+
+        return java.util.Objects.equals(
+                event.input(),
+                redactedInput
+        );
+    }
+
     public ExecutionEventDto.Event findById(UUID eventId) {
         List<ExecutionEventDto.Event> events = jdbcTemplate.query(eventSelect() + " where event.id = ?",
                 this::mapEvent, eventId);

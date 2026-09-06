@@ -1027,6 +1027,425 @@ class StateChangingToolIdempotencyIntegrationTest {
         assertThat(receiptCount).isZero();
     }
 
+    @Test
+    void stateChangingInvocationRejectsNonToolProposedToolCallIdBeforeMutation() {
+        Seed seed = seedRunWithSandbox();
+        UUID traceId = UUID.randomUUID();
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(),
+                seed.caseRunId(),
+                traceId,
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        ExecutionEventDto.Event runStartedEvent = eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        null,
+                        traceId,
+                        ExecutionEventType.RUN_STARTED,
+                        null,
+                        null,
+                        null,
+                        null,
+                        "RUN_STARTED",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ObjectNode arguments = objectMapper.createObjectNode();
+        arguments.put("caseId", "CASE-1001");
+        arguments.put("decision", "APPROVED");
+
+        ToolProposal proposal = new ToolProposal(
+                LoanDecisionUpdateMockToolAdapter.TOOL_NAME,
+                arguments
+        );
+
+        ToolInvocation forgedInvocation = new ToolInvocation(
+                proposal,
+                runStartedEvent.eventId(),
+                runStartedEvent.payloadDigest()
+        );
+
+        assertThatThrownBy(() ->
+                transactionalExecutor.execute(
+                        context,
+                        forgedInvocation,
+                        adapter,
+                        ACTOR
+                )
+        )
+                .as(
+                        "state-changing toolCallId must reference the canonical "
+                                + "TOOL_PROPOSED event"
+                )
+                .isInstanceOfSatisfying(
+                        BusinessException.class,
+                        exception -> assertThat(exception.errorCode())
+                                .isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE)
+                );
+
+        Long rowVersion = jdbcTemplate.queryForObject("""
+                select row_version
+                  from sandbox_loan_decisions
+                 where namespace_id = ?
+                   and case_key = 'CASE-1001'
+                """, Long.class, seed.runId());
+
+        assertThat(rowVersion)
+                .as("forged provenance must be rejected before sandbox mutation")
+                .isZero();
+
+        Integer receiptCount = jdbcTemplate.queryForObject("""
+                select count(*)
+                  from sandbox_tool_idempotency_records
+                 where test_case_run_id = ?
+                """, Integer.class, seed.caseRunId());
+
+        assertThat(receiptCount)
+                .as("forged provenance must be rejected before idempotency reservation")
+                .isZero();
+
+        assertEventCount(
+                seed.runId(),
+                seed.caseRunId(),
+                ExecutionEventType.TOOL_REQUEST,
+                0
+        );
+    }
+
+    @Test
+    void stateChangingInvocationRejectsToolProposedFromAnotherRunAndCase() {
+        Seed source = seedRunWithSandbox();
+        Seed target = seedRunWithSandbox();
+        UUID sourceTrace = UUID.randomUUID();
+        UUID targetTrace = UUID.randomUUID();
+
+        appendRunStarted(source, sourceTrace);
+        appendRunStarted(target, targetTrace);
+
+        ToolProposal proposal = loanDecisionProposal("APPROVED");
+        ExecutionEventDto.Event proposalEvent = appendToolProposal(
+                source,
+                source.caseRunId(),
+                sourceTrace,
+                proposal,
+                proposal.toolName()
+        );
+
+        ToolInvocation forged = new ToolInvocation(
+                proposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
+
+        SandboxExecutionContext targetContext = new SandboxExecutionContext(
+                target.runId(),
+                target.caseRunId(),
+                targetTrace,
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        assertRejectedBeforeMutation(target, targetContext, forged);
+    }
+
+    @Test
+    void stateChangingInvocationRejectsToolProposedFromAnotherCaseRun() {
+        Seed seed = seedRunWithSandbox(2);
+        UUID traceId = UUID.randomUUID();
+        appendRunStarted(seed, traceId);
+
+        ToolProposal proposal = loanDecisionProposal("APPROVED");
+        ExecutionEventDto.Event proposalEvent = appendToolProposal(
+                seed,
+                seed.caseRunId(),
+                traceId,
+                proposal,
+                proposal.toolName()
+        );
+
+        UUID testCaseId = jdbcTemplate.queryForObject("""
+                select test_case_id
+                  from test_case_runs
+                 where id = ?
+                """, UUID.class, seed.caseRunId());
+
+        UUID otherCaseRunId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                insert into test_case_runs
+                    (id, test_run_id, test_case_id, trial_index,
+                     status, variant_hash, started_at)
+                values (?, ?, ?, 1, 'EXECUTING', ?, now())
+                """,
+                otherCaseRunId,
+                seed.runId(),
+                testCaseId,
+                HASH_A
+        );
+
+        ToolInvocation forged = new ToolInvocation(
+                proposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
+
+        SandboxExecutionContext otherCaseContext = new SandboxExecutionContext(
+                seed.runId(),
+                otherCaseRunId,
+                traceId,
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        assertRejectedBeforeMutation(
+                new Seed(seed.runId(), otherCaseRunId),
+                otherCaseContext,
+                forged
+        );
+    }
+
+    @Test
+    void stateChangingInvocationRejectsToolProposedWithDifferentTrace() {
+        Seed seed = seedRunWithSandbox();
+        UUID proposalTrace = UUID.randomUUID();
+        UUID executionTrace = UUID.randomUUID();
+        appendRunStarted(seed, proposalTrace);
+
+        ToolProposal proposal = loanDecisionProposal("APPROVED");
+        ExecutionEventDto.Event proposalEvent = appendToolProposal(
+                seed,
+                seed.caseRunId(),
+                proposalTrace,
+                proposal,
+                proposal.toolName()
+        );
+
+        ToolInvocation forged = new ToolInvocation(
+                proposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(),
+                seed.caseRunId(),
+                executionTrace,
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        assertRejectedBeforeMutation(seed, context, forged);
+    }
+
+    @Test
+    void stateChangingInvocationRejectsToolNameDifferentFromPersistedProposal() {
+        Seed seed = seedRunWithSandbox();
+        UUID traceId = UUID.randomUUID();
+        appendRunStarted(seed, traceId);
+
+        ToolProposal proposal = loanDecisionProposal("APPROVED");
+        ExecutionEventDto.Event proposalEvent = appendToolProposal(
+                seed,
+                seed.caseRunId(),
+                traceId,
+                proposal,
+                ExternalHttpMockToolAdapter.TOOL_NAME
+        );
+
+        ToolInvocation forged = new ToolInvocation(
+                proposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(),
+                seed.caseRunId(),
+                traceId,
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        assertRejectedBeforeMutation(seed, context, forged);
+    }
+
+    @Test
+    void stateChangingInvocationRejectsDigestDifferentFromPersistedProposal() {
+        Seed seed = seedRunWithSandbox();
+        UUID traceId = UUID.randomUUID();
+        appendRunStarted(seed, traceId);
+
+        ToolProposal proposal = loanDecisionProposal("APPROVED");
+        ExecutionEventDto.Event proposalEvent = appendToolProposal(
+                seed,
+                seed.caseRunId(),
+                traceId,
+                proposal,
+                proposal.toolName()
+        );
+
+        ToolInvocation forged = new ToolInvocation(
+                proposal,
+                proposalEvent.eventId(),
+                "sha256:" + "d".repeat(64)
+        );
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(),
+                seed.caseRunId(),
+                traceId,
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        assertRejectedBeforeMutation(seed, context, forged);
+    }
+
+    @Test
+    void stateChangingInvocationRejectsArgumentsNotBoundToPersistedDigest() {
+        Seed seed = seedRunWithSandbox();
+        UUID traceId = UUID.randomUUID();
+        appendRunStarted(seed, traceId);
+
+        ToolProposal persistedProposal = loanDecisionProposal("APPROVED");
+        ExecutionEventDto.Event proposalEvent = appendToolProposal(
+                seed,
+                seed.caseRunId(),
+                traceId,
+                persistedProposal,
+                persistedProposal.toolName()
+        );
+
+        ToolProposal forgedProposal = loanDecisionProposal("REJECTED");
+        ToolInvocation forged = new ToolInvocation(
+                forgedProposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(),
+                seed.caseRunId(),
+                traceId,
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        assertRejectedBeforeMutation(seed, context, forged);
+    }
+
+    private void appendRunStarted(Seed seed, UUID traceId) {
+        eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        null,
+                        traceId,
+                        ExecutionEventType.RUN_STARTED,
+                        null,
+                        null,
+                        null,
+                        null,
+                        "RUN_STARTED",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+    }
+
+    private ExecutionEventDto.Event appendToolProposal(
+            Seed seed,
+            UUID caseRunId,
+            UUID traceId,
+            ToolProposal proposal,
+            String persistedToolName
+    ) {
+        return eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        caseRunId,
+                        traceId,
+                        ExecutionEventType.TOOL_PROPOSED,
+                        persistedToolName,
+                        proposal.arguments(),
+                        null,
+                        null,
+                        "STRUCTURED_TOOL_PROPOSAL",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+    }
+
+    private ToolProposal loanDecisionProposal(String decision) {
+        ObjectNode arguments = objectMapper.createObjectNode();
+        arguments.put("caseId", "CASE-1001");
+        arguments.put("decision", decision);
+        return new ToolProposal(
+                LoanDecisionUpdateMockToolAdapter.TOOL_NAME,
+                arguments
+        );
+    }
+
+    private void assertRejectedBeforeMutation(
+            Seed target,
+            SandboxExecutionContext context,
+            ToolInvocation invocation
+    ) {
+        assertThatThrownBy(() ->
+                transactionalExecutor.execute(
+                        context,
+                        invocation,
+                        adapter,
+                        ACTOR
+                )
+        )
+                .isInstanceOfSatisfying(
+                        BusinessException.class,
+                        exception -> assertThat(exception.errorCode())
+                                .isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE)
+                );
+
+        Long rowVersion = jdbcTemplate.queryForObject("""
+                select row_version
+                  from sandbox_loan_decisions
+                 where namespace_id = ?
+                   and case_key = 'CASE-1001'
+                """, Long.class, target.runId());
+
+        assertThat(rowVersion)
+                .as("invalid canonical provenance must be rejected before mutation")
+                .isZero();
+
+        Integer receiptCount = jdbcTemplate.queryForObject("""
+                select count(*)
+                  from sandbox_tool_idempotency_records
+                 where test_case_run_id = ?
+                """, Integer.class, context.caseRunId());
+
+        assertThat(receiptCount)
+                .as("invalid provenance must be rejected before receipt reservation")
+                .isZero();
+
+        assertEventCount(
+                target.runId(),
+                context.caseRunId(),
+                ExecutionEventType.TOOL_REQUEST,
+                0
+        );
+    }
+
     private StateChangingToolExecutionService executor() {
         try {
             Constructor<?> noArg = Arrays.stream(
@@ -1093,6 +1512,10 @@ class StateChangingToolIdempotencyIntegrationTest {
     }
 
     private Seed seedRunWithSandbox() {
+        return seedRunWithSandbox(1);
+    }
+
+    private Seed seedRunWithSandbox(int plannedCases) {
         UUID agentId = UUID.randomUUID();
         UUID releaseId = UUID.randomUUID();
         UUID suiteId = UUID.randomUUID();
@@ -1182,7 +1605,7 @@ class StateChangingToolIdempotencyIntegrationTest {
                         fixtureService.fixtureDigest(),
                         HASH_B,
                         45L,
-                        1
+                        plannedCases
                 ),
                 ACTOR
         ).runId();
