@@ -364,7 +364,7 @@ public class StateChangingToolExecutionService {
                    and tool_call_id = ?
                    and state = 'PROCESSING'
                 """,
-                json(result.output()),
+                json(responseEvent.output()),
                 result.stateChanged(),
                 requestEvent.eventId(),
                 responseEvent.eventId(),

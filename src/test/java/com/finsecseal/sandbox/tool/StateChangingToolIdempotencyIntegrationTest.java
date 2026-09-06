@@ -1446,6 +1446,129 @@ class StateChangingToolIdempotencyIntegrationTest {
         );
     }
 
+    @Test
+    void idempotencyReceiptStoresRedactedToolResponse() throws Exception {
+        Seed seed = seedRunWithSandbox();
+        UUID traceId = UUID.randomUUID();
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(),
+                seed.caseRunId(),
+                traceId,
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        null,
+                        traceId,
+                        ExecutionEventType.RUN_STARTED,
+                        null,
+                        null,
+                        null,
+                        null,
+                        "RUN_STARTED",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ObjectNode arguments = objectMapper.createObjectNode();
+        arguments.put("operation", "emit-sensitive-output");
+
+        ToolProposal proposal = new ToolProposal(
+                "SENSITIVE_OUTPUT_TEST",
+                arguments
+        );
+
+        ExecutionEventDto.Event proposalEvent = eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        seed.caseRunId(),
+                        traceId,
+                        ExecutionEventType.TOOL_PROPOSED,
+                        proposal.toolName(),
+                        proposal.arguments(),
+                        null,
+                        null,
+                        "STRUCTURED_TOOL_PROPOSAL",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ToolInvocation invocation = new ToolInvocation(
+                proposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
+
+        ToolAdapter sensitiveOutputAdapter = new ToolAdapter() {
+            @Override
+            public String toolName() {
+                return proposal.toolName();
+            }
+
+            @Override
+            public ToolEffect effect() {
+                return ToolEffect.STATE_CHANGING;
+            }
+
+            @Override
+            public void validateArguments(
+                    tools.jackson.databind.JsonNode value
+            ) {
+            }
+
+            @Override
+            public ToolExecutionResult execute(
+                    SandboxExecutionContext executionContext,
+                    tools.jackson.databind.JsonNode value
+            ) {
+                ObjectNode output = objectMapper.createObjectNode();
+                output.put("email", "alice@example.com");
+                output.put("status", "OK");
+                return new ToolExecutionResult(output, false);
+            }
+        };
+
+        StateChangingToolExecutionService.Execution execution =
+                transactionalExecutor.execute(
+                        context,
+                        invocation,
+                        sensitiveOutputAdapter,
+                        ACTOR
+                );
+
+        assertThat(execution.responseEvent().output().path("email").asString())
+                .isEqualTo("[REDACTED:SENSITIVE_PII]");
+
+        String receiptJson = jdbcTemplate.queryForObject("""
+                select response_json::text
+                  from sandbox_tool_idempotency_records
+                 where test_case_run_id = ?
+                   and tool_call_id = ?
+                """,
+                String.class,
+                seed.caseRunId(),
+                invocation.toolCallId()
+        );
+
+        tools.jackson.databind.JsonNode receiptResponse =
+                objectMapper.readTree(receiptJson);
+
+        assertThat(receiptResponse)
+                .as("receipt response_json must match the centrally redacted TOOL_RESPONSE payload")
+                .isEqualTo(execution.responseEvent().output());
+        assertThat(receiptResponse.path("email").asString())
+                .isEqualTo("[REDACTED:SENSITIVE_PII]");
+        assertThat(receiptJson)
+                .doesNotContain("alice@example.com");
+    }
+
     private StateChangingToolExecutionService executor() {
         try {
             Constructor<?> noArg = Arrays.stream(
