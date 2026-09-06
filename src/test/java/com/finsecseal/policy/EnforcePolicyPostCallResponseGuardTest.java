@@ -4,6 +4,8 @@ import static com.finsecseal.common.domain.Sensitivity.CREDIT;
 import static com.finsecseal.common.domain.Sensitivity.NORMAL;
 import static com.finsecseal.policy.EnforcePolicyPostCallDecision.OperationalReason.ADAPTER_CONTRACT_FAILURE;
 import static com.finsecseal.policy.EnforcePolicyPostCallDecision.OperationalReason.RESPONSE_CARDINALITY_VIOLATION;
+import static com.finsecseal.policy.EnforcePolicyPostCallFacts.OutputValueType.INTEGER;
+import static com.finsecseal.policy.EnforcePolicyPostCallFacts.OutputValueType.STRING;
 import static com.finsecseal.policy.EnforcePolicyPostCallDecision.Outcome.PASS;
 import static com.finsecseal.policy.EnforcePolicyPostCallDecision.Outcome.QUARANTINE;
 import static com.finsecseal.policy.EnforcePolicyPostCallDecision.PostCallCheck.CLASSIFICATION;
@@ -145,6 +147,83 @@ class EnforcePolicyPostCallResponseGuardTest {
                 OUTPUT_SCHEMA,
                 ADAPTER_CONTRACT_FAILURE,
                 List.of(OUTPUT_SCHEMA)
+        );
+    }
+
+    @ParameterizedTest(name = "{index}: wrong value type for {0}")
+    @MethodSource("fieldValueTypeMismatches")
+    void quarantinesWrongScalarTypesBeforeEveryLaterFailure(
+            String fieldName,
+            String encodedValue
+    ) throws Exception {
+        ObjectNode response = response(OTHER_CUSTOMER, fieldName, "placeholder");
+        ((ObjectNode) response.at("/rows/0/fields"))
+                .set(fieldName, OBJECT_MAPPER.readTree(encodedValue));
+
+        EnforcePolicyPostCallDecision decision = guard.evaluate(facts(
+                CURRENT_APPLICANT,
+                List.of(CURRENT_APPLICANT),
+                List.of("name", "creditScore"),
+                List.of("name", "creditScore"),
+                catalog(),
+                1,
+                response,
+                null,
+                wrongProvenance()
+        ));
+
+        assertQuarantined(decision, OUTPUT_SCHEMA, ADAPTER_CONTRACT_FAILURE,
+                List.of(OUTPUT_SCHEMA));
+    }
+
+    @Test
+    void passesAnIntegerOnlyWhenItsCatalogTypeIsInteger() {
+        ObjectNode response = response(CURRENT_APPLICANT, "creditScore", 720);
+        assertPassed(guard.evaluate(facts(
+                CURRENT_APPLICANT,
+                List.of(CURRENT_APPLICANT),
+                List.of("creditScore"),
+                List.of("creditScore"),
+                catalog(),
+                1,
+                response,
+                exactClassifications(),
+                null
+        )), response);
+    }
+
+    @Test
+    void preservesEmptyStringsAndOmittedOptionalFields() {
+        ObjectNode emptyString = response(CURRENT_APPLICANT, "name", "");
+        assertPassed(guard.evaluate(facts(emptyString, exactClassifications(), null)),
+                emptyString);
+
+        ObjectNode omitted = validResponse();
+        ((ObjectNode) omitted.at("/rows/0/fields")).remove("name");
+        assertPassed(guard.evaluate(facts(omitted, exactClassifications(), null)), omitted);
+    }
+
+    @Test
+    void rejectsMissingTrustedOutputTypeWithoutGuessingADefault() {
+        assertThatThrownBy(() -> new CatalogOutputField("name", NORMAL, null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("catalog output field type must not be null");
+    }
+
+    private static Stream<Arguments> fieldValueTypeMismatches() {
+        return Stream.of(
+                Arguments.of("name", "720"),
+                Arguments.of("name", "true"),
+                Arguments.of("name", "0.5"),
+                Arguments.of("name", "{\"accountNumber\":\"synthetic-secret\"}"),
+                Arguments.of("name", "[\"synthetic-secret\"]"),
+                Arguments.of("name", "null"),
+                Arguments.of("creditScore", "\"720\""),
+                Arguments.of("creditScore", "true"),
+                Arguments.of("creditScore", "720.5"),
+                Arguments.of("creditScore", "{\"accountNumber\":\"synthetic-secret\"}"),
+                Arguments.of("creditScore", "[720]"),
+                Arguments.of("creditScore", "null")
         );
     }
 
@@ -582,18 +661,18 @@ class EnforcePolicyPostCallResponseGuardTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("catalogOutputFields must not contain null entries");
         assertThatThrownBy(() -> factsWithCatalog(List.of(
-                new CatalogOutputField("name", NORMAL),
-                new CatalogOutputField("name", CREDIT)
+                new CatalogOutputField("name", NORMAL, STRING),
+                new CatalogOutputField("name", CREDIT, STRING)
         )))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("catalogOutputFields must not contain duplicate field names");
-        assertThatThrownBy(() -> new CatalogOutputField(null, NORMAL))
+        assertThatThrownBy(() -> new CatalogOutputField(null, NORMAL, STRING))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("catalog output field name must not be blank");
-        assertThatThrownBy(() -> new CatalogOutputField(" ", NORMAL))
+        assertThatThrownBy(() -> new CatalogOutputField(" ", NORMAL, STRING))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("catalog output field name must not be blank");
-        assertThatThrownBy(() -> new CatalogOutputField("name", null))
+        assertThatThrownBy(() -> new CatalogOutputField("name", null, STRING))
                 .isInstanceOf(NullPointerException.class)
                 .hasMessage("catalog output field classification must not be null");
     }
@@ -953,8 +1032,8 @@ class EnforcePolicyPostCallResponseGuardTest {
 
     private static List<CatalogOutputField> catalog() {
         return List.of(
-                new CatalogOutputField("name", NORMAL),
-                new CatalogOutputField("creditScore", CREDIT)
+                new CatalogOutputField("name", NORMAL, STRING),
+                new CatalogOutputField("creditScore", CREDIT, INTEGER)
         );
     }
 

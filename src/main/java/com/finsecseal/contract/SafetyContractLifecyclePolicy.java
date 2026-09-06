@@ -172,12 +172,7 @@ public final class SafetyContractLifecyclePolicy {
             throw rejection(RejectionCode.INVALID_STATE_TRANSITION);
         }
 
-        String expectedResourceHash = parseIfMatch(ifMatch);
-        if (!constantTimeEqual(expectedResourceHash, snapshot.resourceHash())) {
-            throw rejection(RejectionCode.STALE_RESOURCE);
-        }
-        requireReviewer(reviewer, snapshot.identity().workspaceId());
-        requireExactText(comment, MAX_COMMENT_LENGTH, RejectionCode.INVALID_COMMENT);
+        requireReview(snapshot, ifMatch, reviewer, comment);
 
         CanonicalPolicy canonical = canonicalPolicy(snapshot.policy());
         requirePolicyBinding(snapshot, canonical);
@@ -233,6 +228,50 @@ public final class SafetyContractLifecyclePolicy {
                 reviewer.copy(),
                 comment
         );
+    }
+
+    /**
+     * Returns rejection preconditions for the persistence owner to apply atomically and audit.
+     * Invalid candidates can be discarded without revalidation or catalog availability. Stored
+     * hashes identify the expected snapshot; they are not new policy validation evidence.
+     */
+    public RejectionTransitionCommand reject(
+            ContractVersionSnapshot snapshot,
+            String ifMatch,
+            ReviewerContext reviewer,
+            String comment
+    ) {
+        requireSnapshot(snapshot);
+        if (snapshot.state() != VersionState.CANDIDATE
+                && snapshot.state() != VersionState.VALIDATED) {
+            throw rejection(RejectionCode.INVALID_STATE_TRANSITION);
+        }
+        requireReview(snapshot, ifMatch, reviewer, comment);
+
+        return new RejectionTransitionCommand(
+                snapshot.identity(),
+                snapshot.state(),
+                VersionState.REJECTED,
+                snapshot.resourceHash(),
+                snapshot.policyHash(),
+                snapshot.basePolicyHash(),
+                reviewer.copy(),
+                comment
+        );
+    }
+
+    private static void requireReview(
+            ContractVersionSnapshot snapshot,
+            String ifMatch,
+            ReviewerContext reviewer,
+            String comment
+    ) {
+        String expectedResourceHash = parseIfMatch(ifMatch);
+        if (!constantTimeEqual(expectedResourceHash, snapshot.resourceHash())) {
+            throw rejection(RejectionCode.STALE_RESOURCE);
+        }
+        requireReviewer(reviewer, snapshot.identity().workspaceId());
+        requireExactText(comment, MAX_COMMENT_LENGTH, RejectionCode.INVALID_COMMENT);
     }
 
     private static VerifiedCatalogLoader loaderFor(
@@ -656,7 +695,7 @@ public final class SafetyContractLifecyclePolicy {
         REVIEWER_CSRF_REQUIRED("Reviewer CSRF verification is required"),
         REVIEWER_ROLE_REQUIRED("AI_SECURITY_REVIEWER role is required"),
         REVIEWER_WORKSPACE_MISMATCH("Reviewer workspace does not match"),
-        INVALID_COMMENT("Approval comment is invalid");
+        INVALID_COMMENT("Review comment is invalid");
 
         private final String safeMessage;
 
@@ -853,6 +892,34 @@ public final class SafetyContractLifecyclePolicy {
         @Override
         public ValidationProof validationProof() {
             return validationProof.copy();
+        }
+    }
+
+    public record RejectionTransitionCommand(
+            VersionIdentity identity,
+            VersionState expectedState,
+            VersionState targetState,
+            String expectedResourceHash,
+            String policyHash,
+            Optional<String> basePolicyHash,
+            ReviewerContext reviewer,
+            String comment
+    ) {
+
+        public RejectionTransitionCommand {
+            Objects.requireNonNull(identity, "identity");
+            Objects.requireNonNull(expectedState, "expectedState");
+            Objects.requireNonNull(targetState, "targetState");
+            Objects.requireNonNull(expectedResourceHash, "expectedResourceHash");
+            Objects.requireNonNull(policyHash, "policyHash");
+            basePolicyHash = Objects.requireNonNull(basePolicyHash, "basePolicyHash");
+            reviewer = Objects.requireNonNull(reviewer, "reviewer").copy();
+            Objects.requireNonNull(comment, "comment");
+        }
+
+        @Override
+        public ReviewerContext reviewer() {
+            return reviewer.copy();
         }
     }
 
