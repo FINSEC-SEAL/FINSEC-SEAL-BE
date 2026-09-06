@@ -219,7 +219,7 @@ public class StateChangingToolExecutionService {
                         proposalEvent.payloadDigest(),
                         invocation.requestDigest()
                 )
-                && eventService.matchesRedactedInput(
+                && eventService.matchesToolProposalPayloadDigest(
                         proposalEvent,
                         invocation.proposal().arguments()
                 );

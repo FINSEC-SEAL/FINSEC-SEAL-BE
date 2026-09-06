@@ -180,6 +180,38 @@ public class ExecutionEventService {
         );
     }
 
+    public boolean matchesToolProposalPayloadDigest(
+            ExecutionEventDto.Event event,
+            JsonNode rawInput
+    ) {
+        if (event == null
+                || event.eventType() != ExecutionEventType.TOOL_PROPOSED) {
+            return false;
+        }
+
+        ObjectNode rawEnvelope = objectMapper.createObjectNode();
+        rawEnvelope.set("input", nullToJson(rawInput));
+        rawEnvelope.set("output", nullToJson(event.output()));
+        rawEnvelope.set(
+                "policyDecision",
+                nullToJson(event.policyDecision())
+        );
+        rawEnvelope.set(
+                "metadata",
+                event.metadata() == null
+                        ? objectMapper.createObjectNode()
+                        : event.metadata()
+        );
+
+        String recomputedDigest =
+                redactionService.redact(rawEnvelope).originalDigest();
+
+        return java.util.Objects.equals(
+                event.payloadDigest(),
+                recomputedDigest
+        );
+    }
+
     public boolean matchesRedactedInput(
             ExecutionEventDto.Event event,
             JsonNode rawInput

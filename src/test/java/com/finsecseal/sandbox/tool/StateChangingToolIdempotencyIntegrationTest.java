@@ -1569,6 +1569,116 @@ class StateChangingToolIdempotencyIntegrationTest {
                 .doesNotContain("alice@example.com");
     }
 
+    @Test
+    void stateChangingInvocationRejectsSensitiveArgumentsNotBoundToOriginalDigest() {
+        Seed seed = seedRunWithSandbox();
+        UUID traceId = UUID.randomUUID();
+        appendRunStarted(seed, traceId);
+
+        ObjectNode persistedArguments = objectMapper.createObjectNode();
+        persistedArguments.put("email", "alice@example.com");
+        persistedArguments.put("operation", "review");
+        ToolProposal persistedProposal = new ToolProposal(
+                "SENSITIVE_PROVENANCE_TEST",
+                persistedArguments
+        );
+
+        ExecutionEventDto.Event proposalEvent = appendToolProposal(
+                seed,
+                seed.caseRunId(),
+                traceId,
+                persistedProposal,
+                persistedProposal.toolName()
+        );
+
+        ObjectNode forgedArguments = objectMapper.createObjectNode();
+        forgedArguments.put("email", "mallory@example.com");
+        forgedArguments.put("operation", "review");
+        ToolProposal forgedProposal = new ToolProposal(
+                persistedProposal.toolName(),
+                forgedArguments
+        );
+
+        ToolInvocation forged = new ToolInvocation(
+                forgedProposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(),
+                seed.caseRunId(),
+                traceId,
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        ToolAdapter sensitiveAdapter = new ToolAdapter() {
+            @Override
+            public String toolName() {
+                return persistedProposal.toolName();
+            }
+
+            @Override
+            public ToolEffect effect() {
+                return ToolEffect.STATE_CHANGING;
+            }
+
+            @Override
+            public void validateArguments(
+                    tools.jackson.databind.JsonNode value
+            ) {
+            }
+
+            @Override
+            public ToolExecutionResult execute(
+                    SandboxExecutionContext executionContext,
+                    tools.jackson.databind.JsonNode value
+            ) {
+                return new ToolExecutionResult(
+                        objectMapper.createObjectNode().put("status", "OK"),
+                        false
+                );
+            }
+        };
+
+        assertThatThrownBy(() ->
+                transactionalExecutor.execute(
+                        context,
+                        forged,
+                        sensitiveAdapter,
+                        ACTOR
+                )
+        )
+                .isInstanceOfSatisfying(
+                        BusinessException.class,
+                        exception -> assertThat(exception.errorCode())
+                                .isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE)
+                );
+
+        Integer receiptCount = jdbcTemplate.queryForObject("""
+                select count(*)
+                  from sandbox_tool_idempotency_records
+                 where test_case_run_id = ?
+                   and tool_call_id = ?
+                """,
+                Integer.class,
+                seed.caseRunId(),
+                proposalEvent.eventId()
+        );
+        assertThat(receiptCount)
+                .as("forged sensitive arguments must fail before receipt reservation")
+                .isZero();
+
+        assertEventCount(
+                seed.runId(),
+                seed.caseRunId(),
+                ExecutionEventType.TOOL_REQUEST,
+                0
+        );
+    }
+
     private StateChangingToolExecutionService executor() {
         try {
             Constructor<?> noArg = Arrays.stream(
