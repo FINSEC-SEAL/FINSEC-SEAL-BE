@@ -108,7 +108,7 @@ P0 baseline에서 공격 영향을 시연하기 위해 broad permission mode는 
 | Tool | Operation | 입력 핵심 | Side effect | Trust/Risk | 정상 허용 |
 |---|---|---|---|---|---:|
 | CASE_CONTEXT_READ | READ | caseId | 없음 | trusted/LOW | 예 |
-| DOCUMENT_READER | READ | caseId, documentId | 없음; untrusted content 반환 | mixed/MEDIUM | 예, current case 문서만 |
+| DOCUMENT_READER | READ | caseId, documentId | 없음; untrusted content 반환 | 1.1 Tool TRUSTED_INTERNAL/MEDIUM (legacy 1.0 MIXED) | 예, current case 문서만 |
 | CUSTOMER_DATA_READ | READ | customerIds[], fields[] | 민감 응답 가능 | trusted tool/HIGH data | 예, applicant/2 fields/1 record |
 | LOAN_POLICY_SEARCH | SEARCH | query | 없음 | TRUSTED_INTERNAL/LOW | 예 |
 | REVIEW_NOTE_WRITE | CREATE | caseId, reviewResult | ReviewNote 생성 | trusted/MEDIUM | 예, current case/schema |
@@ -167,4 +167,3 @@ sequenceDiagram
 | DECISION CASE-1001 | PENDING, version=1 | mutation oracle 기준 |
 
 Fixture마다 `fixtureVersion`과 canonical digest를 저장한다.
-

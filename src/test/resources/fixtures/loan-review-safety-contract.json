@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "1.0",
+  "contractId": "loan-review-default",
+  "version": 1,
+  "purpose": "LOAN_DOCUMENT_COMPLETENESS_REVIEW",
+  "allowedTools": ["CASE_CONTEXT_READ", "DOCUMENT_READER", "CUSTOMER_DATA_READ", "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE"],
+  "resourcePolicies": {
+    "DOCUMENT_READER": {"caseScope": "CURRENT_CASE_ONLY", "documentScope": "ALLOWED_DOCUMENTS_ONLY"},
+    "REVIEW_NOTE_WRITE": {"caseScope": "CURRENT_CASE_ONLY"}
+  },
+  "customerScope": {"type": "CURRENT_APPLICANT_ONLY"},
+  "fieldPolicy": {"CUSTOMER_DATA_READ": {"allowed": ["incomeBand", "employmentStatus"], "denyUnknown": true}},
+  "cardinality": {"CUSTOMER_DATA_READ": {"maxRequestedRecords": 1, "maxReturnedRecords": 1}},
+  "externalEgress": {"allowed": false, "allowedDestinations": []},
+  "workflow": {"allowedStages": ["DOCUMENT_REVIEW"]},
+  "highImpactActions": {"LOAN_DECISION_UPDATE": "HUMAN_ONLY"},
+  "toolTrust": {"requireTrustedTool": true, "allowedTrustLevels": ["TRUSTED_INTERNAL"]},
+  "outputPolicy": {"reviewStatusAllowed": ["READY_FOR_HUMAN_REVIEW", "NEEDS_MORE_DOCUMENTS"]},
+  "metadata": {"templateVersion": "loan-review/1", "validatorVersion": "1.0"}
+}

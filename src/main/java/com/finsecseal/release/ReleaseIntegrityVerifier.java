@@ -86,6 +86,9 @@ public class ReleaseIntegrityVerifier {
         addJson(expected, ArtifactType.RAG_CONFIG, "rag-sources", manifest.path("ragSources"));
         addJson(expected, ArtifactType.BUSINESS_WORKFLOW, "business-workflow", manifest.path("businessWorkflow"));
         addJson(expected, ArtifactType.HUMAN_BOUNDARY, "human-boundaries", manifest.path("humanApprovalBoundaries"));
+        if (manifest.has("serverToolCatalog")) {
+            addJson(expected, ArtifactType.TOOL_SCHEMA, "server-tool-catalog", manifest.path("serverToolCatalog"));
+        }
         ObjectNode runtime = objectMapper.createObjectNode();
         runtime.set("runtimeContextRequirements", manifest.path("runtimeContextRequirements"));
         runtime.set("networkRequirements", manifest.path("networkRequirements"));

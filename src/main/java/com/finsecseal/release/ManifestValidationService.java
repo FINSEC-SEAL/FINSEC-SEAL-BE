@@ -49,7 +49,7 @@ public class ManifestValidationService {
     private static final Set<String> TOP_LEVEL_FIELDS = Set.of(
             "schemaVersion", "agent", "release", "businessPurpose", "model", "systemPrompt", "tools",
             "ragSources", "networkRequirements", "businessWorkflow", "humanApprovalBoundaries",
-            "runtimeContextRequirements", "safetyContractRef"
+            "runtimeContextRequirements", "safetyContractRef", "serverToolCatalog"
     );
     private static final Set<String> TOOL_FIELDS = Set.of(
             "name", "version", "operation", "description", "inputSchema", "outputSchema", "trustLevel",
@@ -94,7 +94,9 @@ public class ManifestValidationService {
                 Set.of("allowedStages", "contextSourceTool", "orderedSteps"),
                 issues
         );
-        requireText(manifest, "/schemaVersion", "1.0", issues);
+        requireEnum(manifest, "/schemaVersion", Set.of("1.0", LoanReviewToolCatalog.MANIFEST_VERSION), issues, "");
+        boolean currentCatalog = LoanReviewToolCatalog.MANIFEST_VERSION.equals(text(manifest, "/schemaVersion"));
+        validateServerCatalog(manifest, currentCatalog, issues);
         String agentId = text(manifest, "/agent/id");
         if (agentId == null || !BUSINESS_KEY.matcher(agentId).matches()) {
             issues.add(error("/agent/id", "FORMAT", "Agent id must be a lowercase stable business key"));
@@ -130,7 +132,7 @@ public class ManifestValidationService {
                 || !declared.equals(digestService.sha256(normalizedPrompt)))) {
             issues.add(error("/systemPrompt/declaredSha256", "DIGEST_MISMATCH", "Declared prompt digest does not match"));
         }
-        validateTools(manifest.path("tools"), issues);
+        validateTools(manifest.path("tools"), currentCatalog, issues);
         if (!manifest.path("ragSources").isArray()) {
             issues.add(error("/ragSources", "TYPE", "ragSources must be an array"));
         } else {
@@ -216,7 +218,24 @@ public class ManifestValidationService {
         return new ValidationResult(issues.stream().noneMatch(issue -> issue.severity() == Severity.ERROR), issues);
     }
 
-    private void validateTools(JsonNode tools, List<Issue> issues) {
+    private void validateServerCatalog(JsonNode manifest, boolean currentCatalog, List<Issue> issues) {
+        if (!currentCatalog) {
+            if (manifest.has("serverToolCatalog")) {
+                issues.add(error("/serverToolCatalog", "SCHEMA_VERSION", "Server catalog requires Manifest 1.1"));
+            }
+            return;
+        }
+        try {
+            if (!LoanReviewToolCatalog.matchesServerCatalog(manifest.path("serverToolCatalog"))) {
+                issues.add(error("/serverToolCatalog", "SERVER_CATALOG_MISMATCH",
+                        "Manifest 1.1 requires the exact versioned, non-executable server catalog"));
+            }
+        } catch (IllegalArgumentException exception) {
+            issues.add(error("/serverToolCatalog", "SERVER_CATALOG_MISMATCH", "Invalid server catalog"));
+        }
+    }
+
+    private void validateTools(JsonNode tools, boolean currentCatalog, List<Issue> issues) {
         if (!tools.isArray() || tools.isEmpty() || tools.size() > 50) {
             issues.add(error("/tools", "SIZE", "tools must contain 1 to 50 entries"));
             return;
@@ -290,6 +309,15 @@ public class ManifestValidationService {
                         "NORMAL_TOOL_SCOPE",
                         "Only the server-registered normal Release tools may be declared"
                 ));
+            } else if (currentCatalog) {
+                try {
+                    if (!LoanReviewToolCatalog.matchesNormalTool(tool)) {
+                        issues.add(error(prefix, "TOOL_CONTRACT_MISMATCH",
+                                "Manifest 1.1 Tool definition must match the versioned server schema and metadata"));
+                    }
+                } catch (IllegalArgumentException exception) {
+                    issues.add(error(prefix, "TOOL_CONTRACT_MISMATCH", "Invalid Tool definition"));
+                }
             } else if (!contract.matches(
                     toolVersion,
                     text(tool, "/operation"),

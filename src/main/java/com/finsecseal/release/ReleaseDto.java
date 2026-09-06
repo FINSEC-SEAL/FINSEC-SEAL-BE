@@ -62,6 +62,18 @@ public final class ReleaseDto {
     public record ValidationResponse(boolean valid, List<ManifestValidationService.Issue> issues) {
     }
 
+    /** Verified source data for C's adapter; this response grants no execution permission. */
+    public record ToolCatalogResponse(
+            UUID releaseId,
+            String manifestSchemaVersion,
+            String agentArtifactFingerprint,
+            String releaseFingerprint,
+            String serverToolCatalogHash,
+            JsonNode tools,
+            JsonNode serverToolCatalog
+    ) {
+    }
+
     public record DiffItem(
             String component,
             List<String> jsonPointers,
