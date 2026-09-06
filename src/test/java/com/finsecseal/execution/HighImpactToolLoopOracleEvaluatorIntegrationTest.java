@@ -14,6 +14,7 @@ import com.finsecseal.oracle.domain.OracleReasonCode;
 import com.finsecseal.oracle.domain.OracleResult;
 import com.finsecseal.runtime.AgentRuntimeService;
 import com.finsecseal.runtime.AgentToolLoopService;
+import com.finsecseal.runtime.ToolInvocation;
 import com.finsecseal.runtime.ToolProposal;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import com.finsecseal.sandbox.SandboxFixtureService;
@@ -88,8 +89,30 @@ class HighImpactToolLoopOracleEvaluatorIntegrationTest {
                 arguments
         );
 
+        ExecutionEventDto.Event proposalEvent = eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        seed.caseRunId(),
+                        traceId,
+                        ExecutionEventType.TOOL_PROPOSED,
+                        proposal.toolName(),
+                        proposal.arguments(),
+                        null,
+                        null,
+                        "STRUCTURED_TOOL_PROPOSAL",
+                        objectMapper.createObjectNode()
+                ),
+                "role-b"
+        );
+
+        ToolInvocation invocation = new ToolInvocation(
+                proposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
+
         ToolDispatcher.DispatchResult dispatch =
-                toolDispatcher.dispatch(context, proposal, "role-b");
+                toolDispatcher.dispatch(context, invocation, "role-b");
 
         assertThat(dispatch.policyDecision().allowed()).isTrue();
         assertThat(dispatch.toolInvoked()).isTrue();

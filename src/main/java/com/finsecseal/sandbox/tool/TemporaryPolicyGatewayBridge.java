@@ -100,6 +100,15 @@ public final class TemporaryPolicyGatewayBridge implements PolicyGateway {
         requireBaselineMode(context);
 
         ToolAdapter adapter = requireAdapter(proposal.toolName());
+
+        if (adapter.effect() == ToolEffect.STATE_CHANGING
+                && invocation == null) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "State-changing Tool requires Spring-owned invocation identity"
+            );
+        }
+
         ToolExecutionPolicy policy = requirePolicy(context);
         ToolExecutionPolicy.PolicyDecision legacyDecision =
                 policy.evaluate(context, proposal);

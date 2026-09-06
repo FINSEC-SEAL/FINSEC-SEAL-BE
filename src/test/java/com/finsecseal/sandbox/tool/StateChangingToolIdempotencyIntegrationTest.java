@@ -854,6 +854,179 @@ class StateChangingToolIdempotencyIntegrationTest {
                 .isEqualTo(3);
     }
 
+    @Test
+    void bareLoanDecisionUpdateFailsClosedBeforePolicyOrMutation() {
+        Seed seed = seedRunWithSandbox();
+        UUID traceId = UUID.randomUUID();
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(), seed.caseRunId(), traceId,
+                TestRunMode.BASELINE, "CASE-1001", "CUST-1001"
+        );
+
+        eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        null, traceId, ExecutionEventType.RUN_STARTED,
+                        null, null, null, null, "RUN_STARTED",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ObjectNode arguments = objectMapper.createObjectNode();
+        arguments.put("caseId", "CASE-1001");
+        arguments.put("decision", "APPROVED");
+
+        ToolProposal proposal = new ToolProposal(
+                LoanDecisionUpdateMockToolAdapter.TOOL_NAME,
+                arguments
+        );
+
+        assertThatThrownBy(() ->
+                dispatcher.dispatch(context, proposal, ACTOR)
+        ).isInstanceOfSatisfying(
+                BusinessException.class,
+                exception -> assertThat(exception.errorCode())
+                        .isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE)
+        );
+
+        Long rowVersion = jdbcTemplate.queryForObject(
+                """
+                select row_version
+                  from sandbox_loan_decisions
+                 where namespace_id = ?
+                   and case_key = 'CASE-1001'
+                """,
+                Long.class,
+                seed.runId()
+        );
+        assertThat(rowVersion).isZero();
+
+        Integer receiptCount = jdbcTemplate.queryForObject(
+                """
+                select count(*)
+                  from sandbox_tool_idempotency_records
+                 where test_case_run_id = ?
+                """,
+                Integer.class,
+                seed.caseRunId()
+        );
+        assertThat(receiptCount).isZero();
+
+        assertEventCount(seed.runId(), seed.caseRunId(),
+                ExecutionEventType.POLICY_EVALUATED, 0);
+        assertEventCount(seed.runId(), seed.caseRunId(),
+                ExecutionEventType.TOOL_REQUEST, 0);
+        assertEventCount(seed.runId(), seed.caseRunId(),
+                ExecutionEventType.TOOL_RESPONSE, 0);
+        assertEventCount(seed.runId(), seed.caseRunId(),
+                ExecutionEventType.SANDBOX_STATE_CHANGED, 0);
+    }
+
+    @Test
+    void bareExternalHttpFailsClosedWithoutCollectorSideEffect() {
+        Seed seed = seedRunWithSandbox();
+        UUID traceId = UUID.randomUUID();
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(), seed.caseRunId(), traceId,
+                TestRunMode.BASELINE, "CASE-1001", "CUST-1001"
+        );
+
+        eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        null, traceId, ExecutionEventType.RUN_STARTED,
+                        null, null, null, null, "RUN_STARTED",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ObjectNode arguments = objectMapper.createObjectNode();
+        arguments.put("url", ExternalHttpMockToolAdapter.MOCK_COLLECTOR_URL);
+        arguments.putObject("body").put("message", "safe");
+
+        ToolProposal proposal = new ToolProposal(
+                ExternalHttpMockToolAdapter.TOOL_NAME,
+                arguments
+        );
+
+        assertThatThrownBy(() ->
+                dispatcher.dispatch(context, proposal, ACTOR)
+        ).isInstanceOfSatisfying(
+                BusinessException.class,
+                exception -> assertThat(exception.errorCode())
+                        .isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE)
+        );
+
+        Integer collectorRows = jdbcTemplate.queryForObject(
+                """
+                select count(*)
+                  from sandbox_exfil_events
+                 where namespace_id = ?
+                   and test_case_run_id = ?
+                """,
+                Integer.class,
+                seed.runId(),
+                seed.caseRunId()
+        );
+        assertThat(collectorRows).isZero();
+
+        assertEventCount(seed.runId(), seed.caseRunId(),
+                ExecutionEventType.POLICY_EVALUATED, 0);
+        assertEventCount(seed.runId(), seed.caseRunId(),
+                ExecutionEventType.TOOL_REQUEST, 0);
+    }
+
+    @Test
+    void bareReadOnlyCustomerDataReadKeepsCompatibility() {
+        Seed seed = seedRunWithSandbox();
+        UUID traceId = UUID.randomUUID();
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(), seed.caseRunId(), traceId,
+                TestRunMode.BASELINE, "CASE-1001", "CUST-1001"
+        );
+
+        eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        null, traceId, ExecutionEventType.RUN_STARTED,
+                        null, null, null, null, "RUN_STARTED",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ObjectNode arguments = objectMapper.createObjectNode();
+        arguments.putArray("customerIds").add("CUST-1001");
+        arguments.putArray("fields").add("incomeBand");
+
+        ToolDispatcher.DispatchResult dispatch = dispatcher.dispatch(
+                context,
+                new ToolProposal(CustomerDataReadToolAdapter.TOOL_NAME, arguments),
+                ACTOR
+        );
+
+        assertThat(dispatch.policyDecision().allowed()).isTrue();
+        assertThat(dispatch.toolInvoked()).isTrue();
+        assertThat(dispatch.execution()).isNotNull();
+        assertThat(dispatch.execution().stateChanged()).isFalse();
+
+        Integer receiptCount = jdbcTemplate.queryForObject(
+                """
+                select count(*)
+                  from sandbox_tool_idempotency_records
+                 where test_case_run_id = ?
+                """,
+                Integer.class,
+                seed.caseRunId()
+        );
+        assertThat(receiptCount).isZero();
+    }
+
     private StateChangingToolExecutionService executor() {
         try {
             Constructor<?> noArg = Arrays.stream(
