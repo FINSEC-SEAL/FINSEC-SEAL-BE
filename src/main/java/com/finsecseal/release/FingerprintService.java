@@ -36,6 +36,10 @@ public class FingerprintService {
         components.put("workflowHash", hash(normalized.path("businessWorkflow")));
         components.put("humanBoundaryHash", hash(normalized.path("humanApprovalBoundaries")));
         components.put("runtimeContextHash", hash(normalized.path("runtimeContextRequirements")));
+        // Keep v1.0 fingerprints byte-for-byte stable; only new snapshots add this component.
+        if (normalized.has("serverToolCatalog")) {
+            components.put("serverToolCatalogHash", hash(normalized.path("serverToolCatalog")));
+        }
 
         ObjectNode agentInput = objectMapper.createObjectNode();
         agentInput.put("fingerprintVersion", "finsec-agent-artifact/v1");

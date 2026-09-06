@@ -44,6 +44,11 @@
 - transaction rollback 후 메인 pool과 분리된 전용 2-connection audit pool에서 동기 commit하는
   system prompt plaintext 접근 audit(인메모리 queue 미사용)
 
+Manifest 1.1 추가: 내부 DOCUMENT_READER trust, 실제 고객 필드 schema,
+non-executable high-impact server catalog와 fingerprint/artifact, 검증된 catalog 조회 API를 제공한다.
+기존 1.0 정의와 hash는 보존한다. C integration adapter 및 Gateway 판단은 C 소유다.
+등록 fixture와 인계 절차는 [A_MANIFEST_CONTRACT_HANDOFF.md](A_MANIFEST_CONTRACT_HANDOFF.md)를 따른다.
+
 ### G3 — TestRun, Trace, Evidence and Audit delivery
 
 - TestRun/TestCaseRun 저장 및 상태 전이 API(실행·판정 계산은 미포함)

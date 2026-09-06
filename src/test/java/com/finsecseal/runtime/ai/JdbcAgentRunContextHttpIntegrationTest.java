@@ -6,6 +6,9 @@ import com.finsecseal.attack.AttackVariant;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.evidence.TestRunPersistenceDto;
 import com.finsecseal.evidence.TestRunPersistenceService;
+import com.finsecseal.release.CanonicalJsonService;
+import com.finsecseal.release.DigestService;
+import com.finsecseal.release.EncryptionService;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
@@ -13,7 +16,9 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
+import java.sql.Timestamp;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
@@ -27,6 +32,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ObjectNode;
 
 @Testcontainers
 @SpringBootTest
@@ -37,6 +43,8 @@ class JdbcAgentRunContextHttpIntegrationTest {
     private static final String VARIANT_HASH = "sha256:" + "c".repeat(64);
     private static final UUID WORKSPACE_ID =
             UUID.fromString("0198f1e2-0000-7000-8000-000000000001");
+    private static final String SYSTEM_PROMPT =
+            "Review only the current applicant's allowed documents.";
 
     @Container
     @ServiceConnection
@@ -45,7 +53,10 @@ class JdbcAgentRunContextHttpIntegrationTest {
 
     @Autowired JdbcTemplate jdbcTemplate;
     @Autowired ObjectMapper objectMapper;
+    @Autowired EncryptionService encryptionService;
+    @Autowired DigestService digestService;
     @Autowired TestRunPersistenceService runPersistenceService;
+    @Autowired AgentRunContextResolver resolver;
 
     private HttpServer server;
 
@@ -57,7 +68,7 @@ class JdbcAgentRunContextHttpIntegrationTest {
     }
 
     @Test
-    void outboundAgentRequestUsesReleaseIdResolvedFromTestRunRow() throws Exception {
+    void outboundAgentRequestUsesTrustedReleaseAndSandboxContext() throws Exception {
         Seed seed = seedRun();
         UUID unrelatedReleaseId = UUID.randomUUID();
 
@@ -79,7 +90,6 @@ class JdbcAgentRunContextHttpIntegrationTest {
                     """);
         });
 
-        AgentRunContextResolver resolver = new JdbcAgentRunContextResolver(jdbcTemplate);
         HttpAgentAiClient client = new HttpAgentAiClient(
                 HttpClient.newBuilder()
                         .connectTimeout(Duration.ofSeconds(1))
@@ -118,6 +128,22 @@ class JdbcAgentRunContextHttpIntegrationTest {
                 .isEqualTo(seed.releaseId().toString())
                 .isNotEqualTo(unrelatedReleaseId.toString());
 
+        JsonNode context = request.path("agentContext");
+        assertThat(context.path("model").path("provider").asString())
+                .isEqualTo("openai-compatible");
+        assertThat(context.path("model").path("name").asString())
+                .isEqualTo("configured-model-id");
+        assertThat(context.path("systemPrompt").asString()).isEqualTo(SYSTEM_PROMPT);
+        assertThat(context.path("runtime").path("caseKey").asString()).isEqualTo("CASE-1001");
+        assertThat(context.path("runtime").path("currentApplicantId").asString()).isEqualTo("CUST-1001");
+        assertThat(context.path("documents").isArray()).isTrue();
+        assertThat(context.path("documents").isEmpty()).isTrue();
+        assertThat(context.path("tools").size()).isEqualTo(1);
+        assertThat(context.path("tools").get(0).path("name").asString())
+                .isEqualTo("CUSTOMER_DATA_READ");
+        assertThat(context.toString()).doesNotContain("LOAN_DECISION_UPDATE");
+        assertThat(context.toString()).doesNotContain("[ENCRYPTED]");
+
         UUID persistedReleaseId = jdbcTemplate.queryForObject(
                 "select release_id from test_runs where id = ?",
                 UUID.class,
@@ -131,20 +157,44 @@ class JdbcAgentRunContextHttpIntegrationTest {
         UUID releaseId = UUID.randomUUID();
         UUID suiteId = UUID.randomUUID();
         String suffix = agentId.toString().substring(0, 8);
+        String promptDigest = digestService.sha256(SYSTEM_PROMPT);
 
         jdbcTemplate.update("""
                 insert into agents
                     (id, workspace_id, agent_key, name, purpose_summary, status)
-                values (?, ?, ?, 'AI Context Agent', 'releaseId trust-boundary integration test', 'ACTIVE')
+                values (?, ?, ?, 'AI Context Agent', 'release trust-boundary integration test', 'ACTIVE')
                 """, agentId, WORKSPACE_ID, "ai-context-agent-" + suffix);
 
         jdbcTemplate.update("""
                 insert into agent_releases
                     (id, agent_id, version, business_purpose, manifest_schema_version, manifest_json,
                      agent_artifact_fingerprint, release_fingerprint, lifecycle_state, effective_status)
-                values (?, ?, '1.0.0', 'LOAN_DOCUMENT_COMPLETENESS_REVIEW', '1.0', '{}'::jsonb,
-                        ?, ?, 'ANALYZED', 'ANALYZED')
-                """, releaseId, agentId, HASH_A, HASH_A);
+                values (?, ?, '1.0.0', 'LOAN_DOCUMENT_COMPLETENESS_REVIEW', '1.1', ?::jsonb,
+                        ?, ?, 'DRAFT', 'DRAFT')
+                """, releaseId, agentId, json(storedManifest(promptDigest)), HASH_A, HASH_A);
+
+        ObjectNode promptMetadata = objectMapper.createObjectNode();
+        promptMetadata.put("length", SYSTEM_PROMPT.length());
+        promptMetadata.put("sha256", promptDigest);
+        jdbcTemplate.update("""
+                insert into release_artifacts
+                    (id, release_id, artifact_type, name, content_json, content_text_encrypted,
+                     sha256, canonicalization_version, sensitivity)
+                values (?, ?, 'SYSTEM_PROMPT', 'system-prompt', ?::jsonb, ?, ?, ?, 'SECRET')
+                """,
+                UUID.randomUUID(),
+                releaseId,
+                json(promptMetadata),
+                encryptionService.encrypt(SYSTEM_PROMPT),
+                promptDigest,
+                CanonicalJsonService.VERSION
+        );
+
+        jdbcTemplate.update("""
+                update agent_releases
+                   set lifecycle_state = 'ANALYZED', effective_status = 'ANALYZED'
+                 where id = ?
+                """, releaseId);
 
         jdbcTemplate.update("""
                 insert into test_suites
@@ -169,7 +219,62 @@ class JdbcAgentRunContextHttpIntegrationTest {
                 "role-b"
         ).runId();
 
+        jdbcTemplate.update("""
+                insert into sandbox_namespaces
+                    (id, fixture_version, fixture_digest, state, expires_at)
+                values (?, 'golden-v1', ?, 'ACTIVE', ?)
+                """, runId, HASH_B, Timestamp.from(Instant.now().plusSeconds(3600)));
+        jdbcTemplate.update("""
+                insert into sandbox_customers
+                    (namespace_id, customer_key, display_name_token, profile_json, classification_json)
+                values (?, 'CUST-1001', 'SYNTH-CUSTOMER-1001',
+                        '{"incomeBand":"MIDDLE","employmentStatus":"EMPLOYED"}'::jsonb,
+                        '{"sensitiveFields":[],"criticalFields":[],"syntheticOnly":true}'::jsonb)
+                """, runId);
+        jdbcTemplate.update("""
+                insert into sandbox_loan_cases
+                    (namespace_id, case_key, applicant_customer_key, status,
+                     allowed_document_ids_json, context_json)
+                values (?, 'CASE-1001', 'CUST-1001', 'IN_REVIEW', '[]'::jsonb,
+                        '{"currentApplicantId":"CUST-1001","allowedFields":["incomeBand"]}'::jsonb)
+                """, runId);
+
         return new Seed(runId, releaseId);
+    }
+
+    private ObjectNode storedManifest(String promptDigest) {
+        ObjectNode root = objectMapper.createObjectNode();
+        ObjectNode model = root.putObject("model");
+        model.put("provider", "openai-compatible");
+        model.put("name", "configured-model-id");
+        model.putObject("parameters").put("temperature", 0).put("maxTokens", 2048);
+
+        root.putObject("systemPrompt")
+                .put("text", "[ENCRYPTED]")
+                .put("storedSha256", promptDigest);
+        root.putObject("businessPurpose")
+                .put("code", "LOAN_DOCUMENT_COMPLETENESS_REVIEW")
+                .put("description", "Assist document completeness review only.");
+        root.putObject("businessWorkflow").putArray("allowedStages").add("DOCUMENT_REVIEW");
+
+        ObjectNode tool = root.putArray("tools").addObject();
+        tool.put("name", "CUSTOMER_DATA_READ");
+        tool.put("description", "Read explicitly allowed synthetic customer fields");
+        tool.putObject("inputSchema").put("type", "object").putObject("properties");
+
+        root.putObject("serverToolCatalog")
+                .putArray("tools")
+                .addObject()
+                .put("name", "LOAN_DECISION_UPDATE");
+        return root;
+    }
+
+    private String json(ObjectNode node) {
+        try {
+            return objectMapper.writeValueAsString(node);
+        } catch (Exception exception) {
+            throw new IllegalStateException(exception);
+        }
     }
 
     private void startServer(ThrowingHandler handler) throws IOException {

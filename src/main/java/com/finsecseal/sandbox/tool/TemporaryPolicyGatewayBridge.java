@@ -6,11 +6,13 @@ import com.finsecseal.common.domain.ExecutionEventType;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.evidence.ExecutionEventDto;
 import com.finsecseal.evidence.ExecutionEventService;
+import com.finsecseal.runtime.ToolInvocation;
 import com.finsecseal.runtime.ToolProposal;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
@@ -22,6 +24,7 @@ public final class TemporaryPolicyGatewayBridge implements PolicyGateway {
     private final List<ToolExecutionPolicy> policies;
     private final ExecutionEventService eventService;
     private final ObjectMapper objectMapper;
+    private final StateChangingToolExecutionService stateChangingToolExecutionService;
 
     public TemporaryPolicyGatewayBridge(
             List<ToolAdapter> adapters,
@@ -29,10 +32,49 @@ public final class TemporaryPolicyGatewayBridge implements PolicyGateway {
             ExecutionEventService eventService,
             ObjectMapper objectMapper
     ) {
+        this(
+                adapters,
+                policies,
+                eventService,
+                objectMapper,
+                null
+        );
+    }
+
+    @Autowired
+    public TemporaryPolicyGatewayBridge(
+            List<ToolAdapter> adapters,
+            List<ToolExecutionPolicy> policies,
+            ExecutionEventService eventService,
+            ObjectMapper objectMapper,
+            StateChangingToolExecutionService stateChangingToolExecutionService
+    ) {
         this.adapters = indexAdapters(adapters);
         this.policies = List.copyOf(policies);
         this.eventService = eventService;
         this.objectMapper = objectMapper;
+        this.stateChangingToolExecutionService =
+                stateChangingToolExecutionService;
+    }
+
+    @Override
+    public GatewayResult invoke(
+            SandboxExecutionContext context,
+            ToolInvocation invocation,
+            String actorId
+    ) {
+        if (invocation == null) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Policy Gateway requires Spring-owned Tool invocation identity"
+            );
+        }
+        return invokeInternal(
+                context,
+                invocation.proposal(),
+                invocation,
+                actorId
+        );
     }
 
     @Override
@@ -41,9 +83,32 @@ public final class TemporaryPolicyGatewayBridge implements PolicyGateway {
             ToolProposal proposal,
             String actorId
     ) {
+        return invokeInternal(
+                context,
+                proposal,
+                null,
+                actorId
+        );
+    }
+
+    private GatewayResult invokeInternal(
+            SandboxExecutionContext context,
+            ToolProposal proposal,
+            ToolInvocation invocation,
+            String actorId
+    ) {
         requireBaselineMode(context);
 
         ToolAdapter adapter = requireAdapter(proposal.toolName());
+
+        if (adapter.effect() == ToolEffect.STATE_CHANGING
+                && invocation == null) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "State-changing Tool requires Spring-owned invocation identity"
+            );
+        }
+
         ToolExecutionPolicy policy = requirePolicy(context);
         ToolExecutionPolicy.PolicyDecision legacyDecision =
                 policy.evaluate(context, proposal);
@@ -81,6 +146,32 @@ public final class TemporaryPolicyGatewayBridge implements PolicyGateway {
                     null,
                     null,
                     null
+            );
+        }
+
+        if (invocation != null
+                && adapter.effect() == ToolEffect.STATE_CHANGING) {
+            if (stateChangingToolExecutionService == null) {
+                throw new BusinessException(
+                        ErrorCode.CONFIGURATION_ERROR,
+                        "State-changing Tool invocation requires the common idempotent executor"
+                );
+            }
+
+            StateChangingToolExecutionService.Execution execution =
+                    stateChangingToolExecutionService.execute(
+                            context,
+                            invocation,
+                            adapter,
+                            actorId
+                    );
+
+            return new GatewayResult(
+                    decision,
+                    policyEvent,
+                    execution.requestEvent(),
+                    execution.responseEvent(),
+                    execution.result()
             );
         }
 
