@@ -233,7 +233,17 @@ public final class EnforcePolicyPostCallFacts {
         return value == null ? null : value.deepCopy();
     }
 
-    public record CatalogOutputField(String fieldName, Sensitivity classification) {
+    /** Exact scalar type resolved from the authoritative catalog, never inferred from output. */
+    public enum OutputValueType {
+        STRING,
+        INTEGER
+    }
+
+    public record CatalogOutputField(
+            String fieldName,
+            Sensitivity classification,
+            OutputValueType valueType
+    ) {
 
         public CatalogOutputField {
             fieldName = requireNonBlank(fieldName, "catalog output field name");
@@ -241,6 +251,7 @@ public final class EnforcePolicyPostCallFacts {
                     classification,
                     "catalog output field classification must not be null"
             );
+            Objects.requireNonNull(valueType, "catalog output field type must not be null");
         }
     }
 }

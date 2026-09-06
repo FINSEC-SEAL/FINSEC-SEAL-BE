@@ -12,8 +12,11 @@ import static com.finsecseal.policy.EnforcePolicyPostCallDecision.PostCallCheck.
 import com.finsecseal.common.domain.Sensitivity;
 import com.finsecseal.policy.EnforcePolicyPostCallDecision.OperationalReason;
 import com.finsecseal.policy.EnforcePolicyPostCallDecision.PostCallCheck;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.CatalogOutputField;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.OutputValueType;
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -48,7 +51,7 @@ public final class EnforcePolicyPostCallResponseGuard {
         List<PostCallCheck> evaluated = new ArrayList<>();
 
         evaluated.add(OUTPUT_SCHEMA);
-        if (!hasValidOutputSchema(response, facts.catalogClassifications().keySet())) {
+        if (!hasValidOutputSchema(response, facts.catalogOutputFields())) {
             return quarantine(OUTPUT_SCHEMA, ADAPTER_CONTRACT_FAILURE, evaluated);
         }
 
@@ -101,7 +104,7 @@ public final class EnforcePolicyPostCallResponseGuard {
 
     private static boolean hasValidOutputSchema(
             JsonNode response,
-            Set<String> catalogFields
+            List<CatalogOutputField> catalogFields
     ) {
         if (!hasExactObjectFields(response, RESPONSE_FIELDS)) {
             return false;
@@ -117,6 +120,11 @@ public final class EnforcePolicyPostCallResponseGuard {
         JsonNode rows = response.get("rows");
         if (rows == null || !rows.isArray()) {
             return false;
+        }
+
+        Map<String, OutputValueType> valueTypes = new HashMap<>();
+        for (CatalogOutputField field : catalogFields) {
+            valueTypes.put(field.fieldName(), field.valueType());
         }
 
         for (JsonNode row : rows) {
@@ -135,12 +143,23 @@ public final class EnforcePolicyPostCallResponseGuard {
             }
 
             for (Map.Entry<String, JsonNode> field : fields.properties()) {
-                if (field.getKey().isBlank() || !catalogFields.contains(field.getKey())) {
+                OutputValueType expectedType = valueTypes.get(field.getKey());
+                if (expectedType == null || !hasExpectedType(field.getValue(), expectedType)) {
                     return false;
                 }
             }
         }
         return true;
+    }
+
+    private static boolean hasExpectedType(JsonNode value, OutputValueType expectedType) {
+        if (value == null) {
+            return false;
+        }
+        return switch (expectedType) {
+            case STRING -> value.isString();
+            case INTEGER -> value.isIntegralNumber();
+        };
     }
 
     private static boolean hasExactClassifications(
