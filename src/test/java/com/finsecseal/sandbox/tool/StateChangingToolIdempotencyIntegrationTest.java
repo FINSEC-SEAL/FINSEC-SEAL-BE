@@ -70,6 +70,9 @@ class StateChangingToolIdempotencyIntegrationTest {
     @Autowired
     StateChangingToolExecutionService transactionalExecutor;
 
+    @Autowired
+    ToolDispatcher dispatcher;
+
     @Test
     void sameCaseRunAndToolCallMutatesLoanDecisionExactlyOnce() {
         Seed seed = seedRunWithSandbox();
@@ -687,6 +690,168 @@ class StateChangingToolIdempotencyIntegrationTest {
                                 + " must carry canonical metadata.toolCallId"
                 )
                 .isEqualTo(expectedToolCallId.toString());
+    }
+
+    @Test
+    void dispatcherRoutesStateChangingInvocationThroughIdempotentExecutor() {
+        Seed seed = seedRunWithSandbox();
+        UUID traceId = UUID.randomUUID();
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(),
+                seed.caseRunId(),
+                traceId,
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        null,
+                        traceId,
+                        ExecutionEventType.RUN_STARTED,
+                        null,
+                        null,
+                        null,
+                        null,
+                        "RUN_STARTED",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ObjectNode arguments = objectMapper.createObjectNode();
+        arguments.put("caseId", "CASE-1001");
+        arguments.put("decision", "APPROVED");
+
+        ToolProposal proposal = new ToolProposal(
+                LoanDecisionUpdateMockToolAdapter.TOOL_NAME,
+                arguments
+        );
+
+        ExecutionEventDto.Event proposalEvent = eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        seed.caseRunId(),
+                        traceId,
+                        ExecutionEventType.TOOL_PROPOSED,
+                        proposal.toolName(),
+                        proposal.arguments(),
+                        null,
+                        null,
+                        "STRUCTURED_TOOL_PROPOSAL",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ToolInvocation invocation = new ToolInvocation(
+                proposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
+
+        ToolDispatcher.DispatchResult first =
+                dispatcher.dispatch(
+                        context,
+                        invocation,
+                        ACTOR
+                );
+
+        ToolDispatcher.DispatchResult second =
+                dispatcher.dispatch(
+                        context,
+                        invocation,
+                        ACTOR
+                );
+
+        Long rowVersion = jdbcTemplate.queryForObject("""
+                select row_version
+                  from sandbox_loan_decisions
+                 where namespace_id = ?
+                   and case_key = 'CASE-1001'
+                """, Long.class, seed.runId());
+
+        assertThat(rowVersion)
+                .as(
+                        "dispatcher must not bypass state-changing "
+                                + "Tool idempotency"
+                )
+                .isEqualTo(1L);
+
+        Integer receiptCount = jdbcTemplate.queryForObject("""
+                select count(*)
+                  from sandbox_tool_idempotency_records
+                 where test_case_run_id = ?
+                   and tool_call_id = ?
+                """,
+                Integer.class,
+                seed.caseRunId(),
+                invocation.toolCallId()
+        );
+
+        assertThat(receiptCount)
+                .as(
+                        "dispatcher path must create the common "
+                                + "state-changing idempotency receipt"
+                )
+                .isEqualTo(1);
+
+        assertThat(first.responseEvent()).isNotNull();
+        assertThat(second.responseEvent()).isNotNull();
+
+        assertThat(second.responseEvent().eventId())
+                .as(
+                        "duplicate dispatcher invocation must replay "
+                                + "the original TOOL_RESPONSE evidence"
+                )
+                .isEqualTo(first.responseEvent().eventId());
+
+        assertEventCount(
+                seed.runId(),
+                seed.caseRunId(),
+                ExecutionEventType.TOOL_REQUEST,
+                1
+        );
+        assertEventCount(
+                seed.runId(),
+                seed.caseRunId(),
+                ExecutionEventType.TOOL_RESPONSE,
+                1
+        );
+        assertEventCount(
+                seed.runId(),
+                seed.caseRunId(),
+                ExecutionEventType.SANDBOX_STATE_CHANGED,
+                1
+        );
+
+        Integer correlatedEventCount = jdbcTemplate.queryForObject("""
+                select count(*)
+                  from execution_events
+                 where run_id = ?
+                   and test_case_run_id = ?
+                   and event_type in (
+                       'TOOL_REQUEST',
+                       'TOOL_RESPONSE',
+                       'SANDBOX_STATE_CHANGED'
+                   )
+                   and metadata_json ->> 'toolCallId' = ?
+                """,
+                Integer.class,
+                seed.runId(),
+                seed.caseRunId(),
+                invocation.toolCallId().toString()
+        );
+
+        assertThat(correlatedEventCount)
+                .as(
+                        "all state-changing execution evidence must "
+                                + "preserve canonical toolCallId"
+                )
+                .isEqualTo(3);
     }
 
     private StateChangingToolExecutionService executor() {
