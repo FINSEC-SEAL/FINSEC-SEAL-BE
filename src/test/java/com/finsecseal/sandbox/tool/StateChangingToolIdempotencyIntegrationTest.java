@@ -18,6 +18,11 @@ import com.finsecseal.sandbox.SandboxFixtureService;
 import java.lang.reflect.Constructor;
 import java.util.Arrays;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -61,6 +66,9 @@ class StateChangingToolIdempotencyIntegrationTest {
 
     @Autowired
     LoanDecisionUpdateMockToolAdapter adapter;
+
+    @Autowired
+    StateChangingToolExecutionService transactionalExecutor;
 
     @Test
     void sameCaseRunAndToolCallMutatesLoanDecisionExactlyOnce() {
@@ -336,6 +344,238 @@ class StateChangingToolIdempotencyIntegrationTest {
         assertThat(receiptCount).isEqualTo(1);
     }
 
+    @Test
+    void concurrentSameToolCallIdMutatesExactlyOnceAndReplaysTheLoser()
+            throws Exception {
+        Seed seed = seedRunWithSandbox();
+        UUID traceId = UUID.randomUUID();
+
+        SandboxExecutionContext context = new SandboxExecutionContext(
+                seed.runId(),
+                seed.caseRunId(),
+                traceId,
+                TestRunMode.BASELINE,
+                "CASE-1001",
+                "CUST-1001"
+        );
+
+        eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        null,
+                        traceId,
+                        ExecutionEventType.RUN_STARTED,
+                        null,
+                        null,
+                        null,
+                        null,
+                        "RUN_STARTED",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ObjectNode arguments = objectMapper.createObjectNode();
+        arguments.put("caseId", "CASE-1001");
+        arguments.put("decision", "APPROVED");
+
+        ToolProposal proposal = new ToolProposal(
+                LoanDecisionUpdateMockToolAdapter.TOOL_NAME,
+                arguments
+        );
+
+        ExecutionEventDto.Event proposalEvent = eventService.append(
+                seed.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        seed.caseRunId(),
+                        traceId,
+                        ExecutionEventType.TOOL_PROPOSED,
+                        proposal.toolName(),
+                        proposal.arguments(),
+                        null,
+                        null,
+                        "STRUCTURED_TOOL_PROPOSAL",
+                        objectMapper.createObjectNode()
+                ),
+                ACTOR
+        );
+
+        ToolInvocation invocation = new ToolInvocation(
+                proposal,
+                proposalEvent.eventId(),
+                proposalEvent.payloadDigest()
+        );
+
+        BlockingToolAdapter blockingAdapter =
+                new BlockingToolAdapter(adapter);
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        try {
+            Future<ExecutionOutcome> first = pool.submit(() ->
+                    captureExecution(
+                            context,
+                            invocation,
+                            blockingAdapter
+                    )
+            );
+
+            assertThat(
+                    blockingAdapter.awaitEntered(
+                            5,
+                            TimeUnit.SECONDS
+                    )
+            )
+                    .as("first invocation must reach the adapter")
+                    .isTrue();
+
+            Future<ExecutionOutcome> second = pool.submit(() ->
+                    captureExecution(
+                            context,
+                            invocation,
+                            blockingAdapter
+                    )
+            );
+
+            assertThat(awaitBlockedDuplicateReservation())
+                    .as(
+                            "second invocation must overlap the first "
+                                    + "at the idempotency reservation"
+                    )
+                    .isTrue();
+
+            blockingAdapter.release();
+
+            ExecutionOutcome firstOutcome =
+                    first.get(10, TimeUnit.SECONDS);
+            ExecutionOutcome secondOutcome =
+                    second.get(10, TimeUnit.SECONDS);
+
+            assertThat(firstOutcome.error())
+                    .as("winning invocation must complete normally")
+                    .isNull();
+
+            assertThat(secondOutcome.error())
+                    .as(
+                            "concurrent duplicate must resolve through "
+                                    + "idempotency replay, not leak a raw "
+                                    + "database uniqueness failure"
+                    )
+                    .isNull();
+
+            assertThat(firstOutcome.execution()).isNotNull();
+            assertThat(secondOutcome.execution()).isNotNull();
+
+            assertThat(firstOutcome.execution().replayed())
+                    .isFalse();
+            assertThat(secondOutcome.execution().replayed())
+                    .isTrue();
+
+            assertThat(
+                    secondOutcome.execution()
+                            .responseEvent()
+                            .eventId()
+            ).isEqualTo(
+                    firstOutcome.execution()
+                            .responseEvent()
+                            .eventId()
+            );
+
+            Long rowVersion = jdbcTemplate.queryForObject("""
+                    select row_version
+                      from sandbox_loan_decisions
+                     where namespace_id = ?
+                       and case_key = 'CASE-1001'
+                    """, Long.class, seed.runId());
+
+            assertThat(rowVersion).isEqualTo(1L);
+
+            Integer receiptCount = jdbcTemplate.queryForObject("""
+                    select count(*)
+                      from sandbox_tool_idempotency_records
+                     where test_case_run_id = ?
+                       and tool_call_id = ?
+                    """,
+                    Integer.class,
+                    seed.caseRunId(),
+                    invocation.toolCallId()
+            );
+
+            assertThat(receiptCount).isEqualTo(1);
+
+            assertEventCount(
+                    seed.runId(),
+                    seed.caseRunId(),
+                    ExecutionEventType.TOOL_REQUEST,
+                    1
+            );
+            assertEventCount(
+                    seed.runId(),
+                    seed.caseRunId(),
+                    ExecutionEventType.TOOL_RESPONSE,
+                    1
+            );
+            assertEventCount(
+                    seed.runId(),
+                    seed.caseRunId(),
+                    ExecutionEventType.SANDBOX_STATE_CHANGED,
+                    1
+            );
+        } finally {
+            blockingAdapter.release();
+            pool.shutdownNow();
+            pool.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private ExecutionOutcome captureExecution(
+            SandboxExecutionContext context,
+            ToolInvocation invocation,
+            ToolAdapter adapter
+    ) {
+        try {
+            return new ExecutionOutcome(
+                    transactionalExecutor.execute(
+                            context,
+                            invocation,
+                            adapter,
+                            ACTOR
+                    ),
+                    null
+            );
+        } catch (Throwable throwable) {
+            return new ExecutionOutcome(null, throwable);
+        }
+    }
+
+    private boolean awaitBlockedDuplicateReservation()
+            throws InterruptedException {
+        long deadline =
+                System.nanoTime()
+                        + TimeUnit.SECONDS.toNanos(5);
+
+        while (System.nanoTime() < deadline) {
+            Integer waiting = jdbcTemplate.queryForObject("""
+                    select count(*)
+                      from pg_stat_activity
+                     where datname = current_database()
+                       and pid <> pg_backend_pid()
+                       and state = 'active'
+                       and query ilike
+                           '%insert into sandbox_tool_idempotency_records%'
+                       and wait_event_type = 'Lock'
+                    """, Integer.class);
+
+            if (waiting != null && waiting > 0) {
+                return true;
+            }
+
+            Thread.sleep(25);
+        }
+
+        return false;
+    }
+
     private StateChangingToolExecutionService executor() {
         try {
             Constructor<?> noArg = Arrays.stream(
@@ -511,6 +751,78 @@ class StateChangingToolIdempotencyIntegrationTest {
         );
 
         return new Seed(runId, caseRunId);
+    }
+
+    private record ExecutionOutcome(
+            StateChangingToolExecutionService.Execution execution,
+            Throwable error
+    ) {
+    }
+
+    private static final class BlockingToolAdapter
+            implements ToolAdapter {
+
+        private final ToolAdapter delegate;
+        private final CountDownLatch entered =
+                new CountDownLatch(1);
+        private final CountDownLatch release =
+                new CountDownLatch(1);
+
+        private BlockingToolAdapter(ToolAdapter delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public String toolName() {
+            return delegate.toolName();
+        }
+
+        @Override
+        public ToolEffect effect() {
+            return ToolEffect.STATE_CHANGING;
+        }
+
+        @Override
+        public void validateArguments(
+                tools.jackson.databind.JsonNode arguments
+        ) {
+            delegate.validateArguments(arguments);
+        }
+
+        @Override
+        public ToolExecutionResult execute(
+                SandboxExecutionContext context,
+                tools.jackson.databind.JsonNode arguments
+        ) {
+            entered.countDown();
+
+            try {
+                if (!release.await(10, TimeUnit.SECONDS)) {
+                    throw new AssertionError(
+                            "Timed out waiting to release blocking adapter"
+                    );
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(
+                        "Blocking adapter was interrupted",
+                        exception
+                );
+            }
+
+            return delegate.execute(context, arguments);
+        }
+
+        private boolean awaitEntered(
+                long timeout,
+                TimeUnit unit
+        ) throws InterruptedException {
+            return entered.await(timeout, unit);
+        }
+
+        private void release() {
+            release.countDown();
+        }
     }
 
     private record Seed(

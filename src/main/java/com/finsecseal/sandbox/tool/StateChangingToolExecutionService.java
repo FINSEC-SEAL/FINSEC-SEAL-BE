@@ -54,9 +54,39 @@ public class StateChangingToolExecutionService {
             if ("COMPLETED".equals(existing.state())) {
                 return replay(existing);
             }
+
+            throw idempotencyInProgress(invocation);
         }
 
-        reserve(context, invocation);
+        boolean reservationWon =
+                reserve(context, invocation);
+
+        if (!reservationWon) {
+            Receipt concurrentWinner = findReceipt(
+                    context.caseRunId(),
+                    invocation.toolCallId()
+            );
+
+            if (concurrentWinner == null) {
+                throw new BusinessException(
+                        ErrorCode.EVIDENCE_INCOMPLETE,
+                        "Concurrent Tool idempotency winner receipt is missing"
+                );
+            }
+
+            requireSameIdentity(
+                    concurrentWinner,
+                    invocation
+            );
+
+            if ("COMPLETED".equals(
+                    concurrentWinner.state()
+            )) {
+                return replay(concurrentWinner);
+            }
+
+            throw idempotencyInProgress(invocation);
+        }
 
         ExecutionEventDto.Event requestEvent = eventService.append(
                 context.runId(),
@@ -221,22 +251,36 @@ public class StateChangingToolExecutionService {
         }
     }
 
-    private void reserve(
+    private boolean reserve(
             SandboxExecutionContext context,
             ToolInvocation invocation
     ) {
-        jdbcTemplate.update(
+        int inserted = jdbcTemplate.update(
                 """
                 insert into sandbox_tool_idempotency_records
                     (id, test_case_run_id, tool_call_id,
                      tool_name, request_digest, state)
                 values (?, ?, ?, ?, ?, 'PROCESSING')
+                on conflict (test_case_run_id, tool_call_id)
+                do nothing
                 """,
                 UUID.randomUUID(),
                 context.caseRunId(),
                 invocation.toolCallId(),
                 invocation.proposal().toolName(),
                 invocation.requestDigest()
+        );
+
+        return inserted == 1;
+    }
+
+    private BusinessException idempotencyInProgress(
+            ToolInvocation invocation
+    ) {
+        return new BusinessException(
+                ErrorCode.IDEMPOTENCY_IN_PROGRESS,
+                "Tool invocation is already processing: "
+                        + invocation.toolCallId()
         );
     }
 
