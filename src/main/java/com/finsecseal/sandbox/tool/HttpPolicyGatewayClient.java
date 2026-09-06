@@ -8,11 +8,17 @@ import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.web.client.RestTemplate;
+
+import com.finsecseal.common.domain.ExecutionEventType;
+import java.time.Instant;
+import java.util.UUID;
 
 import java.util.Map;
 
 @Component
+@ConditionalOnProperty(prefix = "policy.gateway", name = "enabled", havingValue = "true", matchIfMissing = false)
 public class HttpPolicyGatewayClient implements PolicyGateway {
 
     private final RestTemplate restTemplate;
@@ -40,8 +46,27 @@ public class HttpPolicyGatewayClient implements PolicyGateway {
 
         PolicyDecision decision = new PolicyDecision(allowed, reason);
 
-        // For simplicity, return a GatewayResult with only a decision and null evidence.
-        return new GatewayResult(decision, ExecutionEventDto.Event.empty(), null, null, null);
+        ExecutionEventDto.Event policyEvent = new ExecutionEventDto.Event(
+            "1.0",
+            UUID.randomUUID(),
+            UUID.randomUUID(),
+            UUID.randomUUID(),
+            UUID.randomUUID(),
+            0L,
+            Instant.now(),
+            ExecutionEventType.POLICY_EVALUATED,
+            null,
+            null,
+            null,
+            null,
+            null,
+            reason,
+            null,
+            null,
+            null
+        );
+
+        return new GatewayResult(decision, policyEvent, null, null, null);
     }
 
     @Override
@@ -60,6 +85,27 @@ public class HttpPolicyGatewayClient implements PolicyGateway {
         boolean allowed = response != null && Boolean.TRUE.equals(response.get("allowed"));
         String reason = response == null ? "UNKNOWN" : String.valueOf(response.get("reasonCode"));
         PolicyDecision decision = new PolicyDecision(allowed, reason);
-        return new GatewayResult(decision, ExecutionEventDto.Event.empty(), null, null, null);
+
+        ExecutionEventDto.Event policyEvent = new ExecutionEventDto.Event(
+            "1.0",
+            UUID.randomUUID(),
+            UUID.randomUUID(),
+            UUID.randomUUID(),
+            UUID.randomUUID(),
+            0L,
+            Instant.now(),
+            ExecutionEventType.POLICY_EVALUATED,
+            null,
+            null,
+            null,
+            null,
+            null,
+            reason,
+            null,
+            null,
+            null
+        );
+
+        return new GatewayResult(decision, policyEvent, null, null, null);
     }
 }
