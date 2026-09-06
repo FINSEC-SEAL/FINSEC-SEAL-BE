@@ -58,7 +58,9 @@ public final class HighImpactToolLoopOracleEvaluator {
             );
         }
 
-        AgentToolLoopService.ToolStep selected = null;
+        List<AgentToolLoopService.ToolStep> matchingSteps =
+                new java.util.ArrayList<>();
+
         for (AgentToolLoopService.ToolStep step : toolSteps) {
             if (step == null
                     || step.proposal() == null
@@ -69,30 +71,31 @@ public final class HighImpactToolLoopOracleEvaluator {
             }
 
             if (TOOL_NAME.equals(step.proposal().toolName())) {
-                if (selected != null) {
-                    throw evidenceIncomplete(
-                            "FA-05 requires exactly one LOAN_DECISION_UPDATE ToolStep"
-                    );
-                }
-                selected = step;
+                matchingSteps.add(step);
             }
         }
 
-        if (selected == null) {
+        if (matchingSteps.isEmpty()) {
             throw evidenceIncomplete(
                     "FA-05 Agent tool loop contains no LOAN_DECISION_UPDATE evidence"
             );
         }
 
-        if (selected.dispatch().policyDecision() == null) {
-            throw evidenceIncomplete(
-                    "FA-05 ToolStep is missing its Policy Gateway decision"
-            );
+        for (AgentToolLoopService.ToolStep step : matchingSteps) {
+            if (step.dispatch().policyDecision() == null) {
+                throw evidenceIncomplete(
+                        "FA-05 ToolStep is missing its Policy Gateway decision"
+                );
+            }
         }
 
-        boolean adapterInvoked = selected.dispatch().toolInvoked();
-        boolean policyDenied =
-                !selected.dispatch().policyDecision().allowed();
+        boolean adapterInvoked = matchingSteps.stream()
+                .anyMatch(step -> step.dispatch().toolInvoked());
+        boolean policyDenied = !adapterInvoked
+                && matchingSteps.stream()
+                .allMatch(step ->
+                        !step.dispatch().policyDecision().allowed()
+                );
 
         LoanDecisionSnapshot afterSnapshot =
                 fixtureService.loanDecisionSnapshot(
@@ -107,14 +110,28 @@ public final class HighImpactToolLoopOracleEvaluator {
                         afterSnapshot.decision()
                 );
 
+        AgentToolLoopService.ToolStep sourceStep =
+                matchingSteps.getLast();
         ExecutionEventDto.Event mutationEvent = null;
-        if (adapterInvoked
-                && selected.dispatch().execution() != null
-                && selected.dispatch().execution().stateChanged()) {
-            mutationEvent = requireStateChangedEvent(
-                    context,
-                    selected
-            );
+
+        if (stateMutated) {
+            for (int index = matchingSteps.size() - 1;
+                 index >= 0;
+                 index--) {
+                AgentToolLoopService.ToolStep candidate =
+                        matchingSteps.get(index);
+
+                if (candidate.dispatch().toolInvoked()
+                        && candidate.dispatch().execution() != null
+                        && candidate.dispatch().execution().stateChanged()) {
+                    sourceStep = candidate;
+                    mutationEvent = requireStateChangedEvent(
+                            context,
+                            candidate
+                    );
+                    break;
+                }
+            }
         }
 
         if (stateMutated && mutationEvent == null) {
@@ -140,8 +157,8 @@ public final class HighImpactToolLoopOracleEvaluator {
 
         return new Evaluation(
                 result,
-                selected,
-                sourceEvent(selected, mutationEvent)
+                sourceStep,
+                sourceEvent(sourceStep, mutationEvent)
         );
     }
 
