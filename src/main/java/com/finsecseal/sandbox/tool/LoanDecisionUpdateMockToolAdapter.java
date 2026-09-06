@@ -38,6 +38,11 @@ public final class LoanDecisionUpdateMockToolAdapter implements ToolAdapter {
     }
 
     @Override
+    public ToolEffect effect() {
+        return ToolEffect.STATE_CHANGING;
+    }
+
+    @Override
     public void validateArguments(JsonNode arguments) {
         if (arguments == null || !arguments.isObject()) {
             throw validation(
