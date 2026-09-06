@@ -57,6 +57,9 @@ public class CanonicalJsonService {
             });
         }
         sortObjectArray(root, "tools", List.of("name", "version"));
+        if (root.path("serverToolCatalog") instanceof ObjectNode catalog) {
+            sortObjectArray(catalog, "tools", List.of("name", "version"));
+        }
         sortObjectArray(root, "ragSources", List.of("sourceId", "version"));
         sortObjectArray(root, "humanApprovalBoundaries", List.of("resource", "mode"));
         sortTextArray(root, "runtimeContextRequirements");
