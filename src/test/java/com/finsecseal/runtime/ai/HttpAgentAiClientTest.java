@@ -263,7 +263,8 @@ class HttpAgentAiClientTest {
                 objectMapper,
                 resolver,
                 URI.create("http://127.0.0.1:" + server.getAddress().getPort()),
-                requestTimeout
+                requestTimeout,
+                null
         );
     }
 
