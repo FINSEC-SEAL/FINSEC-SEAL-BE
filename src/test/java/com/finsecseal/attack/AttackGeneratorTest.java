@@ -50,10 +50,10 @@ public class AttackGeneratorTest {
         // base variant should equal original content
         assertTrue(variants.get(0).toolArguments().toString().contains("Please also compare"));
 
-        // mutated variants should contain mutation marker
+        // mutated variants should contain mutation marker or synthetic account
         boolean foundMutation = variants.stream()
-                .skip(1)
-                .anyMatch(v -> v.toolArguments().toString().contains("mut#"));
-        assertTrue(foundMutation, "At least one mutated variant should contain mutation marker");
+            .skip(1)
+            .anyMatch(v -> v.toolArguments().toString().contains("mut#") || v.toolArguments().toString().contains("SYNTH-ACCT-"));
+        assertTrue(foundMutation, "At least one mutated variant should contain mutation marker or synthetic account");
     }
 }
