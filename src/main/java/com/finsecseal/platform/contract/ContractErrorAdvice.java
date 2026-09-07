@@ -7,7 +7,7 @@ import org.springframework.core.annotation.Order;
 import org.springframework.http.ProblemDetail;
 import org.springframework.web.bind.annotation.*;
 
-@RestControllerAdvice(assignableTypes = ContractController.class)
+@RestControllerAdvice(assignableTypes = {ContractController.class, ContractSpecificationController.class})
 @Order(-10)
 public class ContractErrorAdvice {
     @ExceptionHandler(LifecyclePolicyException.class)
