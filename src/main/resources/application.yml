@@ -10,7 +10,7 @@ spring:
         jdbc:
           time_zone: UTC
   flyway:
-    enabled: true
+    enabled: ${SPRING_FLYWAY_ENABLED:true}
   jackson:
     deserialization:
       fail-on-unknown-properties: true

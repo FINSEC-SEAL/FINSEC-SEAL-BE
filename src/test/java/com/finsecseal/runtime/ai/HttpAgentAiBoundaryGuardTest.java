@@ -162,7 +162,8 @@ class HttpAgentAiBoundaryGuardTest {
                 objectMapper,
                 resolver,
                 URI.create("http://127.0.0.1:" + server.getAddress().getPort()),
-                Duration.ofSeconds(2)
+            Duration.ofSeconds(2),
+            null
         );
     }
 
