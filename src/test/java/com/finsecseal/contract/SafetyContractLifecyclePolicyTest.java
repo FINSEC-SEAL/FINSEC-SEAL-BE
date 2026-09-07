@@ -12,6 +12,7 @@ import com.finsecseal.contract.SafetyContractLifecyclePolicy.ApprovalTransitionC
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.ContractVersionSnapshot;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.LifecyclePolicyException;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.RejectionCode;
+import com.finsecseal.contract.SafetyContractLifecyclePolicy.RejectionTransitionCommand;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.ReviewerContext;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.SourceBinding;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.ValidationDecision;
@@ -36,6 +37,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.InOrder;
 import tools.jackson.databind.ObjectMapper;
@@ -1423,6 +1425,160 @@ class SafetyContractLifecyclePolicyTest {
         assertThatThrownBy(() -> decision.validationProof().result().issues().add(
                 new Issue("/", "MUTATION", IssueSeverity.WARNING, "mutation")
         )).isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = VersionState.class, names = {"CANDIDATE", "VALIDATED"})
+    void rejectionReturnsExactCasPreconditionsWithoutChangingSnapshot(VersionState state) {
+        ContractVersionSnapshot original = state == VersionState.VALIDATED
+                ? validatedSnapshot() : candidate(contract);
+        ReviewerContext reviewer = trustedReviewer();
+        catalogLoads.set(0);
+
+        RejectionTransitionCommand command = lifecyclePolicy.reject(
+                original, quote(original.resourceHash()), reviewer, "Revise the candidate"
+        );
+
+        assertThat(command.identity()).isEqualTo(original.identity());
+        assertThat(command.expectedState()).isEqualTo(state);
+        assertThat(command.targetState()).isEqualTo(VersionState.REJECTED);
+        assertThat(command.expectedResourceHash()).isEqualTo(original.resourceHash());
+        assertThat(command.policyHash()).isEqualTo(original.policyHash());
+        assertThat(command.basePolicyHash()).isEqualTo(original.basePolicyHash());
+        assertThat(command.reviewer()).isEqualTo(reviewer);
+        assertThat(command.comment()).isEqualTo("Revise the candidate");
+        assertThat(original.state()).isEqualTo(state);
+        assertThat(original.policy()).isEqualTo(contract);
+        assertThat(original.validationProof().isPresent())
+                .isEqualTo(state == VersionState.VALIDATED);
+        ((ObjectNode) original.policy()).put("purpose", "MUTATED_COPY");
+        assertThat(original.policy()).isEqualTo(contract);
+        assertThat(lifecyclePolicy.reject(
+                original, quote(original.resourceHash()), reviewer, "Revise the candidate"
+        )).isEqualTo(command);
+        assertThat(catalogLoads).hasValue(0);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = VersionState.class, names = {"APPROVED", "REJECTED", "SUPERSEDED"})
+    void rejectionCannotChangeTerminalVersions(VersionState state) {
+        ContractVersionSnapshot original = snapshot(
+                state, contract, policyHash(contract), CANDIDATE_RESOURCE_HASH, Optional.empty()
+        );
+
+        assertRejected(RejectionCode.INVALID_STATE_TRANSITION, () -> lifecyclePolicy.reject(
+                original, quote(original.resourceHash()), trustedReviewer(), "Rejected"
+        ));
+        assertThat(catalogLoads).hasValue(0);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = VersionState.class, names = {"CANDIDATE", "VALIDATED"})
+    void rejectionDiscardsInvalidObjectsWithoutCatalogOrValidationCalls(VersionState state) {
+        SafetyContractCanonicalizer unusedCanonicalizer = mock(SafetyContractCanonicalizer.class);
+        SafetyContractSemanticValidator unusedValidator = mock(SafetyContractSemanticValidator.class);
+        SafetyContractLifecyclePolicy rejectionOnly = policy(
+                (releaseId, actorId) -> {
+                    throw new AssertionError("Rejection must not require catalog availability");
+                }, unusedCanonicalizer, unusedValidator
+        );
+        ObjectNode schemaInvalid = contract.deepCopy().put("unknownPolicy", true);
+        ObjectNode semanticInvalid = contract.deepCopy();
+        ((ArrayNode) semanticInvalid.path("allowedTools")).removeAll();
+
+        for (ObjectNode invalid : List.of(schemaInvalid, semanticInvalid)) {
+            ContractVersionSnapshot original = new ContractVersionSnapshot(
+                    defaultIdentity(), state, invalid, digest('9'), CANDIDATE_RESOURCE_HASH,
+                    Optional.empty(), Optional.empty()
+            );
+
+            RejectionTransitionCommand command = rejectionOnly.reject(
+                    original, quote(CANDIDATE_RESOURCE_HASH), trustedReviewer(), "Invalid policy"
+            );
+
+            assertThat(command.targetState()).isEqualTo(VersionState.REJECTED);
+            assertThat(command.expectedState()).isEqualTo(state);
+            assertThat(command.policyHash()).isEqualTo(digest('9'));
+            assertThat(command.basePolicyHash()).isEmpty();
+            assertThat(original.policy()).isEqualTo(invalid);
+            assertThat(original.validationProof()).isEmpty();
+        }
+        verifyNoMoreInteractions(unusedCanonicalizer, unusedValidator);
+    }
+
+    @ParameterizedTest
+    @MethodSource("malformedIfMatchValues")
+    void rejectionRequiresOneStrongResourceIfMatch(String ifMatch) {
+        assertRejected(RejectionCode.INVALID_IF_MATCH, () -> lifecyclePolicy.reject(
+                candidate(contract), ifMatch, trustedReviewer(), "Rejected"
+        ));
+        assertThat(catalogLoads).hasValue(0);
+    }
+
+    @Test
+    void rejectionDoesNotAcceptStaleHashOrPolicyHashAsResourceTag() {
+        ContractVersionSnapshot original = candidate(contract);
+        for (String stale : List.of(digest('8'), original.policyHash())) {
+            assertRejected(RejectionCode.STALE_RESOURCE, () -> lifecyclePolicy.reject(
+                    original, quote(stale), trustedReviewer(), "Rejected"
+            ));
+        }
+        assertThat(catalogLoads).hasValue(0);
+    }
+
+    @ParameterizedTest
+    @MethodSource("untrustedReviewers")
+    void rejectionRequiresTrustedReviewer(ReviewerContext reviewer, RejectionCode expectedCode) {
+        assertRejected(expectedCode, () -> lifecyclePolicy.reject(
+                candidate(contract), quote(CANDIDATE_RESOURCE_HASH), reviewer, "Rejected"
+        ));
+        assertThat(catalogLoads).hasValue(0);
+    }
+
+    @Test
+    void rejectionRequiresReviewerContext() {
+        assertRejected(RejectionCode.REVIEWER_CONTEXT_REQUIRED, () -> lifecyclePolicy.reject(
+                candidate(contract), quote(CANDIDATE_RESOURCE_HASH), null, "Rejected"
+        ));
+        assertThat(catalogLoads).hasValue(0);
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidComments")
+    void rejectionRequiresValidComment(String comment) {
+        assertRejected(RejectionCode.INVALID_COMMENT, () -> lifecyclePolicy.reject(
+                candidate(contract), quote(CANDIDATE_RESOURCE_HASH), trustedReviewer(), comment
+        ));
+        assertThat(catalogLoads).hasValue(0);
+    }
+
+    @Test
+    void rejectionStillRequiresValidSnapshotEnvelope() {
+        List<ContractVersionSnapshot> invalidSnapshots = Stream.of(
+                (ContractVersionSnapshot) null,
+                snapshot(VersionState.CANDIDATE, null, digest('9'),
+                        CANDIDATE_RESOURCE_HASH, Optional.empty()),
+                snapshot(VersionState.CANDIDATE, objectMapper.createArrayNode(), digest('9'),
+                        CANDIDATE_RESOURCE_HASH, Optional.empty()),
+                snapshot(VersionState.CANDIDATE, contract, "malformed",
+                        CANDIDATE_RESOURCE_HASH, Optional.empty()),
+                snapshot(VersionState.CANDIDATE, contract, digest('9'),
+                        "malformed", Optional.empty()),
+                snapshot(null, contract, digest('9'), CANDIDATE_RESOURCE_HASH, Optional.empty()),
+                snapshot(null, VersionState.CANDIDATE, contract, digest('9'),
+                        CANDIDATE_RESOURCE_HASH, Optional.empty()),
+                new ContractVersionSnapshot(defaultIdentity(), VersionState.CANDIDATE,
+                        contract, digest('9'), CANDIDATE_RESOURCE_HASH, null, Optional.empty()),
+                new ContractVersionSnapshot(defaultIdentity(), VersionState.CANDIDATE,
+                        contract, digest('9'), CANDIDATE_RESOURCE_HASH, Optional.empty(), null)
+        ).toList();
+
+        for (ContractVersionSnapshot invalid : invalidSnapshots) {
+            assertRejected(RejectionCode.INVALID_SNAPSHOT, () -> lifecyclePolicy.reject(
+                    invalid, quote(CANDIDATE_RESOURCE_HASH), trustedReviewer(), "Rejected"
+            ));
+        }
+        assertThat(catalogLoads).hasValue(0);
     }
 
     private SafetyContractLifecyclePolicy policy(
