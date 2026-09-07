@@ -127,6 +127,91 @@ class ContractPersistenceIntegrationTest {
                 .header("Origin","http://localhost:5173").GET().build();
         assertThat(HttpClient.newHttpClient().send(unauthenticated,HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(403);
     }
+    @Test void specificationPathsReturnValidationResultAndContractScopedHistory() throws Exception {
+        UUID release=release();
+        db.update("update agent_releases set lifecycle_state='REMEDIATION',effective_status='REMEDIATION' where id=?", release);
+        var first=service.create(release,fixture("loan-review-safety-contract.json"),reviewer);
+        var second=service.create(release,((ObjectNode)fixture("loan-review-safety-contract.json")).put("version",2),reviewer);
+        String path="/api/v1/contract-versions/"+second.id();
+        var detail=api("GET",path,null,Map.of("X-Contract-Reviewer-Key",KEY));
+        assertThat(detail.statusCode()).isEqualTo(200);
+        var value=json.readTree(detail.body()).path("data");
+        String contract=value.path("contractId").stringValue();
+        assertThat(value.path("diff").isArray()).isTrue();
+        assertThat(detail.headers().firstValue("ETag")).contains(etag(second));
+        var page=api("GET","/api/v1/contracts/"+contract+"/versions?limit=1",null,Map.of("X-Contract-Reviewer-Key",KEY));
+        var history=json.readTree(page.body()).path("data");
+        assertThat(history.path("items").size()).isEqualTo(1);
+        assertThat(history.at("/items/0/id").stringValue()).isEqualTo(first.id().toString());
+        var next=api("GET","/api/v1/contracts/"+contract+"/versions?limit=1&cursor="+history.path("nextCursor").stringValue(),null,Map.of("X-Contract-Reviewer-Key",KEY));
+        assertThat(json.readTree(next.body()).at("/data/items/0/id").stringValue()).isEqualTo(second.id().toString());
+        assertThat(json.readTree(next.body()).at("/data/nextCursor").isNull()).isTrue();
+        assertThat(api("GET","/api/v1/contracts/"+second.id()+"/versions",null,Map.of("X-Contract-Reviewer-Key",KEY)).statusCode()).isEqualTo(404);
+        assertThat(api("GET","/api/v1/contracts/"+contract+"/versions?limit=101",null,Map.of("X-Contract-Reviewer-Key",KEY)).statusCode()).isEqualTo(400);
+        assertThat(api("GET","/api/v1/contracts/"+contract+"/versions?cursor=invalid",null,Map.of("X-Contract-Reviewer-Key",KEY)).statusCode()).isEqualTo(400);
+        var headers=Map.of("X-Contract-Reviewer-Key",KEY,"If-Match",etag(second));
+        assertThat(api("POST",path+":validate","{\"role\":\"AI_SECURITY_REVIEWER\"}",headers).statusCode()).isEqualTo(400);
+        var validated=api("POST",path+":validate","{}",headers);
+        assertThat(validated.statusCode()).withFailMessage(validated.body()).isEqualTo(200);
+        var result=json.readTree(validated.body()).path("data");
+        assertThat(result.path("status").stringValue()).isEqualTo("VALID");
+        assertThat(result.path("state").stringValue()).isEqualTo("VALIDATED");
+        assertThat(result.path("issues").isArray()).isTrue();
+        String match='"'+result.path("resourceHash").stringValue()+'"';
+        assertThat(api("POST",path+":approve","{\"comment\":\"review\"}",headers).statusCode()).isEqualTo(409);
+        var approved=api("POST",path+":approve","{\"comment\":\"review\",\"patchProposalId\":null}",Map.of("X-Contract-Reviewer-Key",KEY,"If-Match",match));
+        assertThat(approved.statusCode()).withFailMessage(approved.body()).isEqualTo(200);
+        assertThat(json.readTree(approved.body()).at("/data/state").stringValue()).isEqualTo("APPROVED");
+        assertThat(api("GET",path+"/approved?releaseId="+release,null,Map.of("X-Contract-Reviewer-Key",KEY)).statusCode()).isEqualTo(200);
+    }
+
+    @Test void unknownPatchOrReviewFieldsCannotSilentlyApprove() throws Exception {
+        UUID release=release();
+        db.update("update agent_releases set lifecycle_state='REMEDIATION',effective_status='REMEDIATION' where id=?",release);
+        var c=service.create(release,fixture("loan-review-safety-contract.json"),reviewer);
+        var v=service.validate(c.id(),etag(c),reviewer);
+        var headers=Map.of("X-Contract-Reviewer-Key",KEY,"If-Match",etag(v));
+        String path="/api/v1/contract-versions/"+v.id()+":approve";
+        assertThat(api("POST",path,"{\"comment\":\"review\",\"patchProposalId\":\""+UUID.randomUUID()+"\"}",headers).statusCode()).isEqualTo(404);
+        assertThat(api("POST",path,"{\"comment\":\"review\",\"role\":\"AI_SECURITY_REVIEWER\"}",headers).statusCode()).isEqualTo(400);
+        assertThat(service.find(v.id(),reviewer).state()).isEqualTo("VALIDATED");
+    }
+
+    @Test void reviewerSessionRequiresTrustedIssuanceAndCsrfBeforeIdempotency() throws Exception {
+        assertThat(api("GET","/api/v1/reviewer-session",null,Map.of()).statusCode()).isEqualTo(403);
+        assertThat(api("GET","/api/v1/%72eviewer-session",null,Map.of()).statusCode()).isEqualTo(400);
+        assertThat(api("GET","/api/v1/contract-versions/"+UUID.randomUUID(),null,Map.of()).statusCode()).isEqualTo(403);
+        var issued=api("GET","/api/v1/reviewer-session",null,Map.of("X-Contract-Reviewer-Key",KEY));
+        assertThat(issued.statusCode()).isEqualTo(200);
+        String cookieHeader=issued.headers().firstValue("Set-Cookie").orElseThrow();
+        assertThat(cookieHeader).contains("HttpOnly","Secure","SameSite=Lax","Path=/");
+        String cookie=cookieHeader.split(";",2)[0];
+        String csrf=json.readTree(issued.body()).at("/data/csrfToken").stringValue();
+        var c=service.create(release(),fixture("loan-review-safety-contract.json"),reviewer);
+        String path="/api/v1/contract-versions/"+c.id();
+        assertThat(api("GET",path,null,Map.of("Cookie",cookie)).statusCode()).isEqualTo(200);
+        assertThat(api("GET",path,null,Map.of("Cookie",cookie+"x")).statusCode()).isEqualTo(403);
+        String idem=UUID.randomUUID().toString();
+        assertThat(api("POST",path+":validate","{}",Map.of("Cookie",cookie,"If-Match",etag(c),"Idempotency-Key",idem)).statusCode()).isEqualTo(403);
+        assertThat(db.queryForObject("select count(*) from api_idempotency_records where idempotency_key=?",Integer.class,idem)).isZero();
+        assertThat(api("POST",path+":validate","{}",Map.of("Cookie",cookie,"If-Match",etag(c),"X-Contract-Reviewer-Key",KEY)).statusCode()).isEqualTo(403);
+        var validated=api("POST",path+":validate","{}",Map.of("Cookie",cookie,"If-Match",etag(c),"Idempotency-Key",idem,"X-CSRF-Token",csrf));
+        assertThat(validated.statusCode()).withFailMessage(validated.body()).isEqualTo(200);
+        assertThat(api("POST",path+":validate","{}",Map.of("Cookie",cookie,"If-Match",etag(c),"Idempotency-Key",idem,"X-CSRF-Token","wrong")).statusCode()).isEqualTo(403);
+        var restored=api("GET","/api/v1/reviewer-session",null,Map.of("Cookie",cookie));
+        assertThat(json.readTree(restored.body()).at("/data/csrfToken").stringValue()).isEqualTo(csrf);
+    }
+
+    private HttpResponse<String> api(String method,String path,String body,Map<String,String> headers) throws Exception {
+        var builder=HttpRequest.newBuilder(URI.create("http://localhost:"+port+path));
+        headers.forEach(builder::header);
+        if(body!=null) {
+            builder.header("Content-Type","application/json");
+            if(!headers.containsKey("Idempotency-Key")) builder.header("Idempotency-Key",UUID.randomUUID().toString());
+        }
+        builder.method(method,body==null?HttpRequest.BodyPublishers.noBody():HttpRequest.BodyPublishers.ofString(body));
+        return HttpClient.newHttpClient().send(builder.build(),HttpResponse.BodyHandlers.ofString());
+    }
     private HttpResponse<String> post(String path,String body,String idem,String token,String actor) throws Exception {
         var b=HttpRequest.newBuilder(URI.create("http://localhost:"+port+path)).header("Content-Type","application/json")
             .header("Idempotency-Key",idem).header("X-Contract-Reviewer-Key",token).POST(HttpRequest.BodyPublishers.ofString(body));

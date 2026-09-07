@@ -83,6 +83,33 @@ class PatchSourceIntegrationTest {
         assertThat(after.stale()).isTrue();
         assertThat(releaseService.find(s.releaseId()).effectiveStatus().name()).isEqualTo("NEEDS_REVALIDATION");
     }
+    @Test void storesAndApprovesCValidatedPatchWithImmutableApprovalLink() throws Exception {
+        Seed source=seed("SEED",false,false);
+        jdbcTemplate.update("update agent_releases set lifecycle_state='REMEDIATION',effective_status='REMEDIATION' where id=?",source.releaseId());
+        ObjectNode policy=(ObjectNode)objectMapper.readTree(getClass().getResourceAsStream("/fixtures/loan-review-safety-contract.json"));
+        ObjectNode broad=policy.deepCopy();
+        ((tools.jackson.databind.node.ArrayNode)broad.at("/fieldPolicy/CUSTOMER_DATA_READ/allowed")).add("accountNumber");
+        var base=contracts.create(source.releaseId(),broad,reviewer);
+        var patch=new com.finsecseal.contract.SafetyContractPatchProposalFacts.ProposedPatch(policy.put("version",2),
+            java.util.List.of(new com.finsecseal.contract.SafetyContractPatchOperation.NarrowSet(
+                com.finsecseal.contract.SafetyContractPatchOperation.SetKind.ALLOWED_FIELDS,"CUSTOMER_DATA_READ",java.util.List.of("employmentStatus","incomeBand"))),
+            "Excessive fields","Required workflow fields retained","Create a reviewed replacement");
+        var stored=contracts.storePatch(source.findingId(),base.id(),patch,reviewer);
+        var candidate=stored.candidate();
+        var validated=contracts.validate(candidate.id(),'"'+candidate.resourceHash()+'"',reviewer);
+        assertThatThrownBy(()->contracts.approve(validated.id(),'"'+validated.resourceHash()+'"',"review",reviewer)).hasMessageContaining("bound patchProposalId");
+        assertThatThrownBy(()->contracts.approve(validated.id(),'"'+validated.resourceHash()+'"',"review",UUID.randomUUID(),reviewer)).hasMessageContaining("bound patchProposalId");
+        String operations=jdbcTemplate.queryForObject("select policy_diff_json::text from patch_proposals where id=?",String.class,stored.patchProposalId());
+        jdbcTemplate.update("update patch_proposals set policy_diff_json='[]' where id=?",stored.patchProposalId());
+        assertThatThrownBy(()->contracts.approve(validated.id(),'"'+validated.resourceHash()+'"',"review",stored.patchProposalId(),reviewer)).hasMessageContaining("Patch approval evidence changed");
+        assertThat(contracts.find(validated.id(),reviewer).state()).isEqualTo("VALIDATED");
+        assertThat(jdbcTemplate.queryForObject("select count(*) from patch_approvals where patch_proposal_id=?",Integer.class,stored.patchProposalId())).isZero();
+        jdbcTemplate.update("update patch_proposals set policy_diff_json=cast(? as jsonb) where id=?",operations,stored.patchProposalId());
+        var approved=contracts.approve(validated.id(),'"'+validated.resourceHash()+'"',"Reviewed narrowing",stored.patchProposalId(),reviewer);
+        assertThat(approved.state()).isEqualTo("APPROVED");
+        assertThat(jdbcTemplate.queryForObject("select resulting_contract_version_id from patch_approvals where patch_proposal_id=?",UUID.class,stored.patchProposalId())).isEqualTo(approved.id());
+        assertThatThrownBy(()->jdbcTemplate.update("update patch_proposals set root_cause='changed' where id=?",stored.patchProposalId())).hasMessageContaining("immutable");
+    }
     private Seed seed(String partition, boolean hidden, boolean hiddenParent) throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         AgentDto.Response agent = agentService.create(new AgentDto.CreateRequest(

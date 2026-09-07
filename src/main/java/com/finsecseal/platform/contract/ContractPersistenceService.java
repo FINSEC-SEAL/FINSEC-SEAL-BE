@@ -5,6 +5,10 @@ import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.persistence.UuidV7;
 import com.finsecseal.contract.SafetyContractCanonicalizer;
+import com.finsecseal.contract.SafetyContractPatchProposalPolicy;
+import com.finsecseal.contract.SafetyContractPatchProposalFacts.*;
+import com.finsecseal.contract.SafetyContractPatchOperation;
+import com.finsecseal.contract.ReleaseToolCatalogContractAdapter;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.*;
 import com.finsecseal.release.CanonicalJsonService;
@@ -29,17 +33,86 @@ public class ContractPersistenceService {
     private final DigestService digest;
     private final AuditService audit;
     private final ReleaseService releases;
+    private final PatchSourceService patchSources;
+    private final SafetyContractPatchProposalPolicy patchPolicy;
+    private final ReleaseToolCatalogContractAdapter catalogs;
     public ContractPersistenceService(JdbcTemplate db, ObjectMapper json, SafetyContractCanonicalizer canonicalizer,
             SafetyContractLifecyclePolicy lifecycle, CanonicalJsonService canonical, DigestService digest,
-            AuditService audit, ReleaseService releases) {
+            AuditService audit, ReleaseService releases, PatchSourceService patchSources,
+            SafetyContractPatchProposalPolicy patchPolicy, ReleaseToolCatalogContractAdapter catalogs) {
         this.db=db;this.json=json;this.canonicalizer=canonicalizer;this.lifecycle=lifecycle;
         this.canonical=canonical;this.digest=digest;this.audit=audit;this.releases=releases;
+        this.patchSources=patchSources;this.patchPolicy=patchPolicy;this.catalogs=catalogs;
     }
     public record Version(UUID id, UUID workspaceId, UUID releaseId, String contractKey, int version,
             String state, JsonNode policy, String policyHash, String resourceHash, String basePolicyHash,
             JsonNode validation, JsonNode review) {}
     public record ApprovedContract(Version version, String agentArtifactFingerprint, String releaseFingerprint) {}
     private record ReleaseState(UUID workspaceId, String policyHash, String artifact, String fingerprint, String state) {}
+
+    public record History(List<JsonNode> items, String nextCursor) {}
+
+    public JsonNode detail(Version version, ReviewerContext reviewer) {
+        requireReviewer(reviewer, version.workspaceId());
+        var node = (tools.jackson.databind.node.ObjectNode) json.valueToTree(version);
+        UUID contractId = db.queryForObject("select contract_id from safety_contract_versions where id=?", UUID.class, version.id());
+        node.put("contractId", contractId.toString());
+        var diff = node.putArray("diff");
+        var previous = db.queryForList("""
+            select v.id from safety_contract_versions v join contract_version_evidence e on e.version_id=v.id
+            where v.contract_id=? and v.version<? order by v.version desc limit 1
+            """, UUID.class, contractId, version.version());
+        JsonNode before = previous.isEmpty() ? json.createObjectNode() : find(previous.getFirst(), reviewer).policy();
+        Set<String> fields = new TreeSet<>();
+        before.properties().forEach(e -> fields.add(e.getKey()));
+        version.policy().properties().forEach(e -> fields.add(e.getKey()));
+        for (String field : fields) {
+            if (!Objects.equals(before.get(field), version.policy().get(field))) {
+                var change = diff.addObject().put("path", "/" + field.replace("~", "~0").replace("/", "~1"));
+                change.set("before", before.get(field));
+                change.set("after", version.policy().get(field));
+            }
+        }
+        return node;
+    }
+
+    public JsonNode validationResult(Version version) {
+        var result = (tools.jackson.databind.node.ObjectNode) version.validation().path("result").deepCopy();
+        result.put("versionId", version.id().toString()).put("state", version.state())
+                .put("resourceHash", version.resourceHash()).put("policyHash", version.policyHash());
+        result.set("validationProof", version.validation());
+        return result;
+    }
+
+    public History history(UUID contractId, int limit, String cursor, ReviewerContext reviewer) {
+        if (limit < 1 || limit > 100) fail(ErrorCode.VALIDATION_ERROR, "limit must be between 1 and 100");
+        var scopes = db.queryForList("select workspace_id from safety_contracts where id=?", UUID.class, contractId);
+        if (scopes.isEmpty()) fail(ErrorCode.RESOURCE_NOT_FOUND, "Contract not found");
+        requireReviewer(reviewer, scopes.getFirst());
+        int after = 0;
+        if (cursor != null) {
+            try {
+                String decoded = new String(Base64.getUrlDecoder().decode(cursor), java.nio.charset.StandardCharsets.UTF_8);
+                String[] parts = decoded.split(":", -1);
+                if (parts.length != 2 || !contractId.toString().equals(parts[0])) throw new IllegalArgumentException();
+                after = Integer.parseInt(parts[1]);
+                if (after < 1 || db.queryForObject("""
+                    select count(*) from safety_contract_versions v join contract_version_evidence e on e.version_id=v.id
+                    where v.contract_id=? and v.version=?
+                    """, Integer.class, contractId, after) != 1) throw new IllegalArgumentException();
+            } catch (RuntimeException exception) {
+                fail(ErrorCode.VALIDATION_ERROR, "Invalid contract history cursor");
+            }
+        }
+        var ids = db.queryForList("""
+            select v.id from safety_contract_versions v join contract_version_evidence e on e.version_id=v.id
+            where v.contract_id=? and v.version>? order by v.version limit ?
+            """, UUID.class, contractId, after, limit + 1);
+        var versions = ids.stream().limit(limit).map(id -> find(id, reviewer)).toList();
+        String next = ids.size() > limit ? Base64.getUrlEncoder().withoutPadding().encodeToString(
+                (contractId + ":" + versions.getLast().version()).getBytes(java.nio.charset.StandardCharsets.UTF_8)) : null;
+        return new History(versions.stream().map(v -> detail(v, reviewer)).toList(), next);
+    }
 
     @Transactional
     public Version create(UUID releaseId, JsonNode policy, ReviewerContext reviewer) {
@@ -97,15 +170,31 @@ public class ContractPersistenceService {
     }
     @Transactional
     public Version approve(UUID id, String ifMatch, String comment, ReviewerContext reviewer) {
+        return approve(id, ifMatch, comment, null, reviewer);
+    }
+    @Transactional
+    public Version approve(UUID id, String ifMatch, String comment, UUID patchProposalId, ReviewerContext reviewer) {
         Version old=locked(id,ifMatch,reviewer,true);
         ReleaseState release=lockRelease(old.releaseId(),reviewer);
         if (!Set.of("REMEDIATION","PASS","REVIEW","BLOCKED").contains(release.state()))
             fail(ErrorCode.INVALID_STATE_TRANSITION,"Release must be in REMEDIATION or a terminal decision state before policy approval");
+        var linked = db.queryForList("select id from patch_proposals where validation_json->>'candidateVersionId'=?", UUID.class, id.toString());
+        if (!linked.isEmpty() && (linked.size() != 1 || !linked.getFirst().equals(patchProposalId)))
+            fail(ErrorCode.RESOURCE_CONFLICT, "This candidate requires its bound patchProposalId");
+        String patchBase = patchProposalId == null ? null : verifyPatch(patchProposalId, old, reviewer);
         var command=lifecycle.approve(snapshot(old),ifMatch,reviewer,comment);
-        Version result=reviewed(old,command.targetState().name(),comment,reviewer);
+        Version result=reviewed(old,command.targetState().name(),comment,reviewer,patchProposalId);
         persist(old,result,reviewer.actorId());
         releases.applySafetyContractHash(old.releaseId(),old.policyHash(),json.createObjectNode()
                 .put("contractVersionId",id.toString()).put("reviewer",reviewer.actorId()));
+        if (patchProposalId != null) {
+            db.update("update patch_proposals set state='APPROVED',updated_at=now() where id=?", patchProposalId);
+            db.update("""
+                insert into patch_approvals(id,patch_proposal_id,resulting_contract_version_id,decision,
+                    reviewer_actor_id,comment,base_hash,result_hash,decided_at)
+                values(?,?,?,'APPROVED',?,?,?,?,now())
+                """, UuidV7.generate(), patchProposalId, result.id(), reviewer.actorId(), comment, patchBase, result.policyHash());
+        }
         record(result,reviewer,"CONTRACT_APPROVED",old.resourceHash());
         return result;
     }
@@ -113,7 +202,7 @@ public class ContractPersistenceService {
     public Version reject(UUID id, String ifMatch, String comment, ReviewerContext reviewer) {
         Version old=locked(id,ifMatch,reviewer,false);
         var command=lifecycle.reject(snapshot(old),ifMatch,reviewer,comment);
-        Version result=reviewed(old,command.targetState().name(),comment,reviewer);
+        Version result=reviewed(old,command.targetState().name(),comment,reviewer,null);
         persist(old,result,null);
         record(result,reviewer,"CONTRACT_REJECTED",old.resourceHash());
         return result;
@@ -130,9 +219,82 @@ public class ContractPersistenceService {
         return new ApprovedContract(v,r.artifact(),r.fingerprint());
     }
 
-    private Version reviewed(Version old,String state,String comment,ReviewerContext r) {
+    public record StoredPatch(UUID patchProposalId, Version candidate) {}
+
+    /** C/B supply a candidate, never an accepted flag; the server reloads all source facts and reruns C. */
+    @Transactional
+    public StoredPatch storePatch(UUID findingId, UUID baseVersionId, ProposedPatch candidate, ReviewerContext reviewer) {
+        Version base = find(baseVersionId, reviewer);
+        lockRelease(base.releaseId(), reviewer);
+        base = find(baseVersionId, reviewer);
+        if (db.queryForList("select id from findings where id=? and release_id=? for update", UUID.class, findingId, base.releaseId()).isEmpty())
+            fail(ErrorCode.RESOURCE_NOT_FOUND, "Eligible patch source not found");
+        var decision = patchPolicy.evaluate(patchSources.find(findingId, reviewer).facts(), snapshot(base), candidate,
+                catalogs.load(base.releaseId(), reviewer.actorId()));
+        if (decision.status() != Status.PROPOSED) fail(ErrorCode.VALIDATION_ERROR, "C rejected the proposed policy change");
+        var accepted = decision.acceptedProposal().orElseThrow();
+        Version result = create(base.releaseId(), parse(accepted.resultPolicy().canonicalJson()), reviewer);
+        UUID id = UuidV7.generate();
+        var operations = json.createArrayNode();
+        for (var operation : accepted.operations()) {
+            operations.addObject().put("kind", operation.getClass().getSimpleName()).set("value", json.valueToTree(operation));
+        }
+        var proof = json.createObjectNode().put("candidateVersionId", result.id().toString());
+        proof.set("decision", json.valueToTree(decision));
+        db.update("""
+            insert into patch_proposals(id,finding_id,base_contract_version_id,state,root_cause,recommended_rule_json,
+                policy_diff_json,normal_workflow_impact_json,rollback_json,generation_model_meta_json,validation_json)
+            values(?,?,?,'PROPOSED',?,cast(? as jsonb),cast(? as jsonb),cast(? as jsonb),cast(? as jsonb),'{}',cast(? as jsonb))
+            """, id, findingId, base.id(), accepted.rootCause(), result.policy().toString(), operations.toString(),
+                json.valueToTree(accepted.normalWorkflowImpact()).toString(), json.valueToTree(accepted.rollback()).toString(), proof.toString());
+        record(result, reviewer, "CONTRACT_PATCH_STORED", base.resourceHash());
+        return new StoredPatch(id, result);
+    }
+
+    private String verifyPatch(UUID proposalId, Version candidate, ReviewerContext reviewer) {
+        // Read and authorize provenance before loading proposal text or its evidence.
+        var metadata = db.query("""
+            select p.finding_id,p.base_contract_version_id,p.state,f.release_id
+            from patch_proposals p join findings f on f.id=p.finding_id where p.id=? for update of p,f
+            """, (rs,n) -> new Object[]{rs.getObject(1,UUID.class), rs.getObject(2,UUID.class), rs.getString(3), rs.getObject(4,UUID.class)}, proposalId);
+        if (metadata.isEmpty()) fail(ErrorCode.RESOURCE_NOT_FOUND, "Patch proposal not found");
+        var row = metadata.getFirst();
+        if (!candidate.releaseId().equals(row[3]) || !"PROPOSED".equals(row[2]))
+            fail(ErrorCode.RESOURCE_CONFLICT, "Patch proposal must be pending in the candidate Release");
+        var source = patchSources.find((UUID) row[0], reviewer).facts();
+        Version base = find((UUID) row[1], reviewer);
+        var data = db.queryForMap("select * from patch_proposals where id=?", proposalId);
+        JsonNode proof = parse(data.get("validation_json").toString());
+        if (!candidate.id().toString().equals(proof.path("candidateVersionId").asString(null)))
+            fail(ErrorCode.RESOURCE_CONFLICT, "Patch proposal is not bound to this candidate version");
+        var operations = new ArrayList<SafetyContractPatchOperation>();
+        try {
+            for (var operation : parse(data.get("policy_diff_json").toString())) {
+                Class<? extends SafetyContractPatchOperation> type = switch(operation.path("kind").stringValue()) {
+                    case "AddConstraint" -> SafetyContractPatchOperation.AddConstraint.class;
+                    case "NarrowSet" -> SafetyContractPatchOperation.NarrowSet.class;
+                    case "LowerLimit" -> SafetyContractPatchOperation.LowerLimit.class;
+                    case "DenyTool" -> SafetyContractPatchOperation.DenyTool.class;
+                    case "SetHumanOnly" -> SafetyContractPatchOperation.SetHumanOnly.class;
+                    default -> throw new IllegalArgumentException();
+                };
+                operations.add(json.treeToValue(operation.path("value"), type));
+            }
+        } catch (RuntimeException exception) { fail(ErrorCode.EVIDENCE_INCOMPLETE, "Invalid stored patch operations"); }
+        var proposed = new ProposedPatch(parse(data.get("recommended_rule_json").toString()), operations,
+                data.get("root_cause").toString(), parse(data.get("normal_workflow_impact_json").toString()).stringValue(),
+                parse(data.get("rollback_json").toString()).stringValue());
+        var decision = patchPolicy.evaluate(source, snapshot(base), proposed, catalogs.load(base.releaseId(), reviewer.actorId()));
+        if (decision.status() != Status.PROPOSED || !json.valueToTree(decision).equals(proof.path("decision"))
+                || !decision.acceptedProposal().orElseThrow().resultPolicy().policyHash().equals(candidate.policyHash()))
+            fail(ErrorCode.EVIDENCE_INCOMPLETE, "Patch approval evidence changed or does not match candidate");
+        return base.policyHash();
+    }
+
+    private Version reviewed(Version old,String state,String comment,ReviewerContext r,UUID patchProposalId) {
         JsonNode review=json.createObjectNode().put("actorId",r.actorId()).put("role",r.role())
                 .put("sessionId",r.sessionId()).put("comment",comment).put("decision",state);
+        if (patchProposalId != null) ((tools.jackson.databind.node.ObjectNode) review).put("patchProposalId", patchProposalId.toString());
         return withHash(new Version(old.id(),old.workspaceId(),old.releaseId(),old.contractKey(),old.version(),state,
                 old.policy(),old.policyHash(),"",old.basePolicyHash(),old.validation(),review));
     }

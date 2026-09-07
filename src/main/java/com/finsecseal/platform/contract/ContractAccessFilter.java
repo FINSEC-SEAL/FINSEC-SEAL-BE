@@ -1,58 +1,74 @@
 package com.finsecseal.platform.contract;
 
-import com.finsecseal.contract.SafetyContractLifecyclePolicy.ReviewerContext;
 import com.finsecseal.common.api.TraceIdFilter;
+import com.finsecseal.contract.SafetyContractLifecyclePolicy.ReviewerContext;
 import jakarta.servlet.*;
 import jakarta.servlet.http.*;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.util.UUID;
-import org.springframework.beans.factory.annotation.Value;
+import java.util.Set;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
+import org.springframework.web.cors.CorsUtils;
 import org.springframework.web.filter.OncePerRequestFilter;
 import tools.jackson.databind.ObjectMapper;
 
-/** Server-provisioned, workspace-scoped API credential; no cookie or actor-header authentication. */
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE + 5)
 public class ContractAccessFilter extends OncePerRequestFilter {
     public static final String CONTEXT = ContractAccessFilter.class.getName() + ".reviewer";
-    private final String key, actor, workspace;
+    public static final String SESSION = ContractAccessFilter.class.getName() + ".session";
+    private final ContractReviewerCredentials credentials;
     private final ObjectMapper json;
-    public ContractAccessFilter(@Value("${finsec.contract-access.key:}") String key,
-            @Value("${finsec.contract-access.actor:}") String actor,
-            @Value("${finsec.contract-access.workspace:}") String workspace, ObjectMapper json) {
-        this.key=key; this.actor=actor; this.workspace=workspace; this.json=json;
+
+    public ContractAccessFilter(ContractReviewerCredentials credentials, ObjectMapper json) {
+        this.credentials = credentials;
+        this.json = json;
     }
-    @Override protected boolean shouldNotFilter(HttpServletRequest r) {
-        return org.springframework.web.cors.CorsUtils.isPreFlightRequest(r) || !r.getRequestURI().startsWith("/api/v1/platform/contracts")
-                && !r.getRequestURI().startsWith("/api/v1/platform/patch-sources");
+
+    @Override protected boolean shouldNotFilter(HttpServletRequest request) {
+        if (CorsUtils.isPreFlightRequest(request)) return true;
+        String path;
+        try { path = java.net.URLDecoder.decode(request.getRequestURI(), java.nio.charset.StandardCharsets.UTF_8); }
+        catch (IllegalArgumentException exception) { path = request.getRequestURI(); }
+        path = path.replaceAll(";[^/]*", "");
+        // Prefix matching also protects malformed/encoded descendants before MVC routing.
+        return !path.startsWith("/api/v1/platform/contracts") && !path.startsWith("/api/v1/platform/patch-sources")
+                && !path.startsWith("/api/v1/contracts") && !path.startsWith("/api/v1/contract-versions")
+                && !path.startsWith("/api/v1/reviewer-session");
     }
-    @Override protected void doFilterInternal(HttpServletRequest r, HttpServletResponse response, FilterChain chain)
+
+    @Override protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
-        String supplied = r.getHeader("X-Contract-Reviewer-Key");
-        UUID workspaceId;
-        try { workspaceId = UUID.fromString(workspace); } catch (RuntimeException e) { workspaceId = null; }
-        String actorHeader = r.getHeader("X-Actor-Id");
-        if (workspaceId == null || key.getBytes(StandardCharsets.UTF_8).length < 32 || actor.isBlank()
-                || actor.length() > 120 || !actor.equals(actor.strip()) || supplied == null
-                || !MessageDigest.isEqual(key.getBytes(StandardCharsets.UTF_8), supplied.getBytes(StandardCharsets.UTF_8))
-                || (actorHeader != null && !actorHeader.equals(actor)) || r.getHeader("Cookie") != null) {
-            response.setStatus(403); response.setContentType("application/problem+json");
-            response.getOutputStream().write(json.writeValueAsBytes(json.createObjectNode()
-                    .put("status",403).put("title","Forbidden").put("code","CONTRACT_AUTH_REQUIRED")
-                    .put("detail","A configured workspace reviewer API credential is required")
-                    .put("traceId",TraceIdFilter.currentTraceId())));
+        if (request.getRequestURI().contains("%") || request.getRequestURI().contains(";")) {
+            response.sendError(400, "Use the canonical contract API path");
             return;
         }
-        // A secret custom header, never an ambient cookie, authenticates the request. The
-        // same proof supplies CSRF protection; a request-supplied boolean is never accepted.
-        r.setAttribute(CONTEXT,new ReviewerContext(workspaceId,actor,"AI_SECURITY_REVIEWER",
-                "credential-request:"+UUID.randomUUID(),true,true,false));
-        chain.doFilter(new HttpServletRequestWrapper(r) {
+        ReviewerContext reviewer = null;
+        var session = credentials.session(request);
+        String supplied = request.getHeader("X-Contract-Reviewer-Key");
+        boolean mutation = !Set.of("GET", "HEAD", "OPTIONS").contains(request.getMethod());
+        // A cookie request must prove CSRF; a key header cannot downgrade this requirement.
+        if (request.getHeader("Cookie") != null) {
+            if (session != null && (supplied == null || credentials.keyValid(supplied))
+                    && (!mutation || credentials.csrfValid(session, request))) reviewer = session.reviewer();
+        } else if (credentials.keyValid(supplied)) {
+            reviewer = credentials.keyReviewer();
+        }
+        String actorHeader = request.getHeader("X-Actor-Id");
+        if (reviewer == null || (actorHeader != null && !actorHeader.equals(reviewer.actorId()))) {
+            response.setStatus(403);
+            response.setContentType("application/problem+json");
+            response.getOutputStream().write(json.writeValueAsBytes(json.createObjectNode()
+                    .put("status", 403).put("title", "Forbidden").put("code", "CONTRACT_AUTH_REQUIRED")
+                    .put("detail", "A trusted reviewer credential or valid session and CSRF proof is required")
+                    .put("traceId", TraceIdFilter.currentTraceId())));
+            return;
+        }
+        request.setAttribute(CONTEXT, reviewer);
+        request.setAttribute(SESSION, session);
+        String actor = reviewer.actorId();
+        chain.doFilter(new HttpServletRequestWrapper(request) {
             @Override public String getHeader(String name) {
                 return name.equalsIgnoreCase("X-Actor-Id") ? actor : super.getHeader(name);
             }
