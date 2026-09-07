@@ -13,11 +13,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
 @Component
+@ConditionalOnExpression("!${policy.gateway.enabled:false} && !${policy.gateway.c.enabled:false}")
 public final class TemporaryPolicyGatewayBridge implements PolicyGateway {
 
     private final Map<String, ToolAdapter> adapters;

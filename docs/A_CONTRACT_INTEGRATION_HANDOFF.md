@@ -1,84 +1,109 @@
-# A 계약 저장·승인·패치 출처 연결
+# A 계약 API 인수인계
 
-## 구현 범위
+## 원 명세 대응
 
-`platform.contract`는 A 소유의 영속화·무결성·인증 경계다. C의 `SafetyContractLifecyclePolicy`와 canonicalizer를 그대로 호출하며 승인 규칙을 재구현하지 않는다. B의 모델 호출·Tool 실행, C Gateway, D Oracle·판정 코드는 수정하지 않는다.
+기준은 `docs/predev/10_API_SPECIFICATION.md`다. A 패키지 소유권은 URL 접두사를 결정하지 않는다.
+기존 `/platform/contracts`만 제공하던 구현을 보완해 아래 원 명세 경로를 제공한다.
+공통 접두사는 `/api/v1`, 응답은 프로젝트 공통 `{data,traceId,timestamp}` envelope다.
 
-- 후보의 canonical 정책과 hash, 서버에서 읽은 base policy hash, resource hash 저장.
-- C 검증 proof 저장과 CANDIDATE → VALIDATED 전이. INVALID 후보는 CANDIDATE로 유지하며 결과를 반환.
-- 최신 Release를 먼저 잠근 후 strong If-Match를 확인하고 C 승인/거절 판단을 호출.
-- 승인 proof·검토자·의견·불변 승인본과 감사 기록을 한 transaction에 저장.
-- 기존 `ReleaseService.applySafetyContractHash`로 Release fingerprint를 변경. 기존 확정 판정은 invalidation을 남기고 과거 Attestation 원문/hash를 보존.
-- 현재 Release policy hash와 일치하는 승인본만 Gateway용 조회에 반환. 과거 승인본은 일반 버전 조회에 보존.
-- 실제 Finding → Oracle → CaseRun → Run → Case/Suite의 출처를 확인한 전용 patch source 조회.
+| Method / 경로 | 요청 | data 응답 |
+|---|---|---|
+| GET `/contract-versions/{id}` | version UUID | ContractVersion: 기존 Version 필드 + `contractId`(DB UUID), `diff` |
+| GET `/contracts/{id}/versions` | **contract UUID**, `limit=1..100`(기본25), `cursor?` | `{items,nextCursor}`; version 오름차순 |
+| POST `/contract-versions/{id}:validate` | `{}`, strong If-Match | ValidationResult: C의 `status,issues` + `versionId,state,policyHash,resourceHash,validationProof` |
+| POST `/contract-versions/{id}:approve` | `{comment,patchProposalId?}`, strong If-Match | ApprovedVersion: ContractVersion과 같은 형태, state=APPROVED |
 
-## 인증: MVP 로그인 없음 유지
+`contractId`(DB UUID), `contractKey`(정책 JSON의 contractId 문자열), version `id`는 서로 다른 값이다.
+목록 주소에 Release ID나 version ID를 넣지 않는다. `nextCursor=null`이면 마지막 페이지다.
+`diff`는 직전 서버 소유 버전과 비교한 최상위 정책 필드별 `{path,before,after}` 배열이다.
+첫 버전의 before는 null이며 policy는 canonical 공개 정책이다. 원문 프롬프트를 포함하지 않는다.
 
-로그인 UI·세션 로그인은 추가하지 않는다. 신뢰 경계가 필요한 새 API는 서버 관리자가 프로비저닝한 **한 workspace의 검토자 API 자격**을 사용한다. 기본값에서는 자격이 없어 403으로 닫힌다. 익명 체험 화면을 실제 승인으로 승격시키지 않는다.
+추가 A 인터페이스:
 
-서버 환경 변수:
+| Method / 경로 | 용도 |
+|---|---|
+| POST `/platform/contracts` | `{releaseId,policy}`로 **이미 생성된** 후보 저장, 201 Version |
+| GET `/platform/contracts?releaseId=…` | Release별 서버 소유 후보 조회(기존 응답 유지) |
+| POST `/contract-versions/{id}:reject` | `{comment}` + If-Match, 거절 |
+| GET `/contract-versions/{id}/approved?releaseId=…` | 현재 승인본과 Agent artifact / Release fingerprint |
+| GET `/platform/patch-sources/{findingId}` | 적격 Finding facts와 digest 검증된 Oracle evidence |
+| GET `/reviewer-session` | 아래 검토자 자격을 세션으로 교환하거나 현재 세션의 CSRF 토큰 조회 |
+
+이전 `/platform/contracts/{id}` 및 `:validate`, `:approve`, `:reject`, `/approved` 경로는 기존 호출자 호환용이다.
+새 호출자는 원 명세 경로를 사용한다. 두 경로 모두 같은 저장 로직·권한·If-Match·감사를 사용한다.
+기존 경로의 validate는 Version 응답을 유지하며, 원 명세 경로의 validate는 ValidationResult를 반환한다.
+
+## 인증 및 CSRF
+
+로그인 UI는 추가하지 않는다. 검토자 권한은 서버가 설정한 자격에서만 발급된다. 익명 체험이나 X-Actor-Id만으로 승인을 허용하지 않는다.
+기본값은 비활성화(403)다. 서버 환경 변수 및 Compose 전달 항목:
 
 ```text
 FINSEC_CONTRACT_ACCESS_KEY=<최소 32바이트의 무작위 비밀값>
-FINSEC_CONTRACT_ACCESS_ACTOR=<감사에 남길 검토자 식별자>
-FINSEC_CONTRACT_ACCESS_WORKSPACE=<검토자가 접근할 workspace UUID>
+FINSEC_CONTRACT_ACCESS_ACTOR=<검토자 식별자>
+FINSEC_CONTRACT_ACCESS_WORKSPACE=<workspace UUID>
 ```
 
-Docker Compose도 이 세 환경 변수를 backend 컨테이너에 전달한다. 브라우저 요청의 `credentials`는 `omit`을 사용하고, 필요한 Origin을 `FINSEC_CORS_ALLOWED_ORIGINS`에 등록한다. 사전 요청(OPTIONS)은 CORS 검사를 받으며 실제 데이터 요청의 인증을 대신하지 않는다.
+개발 workspace는 `0198f1e2-0000-7000-8000-000000000001`이다. 키는 git·프론트 bundle·URL·localStorage에 넣지 않는다.
 
-현재 개발 workspace ID는 `0198f1e2-0000-7000-8000-000000000001`이다. 키는 서버 운영자만 배포하며 프론트 bundle·git·공유 문서에 넣지 않는다. 이 단계는 개인별 로그인/SSO가 아니므로 여러 사람에게 같은 키를 공유하면 사람별 신원 구분을 제공하지 않는다. 배포 시 HTTPS를 사용한다.
+브라우저 세션 절차:
 
-요청은 `X-Contract-Reviewer-Key`로 인증한다. `X-Actor-Id`를 생략하면 서버 설정 Actor를 적용하며, 다른 Actor를 보내면 거절한다. role/authenticated/csrfVerified/workspace는 요청 본문에서 받지 않는다. Cookie 요청을 거절하고 비밀 custom header를 검증하여 C의 신뢰된 ReviewerContext를 만든다. 이 필터는 멱등성 예약·재응답보다 먼저 실행된다. 따라서 실패 요청은 예약을 만들지 않고, 자격을 잃은 요청도 과거 승인 응답을 재사용할 수 없다.
+1. 신뢰된 검토자가 `GET /api/v1/reviewer-session`에 `X-Contract-Reviewer-Key`를 보낸다.
+2. 서버가 30분 유효한 `__Host-FINSEC_REVIEWER` 쿠키(`HttpOnly; Secure; SameSite=Lax; Path=/`)와 `{csrfToken,expiresAt,actorId,workspaceId,role}`를 반환한다. 응답은 `Cache-Control: no-store`다.
+3. 이후 요청은 쿠키를 보내며, POST에는 `X-CSRF-Token`을 추가한다. 브라우저 연결에는 HTTPS와 허용 Origin 설정이 필요하다. 쿠키를 쓰는 fetch는 `credentials: 'include'`를 사용한다.
+4. 새로고침 후 같은 GET을 세션 쿠키로 호출하면 CSRF 토큰을 다시 받을 수 있다. 만료 시 검토자 자격으로 재발급한다.
 
-## API 계약
+세션은 서명된 서버 Actor/workspace/만료 시각을 검증한다. 키 또는 Actor/workspace 설정을 변경하면 기존 세션은 무효가 된다.
+서버 간 호출 및 로컬 CLI는 Cookie 없이 `X-Contract-Reviewer-Key`를 직접 사용할 수도 있다.
+Cookie가 있는 요청에서는 키를 함께 보내도 CSRF 검사를 우회할 수 없다. 모든 원 명세/호환 경로에서 인증이 멱등성 처리보다 먼저 실행된다.
+X-Actor-Id를 보낸다면 서버 Actor와 같아야 한다. role/workspace/authenticated는 본문에서 받지 않는다.
 
-공통 접두사: `/api/v1/platform`
+이 세션은 **설정된 workspace의 검토자 자격**을 위한 것이다. 공개 방문자별 demo workspace 자동 생성·guest session 발급 전체를 구현했다는 의미가 아니다.
+개인별 SSO나 여러 검토자 계정 관리도 포함하지 않는다. 그런 공통 Demo 기능은 이 변경의 완료 범위와 구분한다.
 
-| Method | 경로 | 입력 / 동작 |
-|---|---|---|
-| POST | `/contracts` | `{releaseId, policy}` 후보 생성. policy.contractId와 version은 C schema 기준이며 같은 계약에서 순차 버전만 허용 |
-| GET | `/contracts?releaseId=…` | A 무결성 메타데이터가 있는 버전 목록 |
-| GET | `/contracts/{versionId}` | 버전·정책·hash·검증 proof·검토 기록, ETag 반환 |
-| POST | `/contracts/{versionId}:validate` | 최신 resource hash의 strong If-Match, C 검증과 proof 저장 |
-| POST | `/contracts/{versionId}:approve` | strong If-Match와 `{comment}` |
-| POST | `/contracts/{versionId}:reject` | strong If-Match와 `{comment}` |
-| GET | `/contracts/{versionId}/approved?releaseId=…` | 현재 승인된 정책 + Agent artifact / Release fingerprint |
-| GET | `/patch-sources/{findingId}` | 적격 출처 facts와 digest 검증된 Oracle evidence만 반환 |
+## 상태·멱등성·응답 검증
 
-표의 `/contracts`는 공통 접두사 `/api/v1/platform` 아래다. 모든 POST에는 기존 `Idempotency-Key`가 필요하다. 응답은 기존 `{data,traceId,timestamp}` envelope다. 버전 응답 `resourceHash`를 큰따옴표로 감싸 If-Match로 전송한다. 재시도 시 응답 본문의 resourceHash가 기준이며 공통 idempotency middleware가 ETag 헤더까지 재생한다고 가정하지 않는다. `policyHash`를 If-Match로 사용하지 않는다.
+모든 POST에 Idempotency-Key가 필요하다. If-Match는 `"<resourceHash>"` 형식이며 policyHash를 대신 쓰지 않는다.
+검증 후 resourceHash가 바뀌므로 **검증 응답의** resourceHash로 승인한다. 공통 멱등성 재응답은 ETag 헤더가 아닌 본문의 resourceHash를 기준으로 한다.
+원 명세 validate body는 `{}`만 허용하고, approve는 comment와 선택적 patchProposalId 이외 필드를 거절한다.
 
-예: `If-Match: "sha256:..."`
+- INVALID 검증은 CANDIDATE 상태를 유지하고 C의 결과를 반환한다.
+- 오래된 If-Match/base 또는 활성 Run은 409다. 후보 생성은 분석된 Release에 허용한다.
+- 승인·Release 적용은 기존 DB 계약의 REMEDIATION → VERIFYING 또는 PASS/REVIEW/BLOCKED → NEEDS_REVALIDATION에서만 가능하다.
+- 승인·거절본과 검토 기록은 불변이다. 이전 판정은 무효화 기록을 남기며 과거 Attestation 원문과 hash를 유지한다.
+- 현재 승인본 조회는 저장 hash, 검증 proof, review, Release/version/workspace 결합과 artifact를 확인한다. 조회 시점 snapshot이므로 Gateway는 실행의 고정 fingerprint와 다시 대조해야 한다.
 
-검증 뒤 resourceHash가 바뀌므로 승인에는 **검증 응답의** resourceHash를 사용한다. 상태 충돌/오래된 base/활성 Run은 409, 권한 오류는 403, 적격 출처 없음은 404, C 검증·승인 조건 위반은 422 또는 해당 상태 오류다. 실제 승인에는 C의 WARN 확인을 포함한 검토 의견이 필요하다.
+## 패치 연결
 
-## Release 상태와 실행 연결
+`ContractPersistenceService.storePatch(findingId,baseVersionId,ProposedPatch,reviewer)`는 B/C가 생성한 후보를 받는 **내부 저장 인터페이스**다.
+A가 DB에서 출처·base·catalog를 다시 읽고 C의 `SafetyContractPatchProposalPolicy`를 호출한다. C가 PROPOSED로 인정한 결과만 후보·proposal·검증 증거와 함께 원자적으로 저장한다.
+반환값은 `{patchProposalId,candidate}`다. 이 메서드는 모델을 호출하지 않는다.
 
-후보 생성은 분석된 Release에 허용한다. 실제 승인·정책 적용은 기존 DB 계약에 따라 **REMEDIATION → VERIFYING**, 또는 **PASS/REVIEW/BLOCKED → NEEDS_REVALIDATION**에서만 수행한다. 진행 중/대기 중 Run이 있으면 검증·승인을 거절한다. A가 없는 시험 결과나 보완 상태를 만들어내지 않는다. B/D 실행 소유자는 실제 baseline과 위험 결과를 근거로 적절한 Release 상태를 전달해야 한다.
+승인 body의 patchProposalId는 존재 여부, 동일 Release, PROPOSED 상태, 해당 candidate ID, C의 재검증 결과와 정책 hash를 확인한다.
+성공 시 불변 patch_approvals와 계약 승인·Release 반영·감사를 같은 transaction에 저장한다.
+패치 후보에 연결된 patchProposalId를 생략하거나 다른 ID를 보내면 409이며, 임의 proposal ID를 무시한 채 일반 승인하지 않는다.
 
-B/C는 HTTP 승인본 조회 또는 `ContractPersistenceService.approved`를 재사용할 수 있다. 반환 snapshot은 조회 시점의 현재 승인본이며 장기 캐시 허가가 아니다. 실제 Gateway는 Run의 고정 version/fingerprint와 조회 snapshot을 대조하고 실행 시점까지의 변경을 통제해야 한다. 이 구현은 도구를 호출하거나 ENFORCE 완료를 주장하지 않는다.
+패치 출처는 OPEN/TRIAGED Finding → ATTACK_SUCCESS Oracle → 완료된 BASELINE/SEAL_REPLAY Run의 SEED/MUTATION만 허용한다.
+증거 본문을 읽기 전에 workspace·suite·Release와 부모 계보를 확인한다. HELD_OUT·숨김·숨김 원본의 파생·외부 workspace·순환 계보는 제외한다.
+통과한 Oracle evidence도 canonical digest를 검사한다. 불허 출처와 미존재 ID는 모두 404다.
 
-## 패치용 Finding 출처
+## 별도 팀 연결 범위
 
-`PatchSourceService.find`는 C의 `FindingSourceFacts` 타입을 그대로 반환한다. 요청자가 partition/hidden/evidenceDigest를 지정하지 못한다.
-
-1. 증거 본문을 읽기 전에 workspace/release/suite/run/case 연결을 조회.
-2. OPEN/TRIAGED Finding, ATTACK_SUCCESS Oracle, 완료된 BASELINE/SEAL_REPLAY Run, SEED/MUTATION 및 hidden=false만 허용.
-3. 부모 seed 계보까지 조사하여 HELD_OUT/숨김/다른 workspace 계보와 순환 계보를 거절.
-4. 통과한 경우에만 Oracle evidence를 읽고 canonical digest를 검증.
-
-관련 Finding 목록, 암호화된 공격 payload, 자유로운 상세 조회 결과는 전달하지 않는다. 불허 출처와 없는 ID는 같은 404 응답이다. 이는 C가 이미 정의한 적격성 규칙을 저장 조회에서 강제한 것이며 D의 Finding 판단을 변경하지 않는다.
+`POST /releases/{id}/contracts:generate`와 `POST /findings/{id}/patch-proposals`의 실제 AI 생성·비동기 작업 접수는 B/C 생성 연결 범위다.
+A의 후보 저장이나 storePatch를 이 생성 API가 완료된 것으로 간주하지 않는다. 현재 생성 API의 202 성공을 합성하지 않는다.
+C 화면·Gateway의 API 사용과 B의 실행 문맥·도구 응답 연결 및 전체 Replay는 별도 통합 작업이다.
 
 ## Migration / 검증
 
-V14는 기존 계약 버전을 다시 승인된 것으로 간주하지 않고, 새 서버 생성 버전에 무결성 메타데이터를 추가한다. 기존 SQL migration은 변경하지 않았다. 승인·거절 후 review metadata도 변경할 수 없다.
+V14는 서버 생성 버전의 hash·검토 metadata를 보존한다. 기존 migration checksum은 변경하지 않았다.
+무결성 metadata가 없는 legacy 계약을 현재 승인 권한으로 자동 승격하지 않으며 새 API 이력 대상에서도 제외한다.
 
 ```sh
 ./gradlew test --tests 'com.finsecseal.platform.contract.*'
-FINSEC_AI_LIVE_E2E=false ./gradlew test
+FINSEC_AI_LIVE_E2E=false ./gradlew test bootJar
 ```
 
-새 PostgreSQL/HTTP 테스트는 계약 생명주기, If-Match, 동시 승인, 잘못된 reviewer와 workspace, idempotency, 변조 탐지, 승인본 불변성, 이전 보고서 보존, 패치 출처·숨김 계보 필터를 검증한다. 실제 LLM/Gateway 실행은 포함하지 않는다.
+원 명세 주소를 직접 호출하는 HTTP 테스트로 상세·계약별 페이지·ValidationResult·승인·오래된 hash·알 수 없는 필드·proposal ID를 검증한다.
+추가로 세션 발급, 쿠키 속성, 만료·서명·workspace, CSRF 실패 전 멱등성 차단, 패치 승인 연결, 동시 승인과 보고서 보존을 검증한다.
 
-C/B 연결이 남는 항목: 후보 생성 호출, 정책 후보 UI의 실 API 사용, Gateway용 실행 문맥·응답 provenance, 실제 Replay. A가 후보나 실행 결과를 합성해 이 경계를 대신하지 않는다.
-
-검증 기록(2026-09-07): 전체 1,295개 중 1,294개 통과, 실제 외부 AI 호출 1개는 비활성화되어 건너뜀. 이후 CORS·설정 전달 보완을 포함한 A 통합 테스트 11개 및 bootJar 빌드 통과.
+검증 기록(2026-09-07): 전체 1,301개 중 1,300개 통과, 외부 AI 호출 1개 제외. 이후 Finding 잠금 및 패치 증거 변조 검사 보완 후 계약 테스트 16개와 bootJar 재검증 통과.

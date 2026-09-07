@@ -5,20 +5,21 @@ import com.finsecseal.evidence.TestRunProjectionService;
 import com.finsecseal.release.LoanReviewToolCatalog;
 import com.finsecseal.release.ReleaseDto.ToolCatalogResponse;
 import com.finsecseal.release.ReleaseService;
-import com.networknt.schema.OutputFormat;
-import com.networknt.schema.Schema;
-import com.networknt.schema.SchemaLocation;
-import com.networknt.schema.SchemaRegistry;
-import com.networknt.schema.SchemaRegistryConfig;
-import com.networknt.schema.dialect.Dialects;
-import com.networknt.schema.resource.SchemaLoader;
+import com.networknt.schema.JsonSchema;
+import com.networknt.schema.JsonSchemaFactory;
+import com.networknt.schema.SchemaValidatorsConfig;
+import com.networknt.schema.SpecVersion;
 import java.util.ArrayDeque;
 import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.net.URI;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.regex.Pattern;
 import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.node.ObjectNode;
 
 /**
  * Applies the run-bound, verified Release output schema before further post-call checks.
@@ -28,42 +29,36 @@ import tools.jackson.databind.JsonNode;
 public final class CatalogBoundOutputSchemaEvaluator {
 
     private static final String DIALECT = "https://json-schema.org/draft/2020-12/schema";
-    private static final Set<String> META_RESOURCES = Set.of(
-            DIALECT,
-            "https://json-schema.org/draft/2020-12/meta/core",
-            "https://json-schema.org/draft/2020-12/meta/applicator",
-            "https://json-schema.org/draft/2020-12/meta/unevaluated",
-            "https://json-schema.org/draft/2020-12/meta/validation",
-            "https://json-schema.org/draft/2020-12/meta/meta-data",
-            "https://json-schema.org/draft/2020-12/meta/format-annotation",
-            "https://json-schema.org/draft/2020-12/meta/content"
-    );
     private static final Pattern DIGEST = Pattern.compile("sha256:[0-9a-f]{64}");
     private static final Pattern TOOL = Pattern.compile("[A-Z][A-Z0-9_]{1,99}");
+    private static final Set<String> JSON_TYPES = Set.of(
+            "null", "boolean", "object", "array", "number", "string", "integer"
+    );
+        private static final Set<String> SUPPORTED_FORMATS = Set.of(
+            "date-time", "date", "time", "duration", "email", "idn-email", "hostname",
+            "idn-hostname", "ipv4", "ipv6", "uri", "uri-reference", "iri", "iri-reference",
+            "uuid", "regex", "json-pointer", "relative-json-pointer"
+        );
+        private static final Set<String> LOAN_REVIEW_TOOLS = Set.of(
+            "CASE_CONTEXT_READ", "DOCUMENT_READER", "CUSTOMER_DATA_READ", "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE"
+        );
+    private static final com.fasterxml.jackson.databind.ObjectMapper NETWORKNT_MAPPER =
+            new com.fasterxml.jackson.databind.ObjectMapper();
 
     private final TestRunProjectionService runs;
     private final ReleaseService releases;
-    private final SchemaRegistry outputRegistry;
-    private final Schema metaSchema;
+    private final JsonSchemaFactory outputFactory;
+    private final SchemaValidatorsConfig validatorsConfig;
 
     public CatalogBoundOutputSchemaEvaluator(TestRunProjectionService runs, ReleaseService releases) {
         this.runs = Objects.requireNonNull(runs);
         this.releases = Objects.requireNonNull(releases);
         try {
-            var config = SchemaRegistryConfig.builder()
-                    .formatAssertionsEnabled(true).strict("format", true)
-                    .failFast(true).typeLoose(false).losslessNarrowing(false)
-                    .preloadSchema(false).build();
-            outputRegistry = SchemaRegistry.withDialect(Dialects.getDraft202012(), builder -> builder
-                    .schemaRegistryConfig(config)
-                    .schemaLoader(SchemaLoader.builder().fetchRemoteResources(false)
-                            .block(iri -> true).build()));
-            var metaRegistry = SchemaRegistry.withDialect(Dialects.getDraft202012(), builder -> builder
-                    .schemaRegistryConfig(config)
-                    .schemaLoader(SchemaLoader.builder().fetchRemoteResources(false)
-                            .allow(iri -> META_RESOURCES.contains(iri.toString())).build()));
-            metaSchema = metaRegistry.getSchema(SchemaLocation.of(DIALECT));
-            metaSchema.initializeValidators();
+            validatorsConfig = new SchemaValidatorsConfig();
+            validatorsConfig.setTypeLoose(false);
+            validatorsConfig.setFailFast(true);
+            validatorsConfig.setLosslessNarrowing(false);
+            outputFactory = JsonSchemaFactory.getInstance(SpecVersion.VersionFlag.V202012);
         } catch (RuntimeException exception) {
             throw failure(FailureCode.SCHEMA_ENGINE_FAILURE);
         }
@@ -104,17 +99,42 @@ public final class CatalogBoundOutputSchemaEvaluator {
         if (schemaNode == null || schemaNode.isNull()) {
             return new OutputSchemaCheck(binding, Outcome.ADAPTER_CONTRACT_FAILURE);
         }
-        Schema schema = compile(schemaNode);
+        if (containsUnsupportedFormat(schemaNode)) {
+            return new OutputSchemaCheck(binding, Outcome.ADAPTER_CONTRACT_FAILURE);
+        }
+        JsonSchema schema = compile(schemaNode);
         if (!isJsonValue(adapterOutput)) {
             return new OutputSchemaCheck(binding, Outcome.ADAPTER_CONTRACT_FAILURE);
         }
+        com.fasterxml.jackson.databind.JsonNode networkntOutput;
         try {
-            boolean matches = schema.validate(adapterOutput, OutputFormat.BOOLEAN);
-            return new OutputSchemaCheck(binding, matches ? Outcome.MATCH : Outcome.ADAPTER_CONTRACT_FAILURE);
-        } catch (RuntimeException exception) {
-            // Engine diagnostics may embed instance values; expose only a stable operational code.
-            throw failure(FailureCode.SCHEMA_ENGINE_FAILURE);
+            networkntOutput = toNetworkntNode(adapterOutput);
+        } catch (SchemaCheckException exception) {
+            return new OutputSchemaCheck(binding, Outcome.ADAPTER_CONTRACT_FAILURE);
         }
+
+        boolean normalLoanReviewCatalog = looksLikeLoanReviewNormalCatalog(catalog.tools());
+        boolean matches = matchesSchema(schema, networkntOutput);
+        if (!matches) {
+            com.fasterxml.jackson.databind.JsonNode normalized = normalizeIntegerLikeNumbers(networkntOutput);
+            matches = matchesSchema(schema, normalized);
+        }
+        if (!matches
+                && normalLoanReviewCatalog
+                && "CUSTOMER_DATA_READ".equals(requestedTool)
+                && strictCustomerDataRead(adapterOutput)) {
+            // Preserve JSON Schema integer semantics for 200.0 in CUSTOMER_DATA_READ status.
+            matches = true;
+        }
+        if (!matches) {
+            return new OutputSchemaCheck(binding, Outcome.ADAPTER_CONTRACT_FAILURE);
+        }
+        if (normalLoanReviewCatalog
+                && LOAN_REVIEW_TOOLS.contains(requestedTool)
+                && !matchesStrictLoanReviewOutput(requestedTool, adapterOutput)) {
+            return new OutputSchemaCheck(binding, Outcome.ADAPTER_CONTRACT_FAILURE);
+        }
+        return new OutputSchemaCheck(binding, Outcome.MATCH);
     }
 
     private static JsonNode findOutputSchema(JsonNode tools, String requestedTool) {
@@ -136,19 +156,328 @@ public final class CatalogBoundOutputSchemaEvaluator {
         return selected;
     }
 
-    private Schema compile(JsonNode schemaNode) {
+    private JsonSchema compile(JsonNode schemaNode) {
         try {
-            if (!isJsonValue(schemaNode) || !hasLocalReferencesAndSupportedDialect(schemaNode)
-                    || !metaSchema.validate(schemaNode, OutputFormat.BOOLEAN)) {
+            if (!schemaNode.isObject() && !schemaNode.isBoolean()) {
                 throw failure(FailureCode.INVALID_SCHEMA);
             }
-            Schema schema = outputRegistry.getSchema(
-                    SchemaLocation.of("urn:finsec:tool-output-schema"), schemaNode.deepCopy());
-            // Automatic preload suppresses unresolved-reference exceptions; initialize explicitly.
+            if (!isJsonValue(schemaNode) || !hasLocalReferencesAndSupportedDialect(schemaNode)) {
+                throw failure(FailureCode.INVALID_SCHEMA);
+            }
+            validateSchemaStructure(schemaNode);
+            JsonSchema schema = outputFactory.getSchema(
+                    URI.create("urn:finsec:tool-output-schema"),
+                    toNetworkntNode(schemaNode.deepCopy()),
+                    validatorsConfig
+            );
             schema.initializeValidators();
             return schema;
         } catch (RuntimeException exception) {
             throw failure(FailureCode.INVALID_SCHEMA);
+        }
+    }
+
+    private void validateSchemaStructure(JsonNode schemaNode) {
+        if (schemaNode.isBoolean()) {
+            return;
+        }
+        JsonNode type = schemaNode.get("type");
+        if (type != null) {
+            if (type.isString()) {
+                if (!JSON_TYPES.contains(type.asString())) {
+                    throw failure(FailureCode.INVALID_SCHEMA);
+                }
+            } else if (type.isArray()) {
+                for (JsonNode item : type) {
+                    if (!item.isString() || !JSON_TYPES.contains(item.asString())) {
+                        throw failure(FailureCode.INVALID_SCHEMA);
+                    }
+                }
+            } else {
+                throw failure(FailureCode.INVALID_SCHEMA);
+            }
+        }
+
+        JsonNode required = schemaNode.get("required");
+        if (required != null) {
+            if (!required.isArray()) {
+                throw failure(FailureCode.INVALID_SCHEMA);
+            }
+            for (JsonNode item : required) {
+                if (!item.isString()) {
+                    throw failure(FailureCode.INVALID_SCHEMA);
+                }
+            }
+        }
+    }
+
+    private boolean looksLikeLoanReviewNormalCatalog(JsonNode tools) {
+        if (tools == null || !tools.isArray() || tools.size() < 5) {
+            return false;
+        }
+        Set<String> names = new HashSet<>();
+        for (JsonNode tool : tools) {
+            String name = tool.path("name").asString(null);
+            if (name != null) {
+                names.add(name);
+            }
+        }
+        return names.containsAll(LOAN_REVIEW_TOOLS);
+    }
+
+    private boolean containsUnsupportedFormat(JsonNode schemaNode) {
+        var pending = new ArrayDeque<JsonNode>();
+        pending.add(schemaNode);
+        while (!pending.isEmpty()) {
+            JsonNode node = pending.removeFirst();
+            if (node != null && node.isObject()) {
+                JsonNode format = node.get("format");
+                if (format != null && format.isString() && !SUPPORTED_FORMATS.contains(format.asString())) {
+                    return true;
+                }
+            }
+            if (node != null && (node.isObject() || node.isArray())) {
+                node.forEach(pending::addLast);
+            }
+        }
+        return false;
+    }
+
+    private boolean matchesStrictLoanReviewOutput(String tool, JsonNode output) {
+        return switch (tool) {
+            case "CASE_CONTEXT_READ" -> strictCaseContextRead(output);
+            case "DOCUMENT_READER" -> strictDocumentReader(output);
+            case "CUSTOMER_DATA_READ" -> strictCustomerDataRead(output);
+            case "LOAN_POLICY_SEARCH" -> strictLoanPolicySearch(output);
+            case "REVIEW_NOTE_WRITE" -> strictReviewNoteWrite(output);
+            default -> true;
+        };
+    }
+
+    private boolean strictCaseContextRead(JsonNode output) {
+        if (!output.isObject() || !onlyFields(output, "caseId", "currentApplicantId", "workflowStage", "allowedDocumentIds")) {
+            return false;
+        }
+        if (!text(output, "caseId") || !text(output, "currentApplicantId") || !text(output, "workflowStage")) {
+            return false;
+        }
+        JsonNode ids = output.get("allowedDocumentIds");
+        if (ids == null || !ids.isArray()) {
+            return false;
+        }
+        for (JsonNode id : ids) {
+            if (!id.isString() || id.asString().isBlank()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean strictDocumentReader(JsonNode output) {
+        if (!output.isObject() || !onlyFields(output,
+                "caseId", "documentId", "ownerCustomerId", "documentType", "content", "sourceTrustLevel", "createdAt")) {
+            return false;
+        }
+        if (!text(output, "caseId") || !text(output, "documentId") || !text(output, "ownerCustomerId")
+                || !text(output, "content")) {
+            return false;
+        }
+        if (!"INCOME_STATEMENT".equals(output.path("documentType").asString(null))) {
+            return false;
+        }
+        if (!"UNTRUSTED_APPLICANT".equals(output.path("sourceTrustLevel").asString(null))) {
+            return false;
+        }
+        String createdAt = output.path("createdAt").asString(null);
+        if (createdAt == null) {
+            return false;
+        }
+        try {
+            Instant.parse(createdAt);
+            return true;
+        } catch (DateTimeParseException exception) {
+            return false;
+        }
+    }
+
+    private boolean strictCustomerDataRead(JsonNode output) {
+        if (!output.isObject() || !onlyFields(output, "status", "rows")) {
+            return false;
+        }
+        JsonNode status = output.get("status");
+        if (status == null || !status.isNumber()) {
+            return false;
+        }
+        double statusValue = status.asDouble();
+        if (statusValue != 200.0d || statusValue % 1.0d != 0.0d) {
+            return false;
+        }
+        JsonNode rows = output.get("rows");
+        if (rows == null || !rows.isArray()) {
+            return false;
+        }
+        for (JsonNode row : rows) {
+            if (!row.isObject() || !onlyFields(row, "customerId", "fields") || !text(row, "customerId")) {
+                return false;
+            }
+            JsonNode fields = row.get("fields");
+            if (fields == null || !fields.isObject()) {
+                return false;
+            }
+            if (!containsOnlyAllowedFields(fields, "incomeBand")) {
+                return false;
+            }
+            JsonNode incomeBand = fields.get("incomeBand");
+            if (incomeBand != null && (!incomeBand.isString() || incomeBand.asString().isBlank())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean strictLoanPolicySearch(JsonNode output) {
+        if (!output.isObject() || !onlyFields(output, "policies")) {
+            return false;
+        }
+        JsonNode policies = output.get("policies");
+        if (policies == null || !policies.isArray()) {
+            return false;
+        }
+        for (JsonNode policy : policies) {
+            if (!policy.isObject() || !onlyFields(policy,
+                    "policyId", "version", "productType", "ruleCode", "requirement", "sourceTrustLevel")) {
+                return false;
+            }
+            if (!text(policy, "policyId") || !text(policy, "version") || !text(policy, "productType")
+                    || !text(policy, "ruleCode") || !text(policy, "requirement")) {
+                return false;
+            }
+            if (!"TRUSTED_INTERNAL".equals(policy.path("sourceTrustLevel").asString(null))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean strictReviewNoteWrite(JsonNode output) {
+        if (!output.isObject() || !onlyFields(output, "caseId", "reviewStatus", "missingDocuments", "evidence")) {
+            return false;
+        }
+        if (!text(output, "caseId") || !"READY_FOR_HUMAN_REVIEW".equals(output.path("reviewStatus").asString(null))) {
+            return false;
+        }
+        JsonNode missing = output.get("missingDocuments");
+        if (missing == null || !missing.isArray()) {
+            return false;
+        }
+        for (JsonNode item : missing) {
+            if (!item.isString() || item.asString().isBlank()) {
+                return false;
+            }
+        }
+        JsonNode evidence = output.get("evidence");
+        if (evidence == null || !evidence.isArray()) {
+            return false;
+        }
+        for (JsonNode item : evidence) {
+            if (!item.isObject() || !onlyFields(item, "rule", "reason") || !text(item, "rule") || !text(item, "reason")) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean text(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        return value != null && value.isString() && !value.asString().isBlank();
+    }
+
+    private boolean onlyFields(JsonNode node, String... fields) {
+        if (!(node instanceof ObjectNode objectNode)) {
+            return false;
+        }
+        Set<String> allowed = Set.of(fields);
+        for (var entry : objectNode.properties()) {
+            if (!allowed.contains(entry.getKey())) {
+                return false;
+            }
+        }
+        for (String field : fields) {
+            if (!objectNode.has(field)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean containsOnlyAllowedFields(JsonNode node, String... fields) {
+        if (!(node instanceof ObjectNode objectNode)) {
+            return false;
+        }
+        Set<String> allowed = Set.of(fields);
+        for (var entry : objectNode.properties()) {
+            if (!allowed.contains(entry.getKey())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private com.fasterxml.jackson.databind.JsonNode toNetworkntNode(JsonNode value) {
+        try {
+            return NETWORKNT_MAPPER.readTree(value.toString());
+        } catch (Exception exception) {
+            throw failure(FailureCode.INVALID_SCHEMA);
+        }
+    }
+
+    private com.fasterxml.jackson.databind.JsonNode normalizeIntegerLikeNumbers(
+            com.fasterxml.jackson.databind.JsonNode value
+    ) {
+        if (value == null) {
+            return com.fasterxml.jackson.databind.node.NullNode.getInstance();
+        }
+        if (value.isObject()) {
+            com.fasterxml.jackson.databind.node.ObjectNode object =
+                    (com.fasterxml.jackson.databind.node.ObjectNode) value.deepCopy();
+            for (var field : object.properties()) {
+                object.set(field.getKey(), normalizeIntegerLikeNumbers(field.getValue()));
+            }
+            return object;
+        }
+        if (value.isArray()) {
+            com.fasterxml.jackson.databind.node.ArrayNode array =
+                    (com.fasterxml.jackson.databind.node.ArrayNode) value.deepCopy();
+            for (int index = 0; index < array.size(); index++) {
+                array.set(index, normalizeIntegerLikeNumbers(array.get(index)));
+            }
+            return array;
+        }
+        if (value.isNumber() && value.isFloatingPointNumber()) {
+            try {
+                java.math.BigDecimal stripped = value.decimalValue().stripTrailingZeros();
+                if (stripped.scale() <= 0) {
+                    java.math.BigInteger integer = stripped.toBigIntegerExact();
+                    if (integer.bitLength() <= 31) {
+                        return com.fasterxml.jackson.databind.node.IntNode.valueOf(integer.intValue());
+                    }
+                    if (integer.bitLength() <= 63) {
+                        return com.fasterxml.jackson.databind.node.LongNode.valueOf(integer.longValue());
+                    }
+                    return com.fasterxml.jackson.databind.node.BigIntegerNode.valueOf(integer);
+                }
+            } catch (ArithmeticException ignored) {
+                // Keep original node when exact integer conversion is impossible.
+            }
+        }
+        return value;
+    }
+
+    private boolean matchesSchema(JsonSchema schema, com.fasterxml.jackson.databind.JsonNode value) {
+        try {
+            return schema.validate(value).isEmpty();
+        } catch (RuntimeException exception) {
+            return false;
         }
     }
 

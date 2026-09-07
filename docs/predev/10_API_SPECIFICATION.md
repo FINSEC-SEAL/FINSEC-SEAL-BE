@@ -148,3 +148,17 @@ Event names: `run.status`, `run.progress`, `case.status`, `trace.event`, `findin
 ## 6. Error codes
 
 `MANIFEST_INVALID`, `RELEASE_CHANGED`, `INVALID_STATE_TRANSITION`, `RUN_ALREADY_ACTIVE`, `BUDGET_EXCEEDED`, `PROVIDER_TIMEOUT`, `LLM_OUTPUT_INVALID`, `FIXTURE_INTEGRITY_FAILURE`, `CONTRACT_VALIDATION_FAILED`, `HELD_OUT_ACCESS_DENIED`, `GATE_CONSTRAINT_VIOLATION`, `EVIDENCE_INCOMPLETE`, `STREAM_CURSOR_EXPIRED`, `IDEMPOTENCY_CONFLICT`, plus Policy reason codes from `12/16`.
+
+## 7. A 계약 저장 API 구현 연결 (2026-09-07)
+
+위 Contracts 표의 원 경로를 유지한다. 현재 원 명세의 상세·검증·승인과 계약 UUID별 페이지 이력은
+`ContractSpecificationController`가 같은 A 저장 서비스에 연결한다. 공통 API envelope의 data에
+검증 응답은 `status,issues,versionId,state,resourceHash,policyHash,validationProof`, 이력 응답은
+`{items,nextCursor}`를 제공한다. 버전 상세의 `contractId`는 DB 계약 UUID이며 정책 안의 문자열 contractId와 구분한다.
+
+검토자 세션은 `/api/v1/reviewer-session`에서 서버 설정 자격으로 발급하며 HttpOnly/Secure/SameSite=Lax 쿠키와 mutation CSRF를 검증한다.
+기존 키 방식은 Cookie 없는 서버 간/로컬 호출의 추가 인증 수단으로 유지한다. 공개 방문자별 guest/demo workspace 발급 전체와 혼동하지 않는다.
+
+추가 후보 저장·현재 승인본 조회·출처 필터 및 이전 `/platform/contracts` 경로의 호환 여부,
+선택적 patchProposalId의 승인 연결은 [A 계약 API 인수인계](../A_CONTRACT_INTEGRATION_HANDOFF.md)에 명시한다.
+`contracts:generate`와 Finding의 비동기 patch 생성은 B/C의 생성 연결 작업이며 이 저장 API와 별개다.

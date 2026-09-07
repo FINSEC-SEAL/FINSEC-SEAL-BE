@@ -16,7 +16,7 @@ public class ContractController {
     private final ContractPersistenceService service;
     public ContractController(ContractPersistenceService service) {this.service=service;}
     public record Create(UUID releaseId,JsonNode policy) {}
-    public record Review(String comment) {}
+    public record Review(String comment, UUID patchProposalId) {}
     @PostMapping
     ResponseEntity<?> create(@RequestBody Create body,HttpServletRequest request) {
         return response(service.create(body.releaseId(),body.policy(),reviewer(request)),201);
@@ -33,7 +33,7 @@ public class ContractController {
     }
     @PostMapping("/{id}:approve")
     ResponseEntity<?> approve(@PathVariable UUID id,@RequestHeader("If-Match") String match,@RequestBody Review body,HttpServletRequest r) {
-        return response(service.approve(id,match,body.comment(),reviewer(r)),200);
+        return response(service.approve(id,match,body.comment(),body.patchProposalId(),reviewer(r)),200);
     }
     @PostMapping("/{id}:reject")
     ResponseEntity<?> reject(@PathVariable UUID id,@RequestHeader("If-Match") String match,@RequestBody Review body,HttpServletRequest r) {
