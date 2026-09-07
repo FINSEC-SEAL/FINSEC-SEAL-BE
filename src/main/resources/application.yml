@@ -33,6 +33,10 @@ management:
         enabled: true
 
 finsec:
+  contract-access:
+    key: ${FINSEC_CONTRACT_ACCESS_KEY:}
+    actor: ${FINSEC_CONTRACT_ACCESS_ACTOR:}
+    workspace: ${FINSEC_CONTRACT_ACCESS_WORKSPACE:}
   scheduling:
     enabled: ${FINSEC_SCHEDULING_ENABLED:true}
   cors:
