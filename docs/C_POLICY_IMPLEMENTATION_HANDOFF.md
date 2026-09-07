@@ -1,3 +1,4 @@
+
 # C 정책 판단 구현 및 통합 인계
 
 이 문서는 C 판단 코어의 구현 범위와 남은 연결 작업을 기록한다. 전체 Role C 또는 ENFORCE/Generation/Replay의 실제 실행 완료를 뜻하지 않는다. 책임 기준은 [A Architecture Baseline](A_ARCHITECTURE_BASELINE.md)과 [4인 역할분담](../FINSEC_SEAL_4인_역할분담.md), 판단 규칙은 [Safety Contract](predev/12_SAFETY_CONTRACT_SPEC.md)와 [Policy Gateway](predev/16_POLICY_GATEWAY_SPEC.md)를 따른다.
@@ -58,7 +59,7 @@ B가 baseline/replay 실행·namespace 초기화와 통제 사실을, D가 Oracl
 4. TC-GW-014의 warm workload p95≤20ms 및 p99≤50ms, 실제 평가 timeout 100ms를 측정. 코어 단위 테스트 시간을 성능 증거로 쓰지 않는다.
 5. 모델 후보/패치 생성, A 승인 저장·API, B Replay 실행·D 결과를 연결하여 TC-CON-004/005/006, TC-PAT-002, TC-REP-001~004 통합 검증.
 
-FE는 현재 공통 shell/API 연결 기반이 없는 README 단계다. C UI를 완료로 계산하지 않았으며 이 문서는 프론트 제외 판단 코어를 다룬다.
+2026-09-07 pull 이후 FE에는 공통 shell과 A/B/D 화면이 있다. 실제 C 계약 API와 UI 연결은 아직 완료로 계산하지 않았으며 이 문서는 프론트 제외 판단 코어를 다룬다. 아래 검증·전달 기록은 이전 정책 코어 Run `20260906T171355Z-5116aa38` 당시의 결과다. 이후 원 명세의 생성 입력·프롬프트·응답 검증·리뷰 비교, 현재 검증 결과와 소유자 연결 현황은 [C 계약 후보 인계](C_CONTRACT_GENERATION_HANDOFF.md)에 기록한다.
 
 ## 검증과 전달
 
