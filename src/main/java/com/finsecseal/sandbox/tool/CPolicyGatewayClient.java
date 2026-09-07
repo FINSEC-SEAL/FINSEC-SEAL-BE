@@ -7,7 +7,6 @@ import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.runtime.ToolInvocation;
 import com.finsecseal.runtime.ToolProposal;
 import com.finsecseal.sandbox.SandboxExecutionContext;
-import com.finsecseal.common.domain.TestRunMode;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -55,7 +54,6 @@ public class CPolicyGatewayClient implements PolicyGateway {
 
     @Override
     public GatewayResult invoke(SandboxExecutionContext context, ToolInvocation invocation, String actorId) {
-        requireBaselineMode(context);
         Map response = evaluate(context, invocation, null, actorId);
         boolean allowed = response != null && Boolean.TRUE.equals(response.get("allowed"));
         String reason = response == null ? "UNKNOWN" : String.valueOf(response.get("reasonCode"));
@@ -145,7 +143,6 @@ public class CPolicyGatewayClient implements PolicyGateway {
 
     @Override
     public GatewayResult invoke(SandboxExecutionContext context, ToolProposal proposal, String actorId) {
-        requireBaselineMode(context);
         Map response = evaluate(context, null, proposal, actorId);
         boolean allowed = response != null && Boolean.TRUE.equals(response.get("allowed"));
         String reason = response == null ? "UNKNOWN" : String.valueOf(response.get("reasonCode"));
@@ -247,13 +244,6 @@ public class CPolicyGatewayClient implements PolicyGateway {
         throw last == null
                 ? new BusinessException(ErrorCode.INTERNAL_ERROR, "C Policy Gateway call failed")
                 : last;
-    }
-
-    private void requireBaselineMode(SandboxExecutionContext context) {
-        if (context.mode() != TestRunMode.BASELINE) {
-            throw new BusinessException(ErrorCode.CONFIGURATION_ERROR,
-                    "C Policy Gateway only supports BASELINE");
-        }
     }
 
     private ToolAdapter requireAdapter(String toolName) {

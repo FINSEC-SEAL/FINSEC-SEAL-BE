@@ -15,18 +15,24 @@ import tools.jackson.databind.ObjectMapper;
 public class AgentAiHttpConfiguration {
 
     @Bean
+    HttpClient finsecAiHttpClient(
+        @Value("${finsec.ai.connect-timeout:2s}") Duration connectTimeout
+    ) {
+    return HttpClient.newBuilder()
+        .version(HttpClient.Version.HTTP_1_1)
+        .connectTimeout(connectTimeout)
+        .build();
+    }
+
+    @Bean
     @ConditionalOnMissingBean(AgentAiClient.class)
     HttpAgentAiClient httpAgentAiClient(
+        HttpClient finsecAiHttpClient,
             ObjectMapper objectMapper,
             AgentRunContextResolver runContextResolver,
             @Value("${finsec.ai.base-url:http://localhost:8001}") URI baseUrl,
-            @Value("${finsec.ai.connect-timeout:2s}") Duration connectTimeout,
             @Value("${finsec.ai.request-timeout:5s}") Duration requestTimeout
     ) {
-        HttpClient httpClient = HttpClient.newBuilder()
-                .version(HttpClient.Version.HTTP_1_1)
-                .connectTimeout(connectTimeout)
-                .build();
         String apiKey = System.getenv("OPENAI_API_KEY");
         // allow overriding via finsec.ai.api-key property
         // Spring will not inject empty nested placeholders cleanly in all cases, so check system properties too
@@ -36,9 +42,30 @@ public class AgentAiHttpConfiguration {
         }
 
         return new HttpAgentAiClient(
-                httpClient,
+                finsecAiHttpClient,
                 objectMapper,
                 runContextResolver,
+                baseUrl,
+                requestTimeout,
+                apiKey
+        );
+    }
+
+    @Bean
+    ContractCandidateAiClient contractCandidateAiClient(
+            HttpClient finsecAiHttpClient,
+            ObjectMapper objectMapper,
+            @Value("${finsec.ai.base-url:http://localhost:8001}") URI baseUrl,
+            @Value("${finsec.ai.request-timeout:5s}") Duration requestTimeout
+    ) {
+        String apiKey = System.getenv("OPENAI_API_KEY");
+        String configured = System.getProperty("finsec.ai.api-key");
+        if (configured != null && !configured.isBlank()) {
+            apiKey = configured;
+        }
+        return new ContractCandidateAiClient(
+                finsecAiHttpClient,
+                objectMapper,
                 baseUrl,
                 requestTimeout,
                 apiKey

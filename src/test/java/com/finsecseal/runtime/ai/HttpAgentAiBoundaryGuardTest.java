@@ -81,7 +81,7 @@ class HttpAgentAiBoundaryGuardTest {
         assertThatThrownBy(() -> client.propose(turnRequest(validArguments())))
                 .isInstanceOfSatisfying(BusinessException.class, exception -> {
                     assertThat(exception.errorCode()).isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE);
-                    assertThat(exception.getMessage()).contains("256 KiB");
+                    assertThat(exception.getMessage()).contains("262144 bytes");
                 });
     }
 
