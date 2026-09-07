@@ -42,8 +42,10 @@ public final class CatalogBoundOutputSchemaEvaluator {
         private static final Set<String> LOAN_REVIEW_TOOLS = Set.of(
             "CASE_CONTEXT_READ", "DOCUMENT_READER", "CUSTOMER_DATA_READ", "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE"
         );
+    // Preserve decimal values in both the schema and output before exact integer normalization.
     private static final com.fasterxml.jackson.databind.ObjectMapper NETWORKNT_MAPPER =
-            new com.fasterxml.jackson.databind.ObjectMapper();
+            new com.fasterxml.jackson.databind.ObjectMapper()
+                    .enable(com.fasterxml.jackson.databind.DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
 
     private final TestRunProjectionService runs;
     private final ReleaseService releases;
@@ -58,6 +60,7 @@ public final class CatalogBoundOutputSchemaEvaluator {
             validatorsConfig.setTypeLoose(false);
             validatorsConfig.setFailFast(true);
             validatorsConfig.setLosslessNarrowing(false);
+            validatorsConfig.setFormatAssertionsEnabled(true);
             outputFactory = JsonSchemaFactory.getInstance(SpecVersion.VersionFlag.V202012);
         } catch (RuntimeException exception) {
             throw failure(FailureCode.SCHEMA_ENGINE_FAILURE);
@@ -118,13 +121,6 @@ public final class CatalogBoundOutputSchemaEvaluator {
         if (!matches) {
             com.fasterxml.jackson.databind.JsonNode normalized = normalizeIntegerLikeNumbers(networkntOutput);
             matches = matchesSchema(schema, normalized);
-        }
-        if (!matches
-                && normalLoanReviewCatalog
-                && "CUSTOMER_DATA_READ".equals(requestedTool)
-                && strictCustomerDataRead(adapterOutput)) {
-            // Preserve JSON Schema integer semantics for 200.0 in CUSTOMER_DATA_READ status.
-            matches = true;
         }
         if (!matches) {
             return new OutputSchemaCheck(binding, Outcome.ADAPTER_CONTRACT_FAILURE);
@@ -247,7 +243,6 @@ public final class CatalogBoundOutputSchemaEvaluator {
         return switch (tool) {
             case "CASE_CONTEXT_READ" -> strictCaseContextRead(output);
             case "DOCUMENT_READER" -> strictDocumentReader(output);
-            case "CUSTOMER_DATA_READ" -> strictCustomerDataRead(output);
             case "LOAN_POLICY_SEARCH" -> strictLoanPolicySearch(output);
             case "REVIEW_NOTE_WRITE" -> strictReviewNoteWrite(output);
             default -> true;
@@ -298,41 +293,6 @@ public final class CatalogBoundOutputSchemaEvaluator {
         } catch (DateTimeParseException exception) {
             return false;
         }
-    }
-
-    private boolean strictCustomerDataRead(JsonNode output) {
-        if (!output.isObject() || !onlyFields(output, "status", "rows")) {
-            return false;
-        }
-        JsonNode status = output.get("status");
-        if (status == null || !status.isNumber()) {
-            return false;
-        }
-        double statusValue = status.asDouble();
-        if (statusValue != 200.0d || statusValue % 1.0d != 0.0d) {
-            return false;
-        }
-        JsonNode rows = output.get("rows");
-        if (rows == null || !rows.isArray()) {
-            return false;
-        }
-        for (JsonNode row : rows) {
-            if (!row.isObject() || !onlyFields(row, "customerId", "fields") || !text(row, "customerId")) {
-                return false;
-            }
-            JsonNode fields = row.get("fields");
-            if (fields == null || !fields.isObject()) {
-                return false;
-            }
-            if (!containsOnlyAllowedFields(fields, "incomeBand")) {
-                return false;
-            }
-            JsonNode incomeBand = fields.get("incomeBand");
-            if (incomeBand != null && (!incomeBand.isString() || incomeBand.asString().isBlank())) {
-                return false;
-            }
-        }
-        return true;
     }
 
     private boolean strictLoanPolicySearch(JsonNode output) {
@@ -404,19 +364,6 @@ public final class CatalogBoundOutputSchemaEvaluator {
         }
         for (String field : fields) {
             if (!objectNode.has(field)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private boolean containsOnlyAllowedFields(JsonNode node, String... fields) {
-        if (!(node instanceof ObjectNode objectNode)) {
-            return false;
-        }
-        Set<String> allowed = Set.of(fields);
-        for (var entry : objectNode.properties()) {
-            if (!allowed.contains(entry.getKey())) {
                 return false;
             }
         }
