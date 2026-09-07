@@ -7,6 +7,11 @@
 
 ## Implemented
 
+### 계약 저장·승인 및 패치 출처 연결
+
+C의 검증·승인 규칙을 호출하는 인증된 계약 영속화 API, 현재 승인본 조회, Release 반영 및 감사 기록, HELD_OUT/숨김 계보를 제외한 패치 출처 조회를 구현했다. 설정과 API 계약은 [A_CONTRACT_INTEGRATION_HANDOFF.md](A_CONTRACT_INTEGRATION_HANDOFF.md)를 따른다.
+
+
 ### G1 — Common platform and persistence
 
 - Java 21 / Spring Boot 4.1.1 / Gradle 9.7.1 project
