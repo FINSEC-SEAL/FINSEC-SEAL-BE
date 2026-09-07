@@ -24,10 +24,10 @@ class HttpAgentAiClientLiveE2ETest {
 
         AgentAiHttpConfiguration configuration = new AgentAiHttpConfiguration();
         HttpAgentAiClient client = configuration.httpAgentAiClient(
+                configuration.finsecAiHttpClient(Duration.ofSeconds(2)),
                 objectMapper,
                 resolver,
                 URI.create("http://127.0.0.1:8001"),
-                Duration.ofSeconds(2),
                 Duration.ofSeconds(5)
         );
 
