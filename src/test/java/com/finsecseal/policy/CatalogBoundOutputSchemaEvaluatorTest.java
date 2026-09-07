@@ -147,6 +147,159 @@ class CatalogBoundOutputSchemaEvaluatorTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"200", "200.0"})
+    void aFalseSchemaCannotBeBypassedByTheCompleteLoanReviewCatalog(String status) {
+        ArrayNode tools = useFullCustomerSchema(BooleanNode.FALSE);
+        JsonNode output = changed(CUSTOMER, "status", status);
+
+        assertEvaluationPreservesInputs(tools, output, ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"200", "200.0"})
+    void integerLikeNormalizationStillEnforcesTheEntireSchema(String status) {
+        ObjectNode schema = (ObjectNode) customerTool(LoanReviewToolCatalog.normalTools()).path("outputSchema").deepCopy();
+        ((ObjectNode) schema.path("properties")).putObject("receipt").put("type", "string");
+        ((ArrayNode) schema.path("required")).add("receipt");
+        // A component fixture constraint, not a claim that A publishes this modified schema.
+        ArrayNode tools = useFullCustomerSchema(schema);
+        ObjectNode missing = (ObjectNode) changed(CUSTOMER, "status", status);
+
+        assertEvaluationPreservesInputs(tools, missing, ADAPTER_CONTRACT_FAILURE);
+
+        ObjectNode complete = missing.deepCopy().put("receipt", "synthetic-receipt");
+        assertEvaluationPreservesInputs(tools, complete, MATCH);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"incomeBand", "employmentStatus", "accountNumber"})
+    void actualDeclaredCustomerFieldsAcceptStringsIncludingEmptyButRejectNumbers(String field) {
+        ArrayNode tools = useFullCustomerSchema(customerTool(LoanReviewToolCatalog.normalTools()).path("outputSchema"));
+        for (String text : new String[]{"synthetic-value", ""}) {
+            ObjectNode output = (ObjectNode) json(OUTPUTS.get(CUSTOMER));
+            ((ObjectNode) output.at("/rows/0/fields")).removeAll().put(field, text);
+            assertEvaluationPreservesInputs(tools, output, MATCH);
+        }
+        ObjectNode numeric = (ObjectNode) json(OUTPUTS.get(CUSTOMER));
+        ((ObjectNode) numeric.at("/rows/0/fields")).removeAll().put(field, 42);
+        assertEvaluationPreservesInputs(tools, numeric, ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @Test
+    void actualSchemaAllowsEmptyCustomerStringsWithoutGrantingPolicyPermission() {
+        ArrayNode tools = useFullCustomerSchema(customerTool(LoanReviewToolCatalog.normalTools()).path("outputSchema"));
+        ObjectNode output = (ObjectNode) json(OUTPUTS.get(CUSTOMER));
+        output.set("status", DecimalNode.valueOf(new BigDecimal("200.0")));
+        ((ObjectNode) output.at("/rows/0")).put("customerId", "");
+        ((ObjectNode) output.at("/rows/0/fields")).put("incomeBand", "");
+
+        assertEvaluationPreservesInputs(tools, output, MATCH);
+
+        assertThat(output.path("status")).isInstanceOf(DecimalNode.class);
+        assertThat(output.path("status").decimalValue()).isEqualTo(new BigDecimal("200.0"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"200.00000000000000001", "199.99999999999999999"})
+    void preservesExactOutputDecimalsThatWouldOtherwiseRoundToStatus200(String literal) {
+        ArrayNode tools = useFullCustomerSchema(customerTool(LoanReviewToolCatalog.normalTools()).path("outputSchema"));
+        BigDecimal exact = new BigDecimal(literal);
+        assertThat(exact.doubleValue()).isEqualTo(200.0d);
+        assertThat(exact).isNotEqualByComparingTo("200");
+        ObjectNode output = (ObjectNode) json(OUTPUTS.get(CUSTOMER));
+        // Construct the node directly: a default parser could already have discarded these digits.
+        output.set("status", DecimalNode.valueOf(exact));
+
+        assertEvaluationPreservesInputs(tools, output, ADAPTER_CONTRACT_FAILURE);
+
+        assertThat(output.path("status")).isInstanceOf(DecimalNode.class);
+        assertThat(output.path("status").decimalValue()).isEqualTo(exact);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"200.00000000000000001", "199.99999999999999999"})
+    void preservesExactSchemaDecimalConstSeparatelyFromOutputConversion(String literal) {
+        BigDecimal exact = new BigDecimal(literal);
+        ObjectNode schema = (ObjectNode) customerTool(LoanReviewToolCatalog.normalTools()).path("outputSchema").deepCopy();
+        ((ObjectNode) schema.at("/properties/status")).put("type", "number").set("const", DecimalNode.valueOf(exact));
+        ArrayNode tools = useFullCustomerSchema(schema);
+        JsonNode originalConst = customerTool(tools).at("/outputSchema/properties/status/const");
+        ObjectNode rounded = (ObjectNode) json(OUTPUTS.get(CUSTOMER));
+
+        assertEvaluationPreservesInputs(tools, rounded, ADAPTER_CONTRACT_FAILURE);
+
+        ObjectNode matching = rounded.deepCopy();
+        matching.set("status", DecimalNode.valueOf(exact));
+        assertEvaluationPreservesInputs(tools, matching, MATCH);
+        assertThat(matching.path("status")).isInstanceOf(DecimalNode.class);
+        assertThat(matching.path("status").decimalValue()).isEqualTo(exact);
+        JsonNode retainedConst = customerTool(tools).at("/outputSchema/properties/status/const");
+        assertThat(retainedConst).isSameAs(originalConst).isInstanceOf(DecimalNode.class);
+        assertThat(retainedConst.decimalValue()).isEqualTo(exact);
+    }
+
+    @ParameterizedTest
+    @MethodSource("customerRowViolationsForBothStatusRepresentations")
+    void rejectsActualNestedCustomerSchemaViolationsBeforeAndAfterIntegerNormalization(String status, String rows) {
+        ArrayNode tools = useFullCustomerSchema(customerTool(LoanReviewToolCatalog.normalTools()).path("outputSchema"));
+        ObjectNode output = (ObjectNode) changed(CUSTOMER, "status", status);
+        output.set("rows", json(rows));
+
+        assertEvaluationPreservesInputs(tools, output, ADAPTER_CONTRACT_FAILURE);
+    }
+
+    static Stream<Arguments> customerRowViolationsForBothStatusRepresentations() {
+        return Stream.of("200", "200.0").flatMap(status -> Stream.of(
+                "[42]",
+                "[{\"customerId\":\"CUST-1001\"}]",
+                "[{\"customerId\":\"CUST-1001\",\"fields\":{\"incomeBand\":42}}]",
+                "[{\"customerId\":\"CUST-1001\",\"fields\":{\"unknownField\":\"synthetic-value\"}}]",
+                "[{\"customerId\":\"CUST-1001\",\"fields\":{\"employmentStatus\":42}}]",
+                "[{\"customerId\":\"CUST-1001\",\"fields\":{\"accountNumber\":42}}]"
+        ).map(rows -> Arguments.of(status, rows)));
+    }
+
+    @Test
+    void standaloneItemsValidatesEveryArrayElement() {
+        ArrayNode tools = useCustomerRowsSchema("{\"type\":\"array\",\"items\":{\"type\":\"integer\"}}");
+
+        assertEvaluationPreservesInputs(tools, changed(CUSTOMER, "rows", "[1,2]"), MATCH);
+        assertEvaluationPreservesInputs(tools, changed(CUSTOMER, "rows", "[1,\"2\"]"), ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @Test
+    void prefixItemsAndItemsApplyDifferentSchemasToTuplePrefixAndTail() {
+        ArrayNode tools = useCustomerRowsSchema("""
+                {"type":"array","prefixItems":[{"type":"integer"},{"type":"string"}],
+                 "items":{"type":"boolean"}}
+                """);
+
+        assertEvaluationPreservesInputs(tools, changed(CUSTOMER, "rows", "[1,\"prefix\",true,false]"), MATCH);
+        assertEvaluationPreservesInputs(tools, changed(CUSTOMER, "rows", "[false,\"prefix\",true]"), ADAPTER_CONTRACT_FAILURE);
+        assertEvaluationPreservesInputs(tools, changed(CUSTOMER, "rows", "[1,\"prefix\",42]"), ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @Test
+    void unevaluatedItemsRejectsOnlyElementsOutsideTheEvaluatedPrefix() {
+        ArrayNode tools = useCustomerRowsSchema("""
+                {"type":"array","prefixItems":[{"type":"integer"},{"type":"string"}],
+                 "unevaluatedItems":false}
+                """);
+
+        assertEvaluationPreservesInputs(tools, changed(CUSTOMER, "rows", "[1,\"prefix\"]"), MATCH);
+        assertEvaluationPreservesInputs(tools, changed(CUSTOMER, "rows", "[1,\"prefix\",true]"), ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @Test
+    void supportedDateTimeFormatIsAnAssertionWithoutADocumentSpecificGuard() {
+        ArrayNode tools = useCustomerRowsSchema("{\"type\":\"string\",\"format\":\"date-time\"}");
+
+        assertEvaluationPreservesInputs(tools, changed(CUSTOMER, "rows", "\"2026-09-07T00:00:00Z\""), MATCH);
+        assertEvaluationPreservesInputs(tools, changed(CUSTOMER, "rows", "\"2026-02-30T00:00:00Z\""), ADAPTER_CONTRACT_FAILURE);
+        assertEvaluationPreservesInputs(tools, changed(CUSTOMER, "rows", "\"not-a-date\""), ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @ParameterizedTest
     @MethodSource("nonJsonValues")
     void rejectsNonJsonAndNonFiniteNodesEvenWhenSchemaWouldAcceptAnything(JsonNode value) {
         useSchema(json("true"));
@@ -301,6 +454,52 @@ class CatalogBoundOutputSchemaEvaluatorTest {
     private void useSchema(JsonNode schema) {
         when(releases.toolCatalog(RELEASE, ACTOR)).thenReturn(catalog(JSON.createArrayNode().add(
                 JSON.createObjectNode().put("name", CUSTOMER).set("outputSchema", schema))));
+    }
+
+    private ArrayNode useFullCustomerSchema(JsonNode schema) {
+        ArrayNode tools = (ArrayNode) LoanReviewToolCatalog.normalTools().deepCopy();
+        customerTool(tools).set("outputSchema", schema.deepCopy());
+        assertThat(tools.size()).isEqualTo(5);
+        var names = new java.util.HashSet<String>();
+        tools.forEach(tool -> names.add(tool.path("name").asString()));
+        assertThat(names).containsExactlyInAnyOrderElementsOf(OUTPUTS.keySet());
+        when(releases.toolCatalog(RELEASE, ACTOR)).thenReturn(catalog(tools));
+        return tools;
+    }
+
+    private ArrayNode useCustomerRowsSchema(String rowsSchema) {
+        ObjectNode schema = (ObjectNode) customerTool(LoanReviewToolCatalog.normalTools()).path("outputSchema").deepCopy();
+        // Synthetic dialect-capability fixture: retain the full catalog and numeric status wrapper.
+        schema.put("$schema", "https://json-schema.org/draft/2020-12/schema");
+        ((ObjectNode) schema.path("properties")).set("rows", json(rowsSchema));
+        return useFullCustomerSchema(schema);
+    }
+
+    private void assertEvaluationPreservesInputs(JsonNode tools, JsonNode output,
+                                                CatalogBoundOutputSchemaEvaluator.Outcome expected) {
+        JsonNode beforeTools = tools.deepCopy();
+        JsonNode beforeOutput = output.deepCopy();
+        JsonNode originalStatus = output.path("status");
+        Number originalNumber = originalStatus.numberValue();
+
+        var result = evaluator.evaluate(RUN, CUSTOMER, output, ACTOR);
+
+        assertThat(result.outcome()).isEqualTo(expected);
+        assertThat(result.source()).isEqualTo(new CatalogBoundOutputSchemaEvaluator.SourceBinding(
+                RUN, RELEASE, CUSTOMER, "1.1", ARTIFACT, RELEASE_HASH, CATALOG_HASH));
+        assertThat(tools).isEqualTo(beforeTools);
+        assertThat(tools.toString()).isEqualTo(beforeTools.toString());
+        assertThat(output).isEqualTo(beforeOutput);
+        assertThat(output.toString()).isEqualTo(beforeOutput.toString());
+        assertThat(output.path("status")).isSameAs(originalStatus);
+        assertThat(output.path("status").numberValue()).isEqualTo(originalNumber);
+    }
+
+    private static ObjectNode customerTool(JsonNode tools) {
+        for (JsonNode tool : tools) {
+            if (CUSTOMER.equals(tool.path("name").asString())) return (ObjectNode) tool;
+        }
+        throw new AssertionError("Actual catalog fixture has no customer tool");
     }
 
     private static void assertFailure(FailureCode code, org.assertj.core.api.ThrowableAssert.ThrowingCallable action) {
