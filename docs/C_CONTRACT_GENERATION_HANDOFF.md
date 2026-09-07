@@ -1,5 +1,7 @@
 # C 계약 후보 준비·검증 및 리뷰 비교 인계
 
+> 2026-09-08 생성 연동 정보는 [A 연동용 계약·패치 생성 호출 계약](C_GENERATION_ASYNC_INTEGRATION_HANDOFF.md)을 먼저 확인한다. 정확한 파일·메서드·입출력·예외·transaction 조건, PR #39의 dev 미반영 여부와 남은 담당별 연결을 구분했다. 아래 구현 설명과 테스트 수치는 최초 C 구성요소 작업의 기록이다.
+
 원 명세의 `Manifest + Purpose + Tool Schemas + Financial Template → LLM Candidate → Deterministic Validator → Reviewer Approval` 흐름에서 C가 독립적으로 구현할 수 있는 생성 입력, 프롬프트, 응답 판단과 리뷰 비교를 다룬다. 실제 모델 호출·후보 저장·승인·ENFORCE·Replay·UI 전체 완료를 뜻하지 않는다.
 
 기준은 [역할 분담](../FINSEC_SEAL_4인_역할분담.md), [현재 아키텍처](A_ARCHITECTURE_BASELINE.md), [Safety Contract 명세](predev/12_SAFETY_CONTRACT_SPEC.md), FS-06과 [원 API 명세](predev/10_API_SPECIFICATION.md)다. #31의 축약 Preview API를 호출하거나 해당 API의 범위를 새 구현 기준으로 사용하지 않는다. 기존 schema/semantic/canonical/lifecycle 판단은 재사용한다.
@@ -28,23 +30,13 @@
 
 결과는 원본 정책을 보존한다. Canonical JSON이 Unicode나 줄바꿈을 정규화하더라도 원본 identity를 덮어쓰지 않는다. 비교도 정확한 원본 문자열·정수를 사용하므로 canonical hash가 같아도 원본 변경은 보일 수 있다. 배열 순서만 다른 경우는 변경으로 표시하지 않는다. 결과 JSON 접근은 복사본이며 기본 `toString`과 처리 오류에 원문을 넣지 않는다. 검증/정규화 엔진 오류는 INVALID 정책으로 가장하지 않고 별도 처리 실패로 반환한다.
 
-## 현재 소유자 연결과 막히는 기능
+## 소유자 연결 상태 갱신
 
-2026-09-07 pull 기준은 BE `origin/dev` `53dc464`, AI `main` `f6481e6`, FE `origin/dev` `d3a26eb`다. 다른 역할의 제품 코드는 이번 변경에서 수정하지 않았다.
+최초 작성 당시의 미구현 목록은 현재 상태와 달라 교체했다. BE `dev` `88aacb2`에는 A의 인증된 계약 저장·검증·승인과 패치 출처 필터, B의 실제 후보 생성 클라이언트가 있다. C 패치 생성 조합 서비스는 PR #39 `de3fffc`에 구현되어 있으며 2026-09-08 확인 시 dev 미반영이다.
 
-| 소유자 | 이미 있는 부분 | 필요한 연결 | 아직 실행할 수 없는 C 기능 |
-|---|---|---|---|
-| A | 계약/version/approval DB 테이블, 승인본 불변성 guard, `ReleaseService.applySafetyContractHash`, 검증된 Tool catalog 읽기 | 인증된 version/workspace snapshot, 생성 identity 할당·후보 저장, 원자적 CAS·승인 적용·Release 연결 | 원래 generate/validate/approve API의 저장 전이, 승인 계약 공급, 실제 계약 상세·승인 UI |
-| B | `/v1/agent/steps`, OpenAI-compatible Agent-step provider | 구조화된 Contract candidate/patch 생성 호출 및 timeout/retry/model 오류 계약 | 실제 AI 후보·패치 생성. 가짜 Agent Run으로 우회하지 않는다. |
-| A/B | Spring invocation identity, BASELINE dispatcher와 일부 adapter, 기존 C 정책 판단 코어 | 승인 정책·run/case/operation의 실제 binding, adapter classification/provenance, pre/post-call 실행·전달 제어, deadline·cache invalidation | 실제 ENFORCE, 응답 격리, 무실행/미전달 증거, policy-only Replay |
-| A/D | 일반 Finding/oracle/evidence 조회와 기존 C patch 판단 | hidden/held-out evidence를 읽기 전에 patch 적격 Finding만 공급하는 출처 필터 | Finding 기반 안전한 patch 입력·생성 |
-| D | Oracle outcome과 assurance 계산, 일부 case 오류 처리 | operational-error Run/trial의 수집·분모·결과 반영을 실제 실행과 검증 | 운영 오류를 공격 차단 성공으로 계산하지 않는 전체 runtime/보고 acceptance |
+A가 담당할 생성용 인증·중복 요청·비동기 접수·상태 저장/조회와 C가 정리할 초기 계약 생성 조합 서비스, A 생성 identity/메타데이터 저장 계약은 [새 인계 문서](C_GENERATION_ASYNC_INTEGRATION_HANDOFF.md)에 명시한다. 이미 있는 저장·모델 클라이언트·출처 필터를 다시 미구현으로 요청하지 않는다. 생성 판단과 저장된 VALIDATED/APPROVED 상태는 계속 구분한다.
 
-A에 DB 테이블이 없다는 뜻이 아니다. C의 `SafetyContractLifecyclePolicy`는 이미 reviewer/If-Match/source 조건을 판단하고 immutable 전이 명령을 반환하지만, 이를 인증된 저장본에 원자적으로 적용하는 연결은 별도다. 후보 응답 평가를 저장된 VALIDATED 상태로 취급하지 않는다.
-
-현재 B의 `ToolProposal`에는 operation이 없고 adapter 결과는 `output/stateChanged`다. `TemporaryPolicyGatewayBridge`는 BASELINE만 허용한다. D의 `ReleaseAssuranceService`에는 COMPLETED Run 조건이 있으므로, 모든 운영 오류 Run이 결과에 반영된다고 단정하지 않는다.
-
-FE에는 pull한 공통 shell과 A/B/D 화면이 있다. C의 실제 계약 API와 연결되지 않은 화면을 생성·승인 완료로 표시하지 않는다. 이 변경에는 FE 제품 수정이 없다.
+Gateway 실행·Replay·D 판정의 완료 여부는 생성 진입점 인계와 별도다. 이 문서의 후보 검증 테스트를 해당 runtime 통합 완료의 증거로 사용하지 않는다.
 
 ## 검증과 하네스 증거
 
