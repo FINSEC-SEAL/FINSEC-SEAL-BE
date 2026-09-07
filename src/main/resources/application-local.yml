@@ -12,6 +12,6 @@ finsec:
     allowed-origins: ${FINSEC_CORS_ALLOWED_ORIGINS:http://localhost:5173}
   crypto:
     # 개발 편의용 기본 키(로컬에서만 사용). 실제 배포에서는 환경변수로 설정하세요.
-    key-base64: ${FINSEC_DATA_ENCRYPTION_KEY_BASE64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
+    key-base64: ${FINSEC_DATA_ENCRYPTION_KEY_BASE64:OdVX6oARQ15JOajVx3+YgiJl26fe1hkv4ETx6jqNVPc=}
   idempotency:
     recovery-key: ${FINSEC_IDEMPOTENCY_RECOVERY_KEY:}
