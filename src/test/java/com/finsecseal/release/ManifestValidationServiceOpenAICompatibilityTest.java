@@ -48,7 +48,7 @@ public class ManifestValidationServiceOpenAICompatibilityTest {
 
         manifest.putArray("runtimeContextRequirements").add("caseId").add("currentApplicantId").add("workflowStage").add("allowedDocumentIds");
 
-        ValidationResult result = manifestValidationService.validate(manifest);
-        assertThat(result.ok()).isTrue();
+        ManifestValidationService.ValidationResult result = manifestValidationService.validate(manifest);
+        assertThat(result.valid()).isTrue();
     }
 }

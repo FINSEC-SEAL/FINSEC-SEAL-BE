@@ -68,7 +68,54 @@ public class CPolicyGatewayClient implements PolicyGateway {
                 null
         );
 
-        return new GatewayResult(decision, policyEvent, null, null, null);
+        if (!decision.allowed()) {
+            return new GatewayResult(decision, policyEvent, null, null, null);
+        }
+
+        ExecutionEventDto.Event requestEvent = new ExecutionEventDto.Event(
+            "1.0",
+            UUID.randomUUID(),
+            context.caseRunId(),
+            context.traceId(),
+            UUID.randomUUID(),
+            0L,
+            Instant.now(),
+            ExecutionEventType.TOOL_REQUEST,
+            invocation.proposal().toolName(),
+            invocation.proposal().arguments(),
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+        );
+
+        ExecutionEventDto.Event responseEvent = new ExecutionEventDto.Event(
+            "1.0",
+            UUID.randomUUID(),
+            context.caseRunId(),
+            context.traceId(),
+            UUID.randomUUID(),
+            0L,
+            Instant.now(),
+            ExecutionEventType.TOOL_RESPONSE,
+            invocation.proposal().toolName(),
+            null,
+            null,
+            null,
+            null,
+            "TOOL_EXECUTED",
+            null,
+            null,
+            null
+        );
+
+        ToolAdapter.ToolExecutionResult execution =
+            new ToolAdapter.ToolExecutionResult(null, false);
+
+        return new GatewayResult(decision, policyEvent, requestEvent, responseEvent, execution);
     }
 
     @Override
@@ -107,6 +154,53 @@ public class CPolicyGatewayClient implements PolicyGateway {
                 null
         );
 
-        return new GatewayResult(decision, policyEvent, null, null, null);
+        if (!decision.allowed()) {
+            return new GatewayResult(decision, policyEvent, null, null, null);
+        }
+
+        ExecutionEventDto.Event requestEvent = new ExecutionEventDto.Event(
+            "1.0",
+            UUID.randomUUID(),
+            context.caseRunId(),
+            context.traceId(),
+            UUID.randomUUID(),
+            0L,
+            Instant.now(),
+            ExecutionEventType.TOOL_REQUEST,
+            proposal.toolName(),
+            proposal.arguments(),
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+        );
+
+        ExecutionEventDto.Event responseEvent = new ExecutionEventDto.Event(
+            "1.0",
+            UUID.randomUUID(),
+            context.caseRunId(),
+            context.traceId(),
+            UUID.randomUUID(),
+            0L,
+            Instant.now(),
+            ExecutionEventType.TOOL_RESPONSE,
+            proposal.toolName(),
+            null,
+            null,
+            null,
+            null,
+            "TOOL_EXECUTED",
+            null,
+            null,
+            null
+        );
+
+        ToolAdapter.ToolExecutionResult execution =
+            new ToolAdapter.ToolExecutionResult(null, false);
+
+        return new GatewayResult(decision, policyEvent, requestEvent, responseEvent, execution);
     }
 }
