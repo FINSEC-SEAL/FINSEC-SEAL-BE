@@ -1,9 +1,11 @@
 package com.finsecseal.policy;
 
 import com.finsecseal.contract.LoanReviewFinancialTemplate;
+import com.finsecseal.contract.ReleaseToolCatalogContractAdapter.SourceBoundCatalog;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ContractValidationCatalog;
 import com.finsecseal.policy.EnforcePolicyPostCallFacts.CatalogOutputField;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.ApprovedPolicySource;
+import com.finsecseal.policy.GatewayBaselinePolicySourceService.BaselinePolicySource;
 import com.finsecseal.policy.PolicyCardinalityFacts.CardinalityPolicy;
 import com.finsecseal.policy.PolicyFieldScopeFacts.FieldPolicy;
 import com.finsecseal.policy.PolicyFieldScopeFacts.ToolOutputSchema;
@@ -11,6 +13,10 @@ import com.finsecseal.policy.PolicyHumanBoundaryFacts.BoundaryMode;
 import com.finsecseal.policy.PolicyHumanBoundaryFacts.HighImpactAction;
 import com.finsecseal.policy.PolicyObjectScopeFacts.DocumentOwnership;
 import com.finsecseal.policy.PolicyObjectScopeFacts.ObjectScopePolicy;
+import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
+import com.finsecseal.policy.PolicyToolTrustFacts.ToolRegistryEntry;
+import com.finsecseal.policy.PolicyToolTrustFacts.ToolTrustPolicy;
+import com.finsecseal.policy.PolicyToolTrustFacts.TrustLevel;
 import com.finsecseal.runtime.ToolProposal;
 import com.finsecseal.runtime.ToolProposalValidator;
 import java.util.ArrayList;
@@ -24,7 +30,7 @@ import java.util.UUID;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.JsonNode;
 
-/** Projects approved policy and request values into stage facts; grants no execution authority. */
+/** Projects policy expectations and request values into stage facts; grants no execution authority. */
 @Component
 public final class GatewayPolicyFactsAssembler {
     private static final String CUSTOMER_DATA_READ = "CUSTOMER_DATA_READ";
@@ -33,6 +39,228 @@ public final class GatewayPolicyFactsAssembler {
 
     public GatewayPolicyFactsAssembler(ToolProposalValidator proposals) {
         this.proposals = Objects.requireNonNull(proposals);
+    }
+
+    /** Internal source expectations only; no runtime observation or stage result is constructed. */
+    PolicyInputs approvedInputs(ApprovedPolicySource source) {
+        try {
+            return new PolicyInputs(policy(source), source.catalog(), null);
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+    }
+
+    PolicyInputs baselineInputs(BaselinePolicySource source, LoanReviewFinancialTemplate template) {
+        try {
+            if (source == null || template == null) throw invalidSource();
+            JsonNode rules = object(template.policyRules());
+            if (!LoanReviewFinancialTemplate.KEY.equals(rules.at("/metadata/templateVersion").stringValue())
+                    || !LoanReviewFinancialTemplate.PURPOSE.equals(rules.path("purpose").stringValue())
+                    || !LoanReviewFinancialTemplate.PURPOSE.equals(source.releasePurpose())
+                    || source.catalog() == null || !source.catalog().releaseId().equals(source.releaseId())) {
+                throw invalidSource();
+            }
+            JsonNode workflow = object(source.releaseDeclarations().path("businessWorkflow"));
+            return new PolicyInputs(rules, source.catalog(), workflow);
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+    }
+
+    PolicyToolAuthorizationFacts authorizationFor(PolicyInputs inputs, String requestedTool,
+            String requestedOperation) {
+        requireStageToolName(requestedTool);
+        if (requestedOperation == null || requestedOperation.isBlank()) throw failure(FailureCode.INVALID_REQUEST);
+        try {
+            requireInputs(inputs);
+            var declarations = declaredTools(inputs.catalog);
+            if (inputs.baseline()) {
+                // Server-known HUMAN_ONLY is not a BASELINE mock-experiment execution permission.
+                var normal = inputs.catalog.semanticCatalog().enabledReleaseTools().stream()
+                        .map(tool -> tool.toolName()).toList();
+                return new PolicyToolAuthorizationFacts(requestedTool, requestedOperation, declarations,
+                        normal, false, List.of());
+            }
+            var egress = egress(inputs.policy, requestedTool, declarations);
+            var human = humanBoundary(inputs.policy, inputs.catalog.semanticCatalog(), requestedTool);
+            var allowed = policyValues(inputs.policy.path("allowedTools"));
+            for (String tool : allowed) {
+                if (!inputs.catalog.semanticCatalog().hasEnabledTool(tool)
+                        || inputs.catalog.semanticCatalog().hasHighImpactTool(tool)) throw invalidSource();
+            }
+            return new PolicyToolAuthorizationFacts(requestedTool, requestedOperation, declarations,
+                    allowed, !egress.externalEgressAllowed(),
+                    human.highImpactActions().stream().map(HighImpactAction::toolName).toList());
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+    }
+
+    PolicyBusinessContextFacts businessContextFor(PolicyInputs inputs, boolean serverResolved,
+            Optional<String> releasePurpose, Optional<String> runPurpose, Optional<String> casePurpose,
+            Optional<String> namespaceId, Optional<String> caseId, Optional<String> currentApplicantId,
+            Optional<String> workflowStage, Optional<List<String>> allowedDocumentIds) {
+        String purpose;
+        try {
+            JsonNode value = requireInputs(inputs).policy.path("purpose");
+            if (!value.isString() || value.stringValue().isBlank()) throw invalidSource();
+            purpose = value.stringValue();
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+        try {
+            return new PolicyBusinessContextFacts(serverResolved, Optional.of(purpose), releasePurpose,
+                    runPurpose, casePurpose, namespaceId, caseId, currentApplicantId, workflowStage, allowedDocumentIds);
+        } catch (RuntimeException exception) {
+            throw failure(FailureCode.INVALID_REQUEST);
+        }
+    }
+
+    PolicyObjectScopeFacts objectScopeFor(PolicyInputs inputs, String requestedTool,
+            Optional<String> requestedCaseId, Optional<List<String>> requestedDocumentIds,
+            Optional<List<String>> requestedCustomerIds, Optional<String> currentCaseId,
+            Optional<String> currentApplicantId, Optional<List<String>> allowedDocumentIds,
+            Optional<List<DocumentOwnership>> documentOwnerships) {
+        requireStageToolName(requestedTool);
+        List<String> tools;
+        List<ObjectScopePolicy> scopes;
+        try {
+            var catalog = requireInputs(inputs).catalog.semanticCatalog();
+            tools = catalogToolNames(catalog);
+            scopes = objectScopes(inputs.policy, catalog);
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+        try {
+            return new PolicyObjectScopeFacts(requestedTool, tools, scopes, requestedCaseId,
+                    requestedDocumentIds, requestedCustomerIds, currentCaseId, currentApplicantId,
+                    allowedDocumentIds, documentOwnerships);
+        } catch (InvalidPolicyScopeRequestException | PolicyScopeContextIntegrityException exception) {
+            throw exception;
+        } catch (RuntimeException exception) {
+            throw failure(FailureCode.INVALID_REQUEST);
+        }
+    }
+
+    /** Reads only fields, not customerIds or the later cardinality rule; C preflight runs first. */
+    PolicyFieldScopeFacts fieldScopeFor(PolicyInputs inputs, ToolProposal request) {
+        String tool = stageRequestTool(request);
+        Optional<List<String>> fields = CUSTOMER_DATA_READ.equals(tool)
+                ? Optional.of(stageRequestValues(request, "fields")) : Optional.empty();
+        List<ToolOutputSchema> schemas;
+        List<FieldPolicy> policies;
+        try {
+            var catalog = requireInputs(inputs).catalog.semanticCatalog();
+            schemas = new ArrayList<>();
+            catalog.enabledReleaseTools().forEach(value ->
+                    schemas.add(new ToolOutputSchema(value.toolName(), value.outputFields())));
+            // Empty fields express membership for a no-rule human Tool, not its real output schema.
+            for (String human : catalog.highImpactToolNames()) schemas.add(new ToolOutputSchema(human, List.of()));
+            JsonNode fieldPolicies = object(inputs.policy.path("fieldPolicy"));
+            if (CUSTOMER_DATA_READ.equals(tool)) {
+                policies = List.of(customerFieldPolicy(inputs.policy));
+            } else {
+                if (fieldPolicies.has(tool)) throw invalidSource();
+                policies = List.of();
+            }
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+        try {
+            return new PolicyFieldScopeFacts(tool, fields, schemas, policies);
+        } catch (InvalidPolicyScopeRequestException exception) {
+            throw failure(FailureCode.INVALID_REQUEST);
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+    }
+
+    /** Counts raw request entries without deduplication and never reads the Field Scope inputs. */
+    PolicyCardinalityFacts cardinalityFor(PolicyInputs inputs, ToolProposal request) {
+        String tool = stageRequestTool(request);
+        // Zero is unused when no rule exists; it is not an observation of returned or requested rows.
+        int count = CUSTOMER_DATA_READ.equals(tool)
+                ? stageRequestValues(request, "customerIds").size() : 0;
+        try {
+            var catalog = requireInputs(inputs).catalog.semanticCatalog();
+            JsonNode rules = object(inputs.policy.path("cardinality"));
+            List<CardinalityPolicy> policies;
+            if (CUSTOMER_DATA_READ.equals(tool)) {
+                JsonNode limit = object(rules.path(tool)).path("maxRequestedRecords");
+                if (!limit.isIntegralNumber() || !limit.canConvertToInt() || limit.intValue() <= 0) throw invalidSource();
+                policies = List.of(new CardinalityPolicy(tool, limit.intValue()));
+            } else {
+                // Includes return-only rules: unsupported active rules must not become no-rule PASS.
+                if (rules.has(tool)) throw invalidSource();
+                policies = List.of();
+            }
+            return new PolicyCardinalityFacts(tool, count, catalogToolNames(catalog), policies);
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+    }
+
+    PolicyEgressFacts egressFor(PolicyInputs inputs, String requestedTool) {
+        requireStageToolName(requestedTool);
+        try {
+            requireInputs(inputs);
+            return egress(inputs.policy, requestedTool, declaredTools(inputs.catalog));
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+    }
+
+    PolicyWorkflowFacts workflowFor(PolicyInputs inputs, String requestedTool, String serverWorkflowStage) {
+        requireStageToolName(requestedTool);
+        if (serverWorkflowStage == null || serverWorkflowStage.isBlank()) throw failure(FailureCode.INVALID_REQUEST);
+        try {
+            requireInputs(inputs);
+            JsonNode workflow = inputs.baseline() ? inputs.baselineWorkflow : object(inputs.policy.path("workflow"));
+            var stages = policyValues(workflow.path("allowedStages"));
+            var tools = catalogToolNames(inputs.catalog.semanticCatalog()).stream()
+                    .map(name -> new PolicyWorkflowFacts.CatalogTool(name, "CASE_CONTEXT_READ".equals(name))).toList();
+            return new PolicyWorkflowFacts(requestedTool, serverWorkflowStage, stages, tools);
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+    }
+
+    PolicyHumanBoundaryFacts humanBoundaryFor(PolicyInputs inputs, String requestedTool) {
+        requireStageToolName(requestedTool);
+        try {
+            requireInputs(inputs);
+            return humanBoundary(inputs.policy, inputs.catalog.semanticCatalog(), requestedTool);
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+    }
+
+    /** Called only at TOOL_TRUST; observed registry entries are never filled from declarations. */
+    PolicyToolTrustFacts toolTrustFor(PolicyInputs inputs, String requestedTool,
+            String observedReleaseFingerprint, List<ToolRegistryEntry> observedRegistry) {
+        requireStageToolName(requestedTool);
+        String expectedFingerprint;
+        List<ReleaseToolBinding> bindings;
+        ToolTrustPolicy trust;
+        try {
+            requireInputs(inputs);
+            expectedFingerprint = inputs.catalog.releaseFingerprint();
+            bindings = inputs.catalog.releaseToolBindings();
+            JsonNode rules = object(inputs.policy.path("toolTrust"));
+            JsonNode required = rules.path("requireTrustedTool");
+            if (!required.isBoolean()) throw invalidSource();
+            var levels = policyValues(rules.path("allowedTrustLevels")).stream().map(TrustLevel::valueOf).toList();
+            trust = new ToolTrustPolicy(required.booleanValue(), levels);
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+        try {
+            // Keep complete bindings/observations, including constructor checks for unrelated entries.
+            return new PolicyToolTrustFacts(requestedTool, expectedFingerprint, observedReleaseFingerprint,
+                    observedRegistry, bindings, trust);
+        } catch (RuntimeException exception) {
+            throw failure(FailureCode.INVALID_REQUEST);
+        }
     }
 
     /** No applicant identity, Run/Case binding, preflight or other policy stage is established here. */
@@ -67,23 +295,7 @@ public final class GatewayPolicyFactsAssembler {
     public PolicyHumanBoundaryFacts humanBoundary(ApprovedPolicySource source, String requestedTool) {
         requireToolName(requestedTool);
         try {
-            JsonNode actions = object(policy(source).path("highImpactActions"));
-            ContractValidationCatalog catalog = catalog(source);
-            if (!"HUMAN_ONLY".equals(actions.path(LOAN_DECISION_UPDATE).stringValue())) throw invalidSource();
-            // Do not use allowedTools: human-only operations deliberately live outside that allowlist.
-            var tools = new LinkedHashSet<String>();
-            catalog.enabledReleaseTools().forEach(tool -> tools.add(tool.toolName()));
-            tools.addAll(catalog.highImpactToolNames());
-            var mappings = new ArrayList<HighImpactAction>();
-            for (var entry : actions.properties()) {
-                if (!catalog.hasHighImpactTool(entry.getKey()) || !entry.getValue().isString()
-                        || !"HUMAN_ONLY".equals(entry.getValue().stringValue())) throw invalidSource();
-                mappings.add(new HighImpactAction(entry.getKey(), BoundaryMode.HUMAN_ONLY));
-            }
-            for (String tool : catalog.highImpactToolNames()) {
-                if (!actions.has(tool)) throw invalidSource();
-            }
-            return new PolicyHumanBoundaryFacts(requestedTool, List.copyOf(tools), mappings);
+            return humanBoundary(policy(source), catalog(source), requestedTool);
         } catch (FactAssemblyException exception) {
             throw exception;
         } catch (RuntimeException exception) {
@@ -258,6 +470,26 @@ public final class GatewayPolicyFactsAssembler {
         return new FieldPolicy(CUSTOMER_DATA_READ, policyValues(fieldPolicy.path("allowed")), true);
     }
 
+    private static PolicyHumanBoundaryFacts humanBoundary(JsonNode policy, ContractValidationCatalog catalog,
+            String requestedTool) {
+        JsonNode actions = object(policy.path("highImpactActions"));
+        if (!"HUMAN_ONLY".equals(actions.path(LOAN_DECISION_UPDATE).stringValue())) throw invalidSource();
+        // Do not use allowedTools: human-only operations deliberately live outside that allowlist.
+        var tools = new LinkedHashSet<String>();
+        catalog.enabledReleaseTools().forEach(tool -> tools.add(tool.toolName()));
+        tools.addAll(catalog.highImpactToolNames());
+        var mappings = new ArrayList<HighImpactAction>();
+        for (var entry : actions.properties()) {
+            if (!catalog.hasHighImpactTool(entry.getKey()) || !entry.getValue().isString()
+                    || !"HUMAN_ONLY".equals(entry.getValue().stringValue())) throw invalidSource();
+            mappings.add(new HighImpactAction(entry.getKey(), BoundaryMode.HUMAN_ONLY));
+        }
+        for (String tool : catalog.highImpactToolNames()) {
+            if (!actions.has(tool)) throw invalidSource();
+        }
+        return new PolicyHumanBoundaryFacts(requestedTool, List.copyOf(tools), mappings);
+    }
+
     private static List<ObjectScopePolicy> objectScopes(JsonNode policy, ContractValidationCatalog catalog) {
         JsonNode resources = object(policy.path("resourcePolicies"));
         var scopes = new TreeMap<String, ObjectScopePolicy>();
@@ -299,7 +531,10 @@ public final class GatewayPolicyFactsAssembler {
     }
 
     private static List<String> catalogToolNames(ApprovedPolicySource source) {
-        ContractValidationCatalog catalog = catalog(source);
+        return catalogToolNames(catalog(source));
+    }
+
+    private static List<String> catalogToolNames(ContractValidationCatalog catalog) {
         var names = new LinkedHashSet<String>();
         for (var tool : catalog.enabledReleaseTools()) {
             if (!names.add(tool.toolName())) throw invalidSource();
@@ -331,18 +566,66 @@ public final class GatewayPolicyFactsAssembler {
 
     private static List<PolicyToolAuthorizationFacts.CatalogTool> declaredTools(ApprovedPolicySource source) {
         ContractValidationCatalog catalog = catalog(source);
+        return declaredTools(source.catalog(), catalog);
+    }
+
+    private static List<PolicyToolAuthorizationFacts.CatalogTool> declaredTools(SourceBoundCatalog source) {
+        return declaredTools(source, source.semanticCatalog());
+    }
+
+    private static List<PolicyToolAuthorizationFacts.CatalogTool> declaredTools(SourceBoundCatalog source,
+            ContractValidationCatalog catalog) {
         var expected = new HashSet<String>();
         catalog.enabledReleaseTools().forEach(tool -> expected.add(tool.toolName()));
         for (String tool : catalog.highImpactToolNames()) {
             if (!expected.add(tool)) throw invalidSource();
         }
-        var declarations = List.copyOf(source.catalog().declaredTools());
+        var declarations = List.copyOf(source.declaredTools());
         var actual = new HashSet<String>();
         for (var tool : declarations) {
             if (!actual.add(tool.name())) throw invalidSource();
         }
         if (actual.isEmpty() || !actual.equals(expected)) throw invalidSource();
         return declarations;
+    }
+
+    /** New stage entrypoints consume C's bounded schema-checked request, never B validation hooks. */
+    private static String stageRequestTool(ToolProposal proposal) {
+        try {
+            if (proposal == null) throw failure(FailureCode.INVALID_REQUEST);
+            requireStageToolName(proposal.toolName());
+            if (proposal.arguments() == null || !proposal.arguments().isObject()) throw failure(FailureCode.INVALID_REQUEST);
+            return proposal.toolName();
+        } catch (RuntimeException exception) {
+            throw failure(FailureCode.INVALID_REQUEST);
+        }
+    }
+
+    private static List<String> stageRequestValues(ToolProposal request, String field) {
+        try {
+            JsonNode array = request.arguments().path(field);
+            if (array == null || !array.isArray() || array.isEmpty()) throw failure(FailureCode.INVALID_REQUEST);
+            var values = new ArrayList<String>();
+            var unique = new HashSet<String>();
+            for (JsonNode item : array) {
+                if (!item.isString() || item.stringValue().isBlank() || !unique.add(item.stringValue())) {
+                    throw failure(FailureCode.INVALID_REQUEST);
+                }
+                values.add(item.stringValue());
+            }
+            return List.copyOf(values);
+        } catch (RuntimeException exception) {
+            throw failure(FailureCode.INVALID_REQUEST);
+        }
+    }
+
+    private static PolicyInputs requireInputs(PolicyInputs inputs) {
+        if (inputs == null) throw invalidSource();
+        return inputs;
+    }
+
+    private static void requireStageToolName(String tool) {
+        if (!CatalogBoundInputSchemaEvaluator.validToolName(tool)) throw failure(FailureCode.INVALID_REQUEST);
     }
 
     private ToolProposal customerRequest(ToolProposal proposal) {
@@ -401,6 +684,24 @@ public final class GatewayPolicyFactsAssembler {
             values.add(value.stringValue());
         }
         return values;
+    }
+
+    /** Policy expectations, not proof of approval or observed runtime context. */
+    static final class PolicyInputs {
+        private final JsonNode policy;
+        private final SourceBoundCatalog catalog;
+        private final JsonNode baselineWorkflow;
+
+        private PolicyInputs(JsonNode policy, SourceBoundCatalog catalog, JsonNode baselineWorkflow) {
+            this.policy = object(policy).deepCopy();
+            this.catalog = Objects.requireNonNull(catalog);
+            Objects.requireNonNull(catalog.semanticCatalog());
+            this.baselineWorkflow = baselineWorkflow == null ? null : object(baselineWorkflow).deepCopy();
+        }
+
+        JsonNode policy() { return policy.deepCopy(); }
+        SourceBoundCatalog catalog() { return catalog; }
+        boolean baseline() { return baselineWorkflow != null; }
     }
 
     public record CustomerDataReadFacts(PolicyFieldScopeFacts fieldScope, PolicyCardinalityFacts cardinality) {

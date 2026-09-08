@@ -1,5 +1,6 @@
 package com.finsecseal.policy;
 
+import com.finsecseal.contract.ReleaseToolCatalogContractAdapter.SourceBoundCatalog;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.ApprovedPolicySource;
 import com.finsecseal.runtime.ToolProposal;
 import java.math.BigDecimal;
@@ -12,13 +13,15 @@ import java.util.regex.Pattern;
 import tools.jackson.databind.JsonNode;
 
 /**
- * Checks request shape against the already approved source snapshot, without owner reads or execution.
- * MATCH is only input-schema conformance; context, permission and the remaining preflight are separate.
+ * Checks the verified catalog schema and mode-independent request invariants, without owner reads or execution.
+ * MATCH grants no context, permission or remaining preflight authority.
  */
 public final class CatalogBoundInputSchemaEvaluator {
     private static final int MAX_ARGUMENT_BYTES = 32 * 1024;
     // C resource-limit choices. The specification requires a depth bound but does not fix this number.
     private static final int MAX_DEPTH = 32;
+    private static final int MAX_RESPONSE_BYTES = 1024 * 1024;
+    private static final int MAX_RESPONSE_DEPTH = 64;
     private static final int MAX_NUMERIC_DIGITS = MAX_ARGUMENT_BYTES;
     private static final Pattern TOOL = Pattern.compile("[A-Z][A-Z0-9_]{1,99}");
     private final CatalogJsonSchemaValidator schemas;
@@ -32,7 +35,15 @@ public final class CatalogBoundInputSchemaEvaluator {
     }
 
     public InputOutcome evaluate(ApprovedPolicySource source, ToolProposal proposal) {
-        Map<String, JsonNode> catalog = inputSchemas(source);
+        return evaluate(proposal, inputSchemas(source));
+    }
+
+    /** Internal use with an already verified catalog; input conformance grants no permission. */
+    InputOutcome evaluateCatalog(SourceBoundCatalog catalog, ToolProposal proposal) {
+        return evaluate(proposal, inputSchemas(catalog));
+    }
+
+    private InputOutcome evaluate(ToolProposal proposal, Map<String, JsonNode> catalog) {
         if (proposal == null || !validToolName(proposal.toolName())) {
             return InputOutcome.INVALID_REQUEST_SCHEMA;
         }
@@ -41,8 +52,15 @@ public final class CatalogBoundInputSchemaEvaluator {
         JsonNode schema = catalog.get(proposal.toolName());
         if (schema == null) return InputOutcome.TOOL_NOT_IN_CATALOG;
         try {
-            return schemas.matches(schema, arguments)
-                    ? InputOutcome.MATCH : InputOutcome.INVALID_REQUEST_SCHEMA;
+            if (!schemas.matches(schema, arguments)) return InputOutcome.INVALID_REQUEST_SCHEMA;
+            // These request invariants precede business rules in both BASELINE and ENFORCE.
+            // Never normalize or deduplicate malformed requests into executable ones.
+            if ("CUSTOMER_DATA_READ".equals(proposal.toolName())
+                    && (!uniqueNonblankStrings(arguments.path("customerIds"))
+                            || !uniqueNonblankStrings(arguments.path("fields")))) {
+                return InputOutcome.INVALID_REQUEST_SCHEMA;
+            }
+            return InputOutcome.MATCH;
         } catch (CatalogJsonSchemaValidator.ValidationException exception) {
             throw failure(switch (exception.failure()) {
                 case INVALID_SCHEMA, UNSUPPORTED_FORMAT -> FailureCode.INVALID_CATALOG_SCHEMA;
@@ -53,10 +71,28 @@ public final class CatalogBoundInputSchemaEvaluator {
         }
     }
 
+    private static boolean uniqueNonblankStrings(JsonNode array) {
+        if (!array.isArray() || array.isEmpty()) return false;
+        var seen = new HashSet<String>();
+        for (JsonNode value : array) {
+            if (!value.isString() || value.stringValue().isBlank() || !seen.add(value.stringValue())) return false;
+        }
+        return true;
+    }
+
     private Map<String, JsonNode> inputSchemas(ApprovedPolicySource source) {
         try {
             if (source == null) throw failure(FailureCode.INVALID_POLICY_SOURCE);
-            var catalog = source.catalog();
+            return inputSchemas(source.catalog());
+        } catch (InputSchemaException exception) {
+            throw exception;
+        } catch (RuntimeException exception) {
+            throw failure(FailureCode.INVALID_POLICY_SOURCE);
+        }
+    }
+
+    private Map<String, JsonNode> inputSchemas(SourceBoundCatalog catalog) {
+        try {
             if (catalog == null) throw failure(FailureCode.INVALID_POLICY_SOURCE);
             var semantic = catalog.semanticCatalog();
             if (semantic == null) throw failure(FailureCode.INVALID_POLICY_SOURCE);
@@ -87,11 +123,25 @@ public final class CatalogBoundInputSchemaEvaluator {
         }
     }
 
-    private JsonNode snapshotArguments(JsonNode arguments) {
+    static JsonNode snapshotArguments(JsonNode arguments) {
         try {
-            if (arguments == null || !arguments.isObject() || !withinTreeLimits(arguments)) return null;
-            JsonNode snapshot = arguments.deepCopy();
-            return snapshot.toString().getBytes(StandardCharsets.UTF_8).length <= MAX_ARGUMENT_BYTES
+            return arguments == null || !arguments.isObject()
+                    ? null : snapshot(arguments, MAX_ARGUMENT_BYTES, MAX_DEPTH);
+        } catch (RuntimeException exception) {
+            return null;
+        }
+    }
+
+    /** Bounded raw response/classification snapshot, prior to schema or provenance evaluation. */
+    static JsonNode snapshotResponse(JsonNode response) {
+        return snapshot(response, MAX_RESPONSE_BYTES, MAX_RESPONSE_DEPTH);
+    }
+
+    private static JsonNode snapshot(JsonNode value, int maximumBytes, int maximumDepth) {
+        try {
+            if (value == null || !withinTreeLimits(value, maximumBytes, maximumDepth)) return null;
+            JsonNode snapshot = value.deepCopy();
+            return snapshot.toString().getBytes(StandardCharsets.UTF_8).length <= maximumBytes
                     ? snapshot : null;
         } catch (RuntimeException exception) {
             return null;
@@ -99,21 +149,22 @@ public final class CatalogBoundInputSchemaEvaluator {
     }
 
     /** Reject unsafe trees before recursive copying/serialization; callers must not mutate during evaluation. */
-    private boolean withinTreeLimits(JsonNode root) {
+    private static boolean withinTreeLimits(JsonNode root, int maximumBytes, int maximumDepth) {
         var pending = new ArrayDeque<PendingNode>();
         pending.push(new PendingNode(root, 1));
         long minimumBytes = 1;
+        long numericWork = 0;
         while (!pending.isEmpty()) {
             PendingNode current = pending.pop();
             JsonNode node = current.node();
-            if (current.depth() > MAX_DEPTH || node == null) return false;
+            if (current.depth() > maximumDepth || node == null) return false;
             if (node.isObject()) {
                 minimumBytes++; // Replace the queued one-byte lower bound with two delimiters.
                 int index = 0;
                 for (var property : node.properties()) {
                     // Key quotes, colon, child and (after the first item) comma; escapes can only add bytes.
                     minimumBytes += (long) property.getKey().length() + 4 + (index++ == 0 ? 0 : 1);
-                    if (minimumBytes > MAX_ARGUMENT_BYTES) return false;
+                    if (minimumBytes > maximumBytes) return false;
                     pending.push(new PendingNode(property.getValue(), current.depth() + 1));
                 }
             } else if (node.isArray()) {
@@ -121,23 +172,37 @@ public final class CatalogBoundInputSchemaEvaluator {
                 int index = 0;
                 for (JsonNode child : node) {
                     minimumBytes += 1 + (index++ == 0 ? 0 : 1);
-                    if (minimumBytes > MAX_ARGUMENT_BYTES) return false;
+                    if (minimumBytes > maximumBytes) return false;
                     pending.push(new PendingNode(child, current.depth() + 1));
                 }
             } else if (node.isString()) {
                 minimumBytes += (long) node.stringValue().length() + 1;
             } else if (node.isNumber()) {
-                if (!withinNumericWorkLimit(node.numberValue())) return false;
+                Number number = node.numberValue();
+                if (!withinNumericWorkLimit(number)) return false;
+                // Each number is already bounded. Count its representation before copying the
+                // whole tree, and separately bound aggregate exact-integer normalization work.
+                String encoded = number.toString();
+                minimumBytes += encoded.length() - 1L;
+                long work = encoded.length();
+                BigDecimal decimal = number instanceof BigDecimal value ? value
+                        : number instanceof Double || number instanceof Float ? new BigDecimal(encoded) : null;
+                if (decimal != null && decimal.signum() != 0) {
+                    work = Math.max(work, Math.max(decimal.precision(),
+                            (long) decimal.precision() - decimal.scale()));
+                }
+                numericWork += work;
+                if (numericWork > maximumBytes) return false;
             } else if (!node.isBoolean() && !node.isNull()) {
                 return false;
             }
-            if (minimumBytes > MAX_ARGUMENT_BYTES) return false;
+            if (minimumBytes > maximumBytes) return false;
         }
         return true;
     }
 
     /** Bounds exact-integer fallback expansion without creating an integer or changing the original value. */
-    private boolean withinNumericWorkLimit(Number number) {
+    private static boolean withinNumericWorkLimit(Number number) {
         if (number == null) return false;
         if (number instanceof Double value) return Double.isFinite(value);
         if (number instanceof Float value) return Float.isFinite(value);
@@ -151,7 +216,7 @@ public final class CatalogBoundInputSchemaEvaluator {
         return true;
     }
 
-    private static boolean validToolName(String name) {
+    static boolean validToolName(String name) {
         return name != null && name.length() <= 100 && TOOL.matcher(name).matches();
     }
 

@@ -583,6 +583,14 @@ public final class SafetyContractLifecyclePolicy {
         return matcher.group(1);
     }
 
+    /** Checks reviewer policy over an already authenticated context; does not verify credentials. */
+    public static void requireReviewerContext(ReviewerContext reviewer, UUID expectedWorkspaceId) {
+        if (expectedWorkspaceId == null) {
+            throw rejection(RejectionCode.REVIEWER_WORKSPACE_MISMATCH);
+        }
+        requireReviewer(reviewer, expectedWorkspaceId);
+    }
+
     private static void requireReviewer(
             ReviewerContext reviewer,
             UUID expectedWorkspaceId

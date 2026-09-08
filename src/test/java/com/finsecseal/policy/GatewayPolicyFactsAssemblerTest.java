@@ -11,6 +11,7 @@ import static com.finsecseal.policy.PolicyEvaluationReason.INVALID_WORKFLOW_STAG
 import static com.finsecseal.policy.PolicyEvaluationReason.OPERATION_NOT_ALLOWED;
 import static com.finsecseal.policy.PolicyEvaluationReason.RECORD_LIMIT_EXCEEDED;
 import static com.finsecseal.policy.PolicyEvaluationReason.TOOL_NOT_ALLOWED;
+import static com.finsecseal.policy.PolicyEvaluationReason.TOOL_INTEGRITY_FAILURE;
 import static com.finsecseal.policy.PolicyEvaluationStage.CARDINALITY;
 import static com.finsecseal.policy.PolicyEvaluationStage.BUSINESS_CONTEXT;
 import static com.finsecseal.policy.PolicyEvaluationStage.EGRESS;
@@ -20,6 +21,8 @@ import static com.finsecseal.policy.PolicyEvaluationStage.OPERATION;
 import static com.finsecseal.policy.PolicyEvaluationStage.OBJECT_SCOPE;
 import static com.finsecseal.policy.PolicyEvaluationStage.TOOL;
 import static com.finsecseal.policy.PolicyEvaluationStage.WORKFLOW;
+import static com.finsecseal.policy.PolicyEvaluationStage.PREFLIGHT;
+import static com.finsecseal.policy.PolicyEvaluationStage.TOOL_TRUST;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
@@ -33,12 +36,16 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+import com.finsecseal.agent.AgentEntity;
+import com.finsecseal.agent.AgentService;
+import com.finsecseal.common.domain.ReleaseLifecycleState;
 import com.finsecseal.common.domain.Sensitivity;
 import com.finsecseal.common.domain.TestCaseRunStatus;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.common.domain.TestRunStatus;
 import com.finsecseal.contract.ReleaseToolCatalogContractAdapter;
 import com.finsecseal.contract.ReleaseToolCatalogContractAdapter.SourceBoundCatalog;
+import com.finsecseal.contract.LoanReviewFinancialTemplate;
 import com.finsecseal.contract.SafetyContractCanonicalizer;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.ReviewerContext;
 import com.finsecseal.contract.SafetyContractSchemaValidator;
@@ -55,6 +62,8 @@ import com.finsecseal.platform.contract.ContractPersistenceService.Version;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.ApprovedPolicySource;
 import com.finsecseal.policy.GatewayPolicyFactsAssembler.FactAssemblyException;
 import com.finsecseal.policy.GatewayPolicyFactsAssembler.FailureCode;
+import com.finsecseal.policy.GatewayPolicyFactsAssembler.PolicyInputs;
+import com.finsecseal.policy.GatewayBaselinePolicySourceService.BaselinePolicySource;
 import com.finsecseal.policy.EnforcePolicyPostCallDecision.OperationalReason;
 import com.finsecseal.policy.EnforcePolicyPostCallDecision.PostCallCheck;
 import com.finsecseal.policy.EnforcePolicyPostCallFacts.CatalogOutputField;
@@ -63,8 +72,14 @@ import com.finsecseal.policy.PolicyEvaluationDecision.StageOutcome;
 import com.finsecseal.policy.PolicyObjectScopeFacts.DocumentOwnership;
 import com.finsecseal.policy.PolicyObjectScopeFacts.ObjectScopePolicy;
 import com.finsecseal.policy.PolicyToolAuthorizationFacts.CatalogTool;
+import com.finsecseal.policy.PolicyToolTrustFacts.ToolRegistryEntry;
+import com.finsecseal.policy.PolicyToolTrustFacts.TrustLevel;
+import com.finsecseal.release.AgentReleaseEntity;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
+import com.finsecseal.release.FingerprintService;
+import com.finsecseal.release.ReleaseDto.ToolCatalogResponse;
+import com.finsecseal.release.ReleaseService;
 import com.finsecseal.runtime.ToolProposal;
 import com.finsecseal.runtime.ToolProposalValidator;
 import com.finsecseal.sandbox.tool.CustomerDataReadToolAdapter;
@@ -72,11 +87,15 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.math.BigInteger;
 import java.sql.Connection;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.AfterEach;
@@ -1517,6 +1536,256 @@ class GatewayPolicyFactsAssemblerTest {
         assertThat(decision.toString()).doesNotContain(CUSTOMER_CANARY, ERROR_CANARY);
     }
 
+    @Test
+    void baselineInputsUseRealTemplateAndManifestWorkflowWithoutGrantingHumanPermission() throws Exception {
+        var baseline = baselineSourceFixture("POST_DOCUMENT_REVIEW");
+        var inputs = assembler.baselineInputs(baseline, new LoanReviewFinancialTemplate(json));
+        assertThat(inputs.policy().at("/metadata/templateVersion").stringValue()).isEqualTo(LoanReviewFinancialTemplate.KEY);
+        for (CatalogTool tool : declarations()) {
+            var facts = assembler.authorizationFor(inputs, tool.name(), tool.operation());
+            assertThat(authorization.evaluate(TOOL, facts)).isEqualTo(tool.name().equals(HUMAN_TOOL)
+                    ? StageOutcome.deny(TOOL, TOOL_NOT_ALLOWED) : StageOutcome.pass(TOOL));
+        }
+        assertThat(workflow.evaluate(WORKFLOW, assembler.workflowFor(inputs, CUSTOMER_TOOL, "POST_DOCUMENT_REVIEW")))
+                .isEqualTo(StageOutcome.pass(WORKFLOW));
+        assertThat(workflow.evaluate(WORKFLOW, assembler.workflowFor(inputs, CUSTOMER_TOOL, "DOCUMENT_REVIEW")))
+                .isEqualTo(StageOutcome.deny(WORKFLOW, INVALID_WORKFLOW_STAGE));
+        assertThat(assembler.businessContextFor(inputs, true, Optional.of(PURPOSE), Optional.of(PURPOSE), Optional.of(PURPOSE),
+                Optional.of("server-namespace"), Optional.of(CASE), Optional.of(CUSTOMER_CANARY),
+                Optional.of("POST_DOCUMENT_REVIEW"), Optional.of(List.of(DOCUMENT))).contractPurpose()).contains(PURPOSE);
+        assertThat(fields.evaluate(FIELD_SCOPE, assembler.fieldScopeFor(inputs, proposal(arguments()))))
+                .isEqualTo(StageOutcome.pass(FIELD_SCOPE));
+        assertThat(cardinality.evaluate(CARDINALITY, assembler.cardinalityFor(inputs, proposal(arguments()))))
+                .isEqualTo(StageOutcome.pass(CARDINALITY));
+        assertThat(human.evaluate(HUMAN_BOUNDARY, assembler.humanBoundaryFor(inputs, HUMAN_TOOL)))
+                .isEqualTo(StageOutcome.deny(HUMAN_BOUNDARY, HUMAN_ONLY_ACTION));
+        safe(() -> assembler.baselineInputs(baseline, null), FailureCode.INVALID_POLICY_SOURCE);
+        assertInternalProjectionOnly();
+    }
+
+    @Test
+    void approvedInputsPreserveIndependentOperationAndExistingContextAndScopeRules() {
+        var inputs = assembler.approvedInputs(source);
+        var auth = assembler.authorizationFor(inputs, CUSTOMER_TOOL, "WRITE");
+        assertThat(auth.requestedOperation()).isEqualTo("WRITE");
+        assertThat(authorization.evaluate(OPERATION, auth)).isEqualTo(StageOutcome.deny(OPERATION, OPERATION_NOT_ALLOWED));
+        assertThat(business.evaluate(BUSINESS_CONTEXT, assembler.businessContextFor(inputs, true,
+                Optional.of(PURPOSE), Optional.of(PURPOSE), Optional.of(PURPOSE), Optional.of("server-namespace"),
+                Optional.of(CASE), Optional.of(CUSTOMER_CANARY), Optional.of("DOCUMENT_REVIEW"), Optional.of(List.of(DOCUMENT)))))
+                .isEqualTo(StageOutcome.pass(BUSINESS_CONTEXT));
+        assertThat(objects.evaluate(OBJECT_SCOPE, assembler.objectScopeFor(inputs, CUSTOMER_TOOL,
+                Optional.of(CASE), Optional.empty(), Optional.of(List.of("OTHER-CUSTOMER")), Optional.of(CASE),
+                Optional.of(CUSTOMER_CANARY), Optional.of(List.of(DOCUMENT)), Optional.empty())))
+                .isEqualTo(StageOutcome.deny(OBJECT_SCOPE, CUSTOMER_SCOPE_VIOLATION));
+        assertThat(egress.evaluate(EGRESS, assembler.egressFor(inputs, CUSTOMER_TOOL))).isEqualTo(StageOutcome.pass(EGRESS));
+        assertInternalProjectionOnly();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"CASE_CONTEXT_READ", "DOCUMENT_READER", "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE", HUMAN_TOOL})
+    void noRuleNoncustomerAndHumanFactsRetainActualCatalogMembership(String tool) throws Exception {
+        var actual = approvedSourceFixture(policy -> {}, true);
+        var inputs = assembler.approvedInputs(actual);
+        var request = new ToolProposal(tool, json.createObjectNode());
+        var fieldFacts = assembler.fieldScopeFor(inputs, request);
+        var countFacts = assembler.cardinalityFor(inputs, request);
+        assertThat(fieldFacts.isRequestedToolCatalogKnown()).isTrue();
+        assertThat(fieldFacts.requestedFields()).isEmpty();
+        assertThat(fieldFacts.requestedFieldPolicy()).isEmpty();
+        assertThat(countFacts.isRequestedToolCatalogKnown()).isTrue();
+        assertThat(countFacts.requestedCardinalityPolicy()).isEmpty();
+        assertThat(fields.evaluate(FIELD_SCOPE, fieldFacts)).isEqualTo(StageOutcome.pass(FIELD_SCOPE));
+        assertThat(cardinality.evaluate(CARDINALITY, countFacts)).isEqualTo(StageOutcome.pass(CARDINALITY));
+        var expectedFields = actual.catalog().semanticCatalog().enabledReleaseTools().stream()
+                .filter(value -> value.toolName().equals(tool)).findFirst().map(EnabledTool::outputFields).orElse(List.of());
+        assertThat(fieldFacts.catalogSchemas().stream().filter(value -> value.toolName().equals(tool)).findFirst().orElseThrow().outputFields())
+                .containsExactlyElementsOf(expectedFields);
+        assertInternalProjectionOnly();
+    }
+
+    @Test
+    void unknownToolDoesNotAcquireNoRuleCatalogMembership() {
+        var inputs = assembler.approvedInputs(source);
+        var request = new ToolProposal("UNKNOWN_TOOL", json.createObjectNode());
+        var fieldFacts = assembler.fieldScopeFor(inputs, request);
+        var countFacts = assembler.cardinalityFor(inputs, request);
+        assertThat(fieldFacts.isRequestedToolCatalogKnown()).isFalse();
+        assertThat(countFacts.isRequestedToolCatalogKnown()).isFalse();
+        assertThatThrownBy(() -> fields.evaluate(FIELD_SCOPE, fieldFacts)).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> cardinality.evaluate(CARDINALITY, countFacts)).isInstanceOf(IllegalStateException.class);
+        assertInternalProjectionOnly();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"field", "requested-count", "returned-count-only"})
+    void activeValidatedNoncustomerRuleCannotDisappearIntoNoRuleFacts(String rule) throws Exception {
+        var actual = approvedSourceFixture(policy -> addNoncustomerRule(policy, rule), true);
+        var inputs = assembler.approvedInputs(actual);
+        var request = new ToolProposal("DOCUMENT_READER", json.createObjectNode().put("caseId", CASE).put("documentId", DOCUMENT));
+        if (rule.equals("field")) safe(() -> assembler.fieldScopeFor(inputs, request), FailureCode.INVALID_POLICY_SOURCE);
+        else safe(() -> assembler.cardinalityFor(inputs, request), FailureCode.INVALID_POLICY_SOURCE);
+        assertInternalProjectionOnly();
+    }
+
+    @Test
+    void unrelatedValidatedNoncustomerRulesDoNotBlockCurrentCustomerRequest() throws Exception {
+        var actual = approvedSourceFixture(policy -> {
+            addNoncustomerRule(policy, "field");
+            addNoncustomerRule(policy, "returned-count-only");
+        }, true);
+        var inputs = assembler.approvedInputs(actual);
+        assertThat(fields.evaluate(FIELD_SCOPE, assembler.fieldScopeFor(inputs, proposal(arguments()))))
+                .isEqualTo(StageOutcome.pass(FIELD_SCOPE));
+        assertThat(cardinality.evaluate(CARDINALITY, assembler.cardinalityFor(inputs, proposal(arguments()))))
+                .isEqualTo(StageOutcome.pass(CARDINALITY));
+        assertInternalProjectionOnly();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"unknown", "unknown-100-characters", "customer", "field", "human"})
+    void earlierRealStageFailureDoesNotReadRegistryOrLaterMalformedCardinality(String boundary) {
+        ObjectNode policy = (ObjectNode) source.policy();
+        ObjectNode args = arguments();
+        String tool = CUSTOMER_TOOL;
+        PolicyEvaluationReason expected = CUSTOMER_SCOPE_VIOLATION;
+        switch (boundary) {
+            case "unknown" -> { tool = "UNKNOWN_TOOL"; expected = TOOL_NOT_ALLOWED; }
+            case "unknown-100-characters" -> { tool = "A".repeat(100); expected = TOOL_NOT_ALLOWED; }
+            case "customer" -> args.putArray("customerIds").add("OTHER-CUSTOMER");
+            case "field" -> {
+                args.putArray("fields").add("accountNumber");
+                ((ObjectNode) policy.at("/cardinality/CUSTOMER_DATA_READ")).put("maxRequestedRecords", ERROR_CANARY);
+                expected = FIELD_SCOPE_VIOLATION;
+            }
+            case "human" -> { tool = HUMAN_TOOL; expected = HUMAN_ONLY_ACTION; }
+            default -> throw new IllegalArgumentException(boundary);
+        }
+        var inputs = assembler.approvedInputs(boundary.equals("field") ? malformedSource(policy, source.catalog()) : source);
+        AtomicInteger registryCalls = new AtomicInteger();
+        var decision = evaluateInputs(inputs, new ToolProposal(tool, args), () -> {
+            registryCalls.incrementAndGet();
+            throw new IllegalStateException(ERROR_CANARY);
+        });
+        assertThat(decision.reason()).contains(expected);
+        assertThat(decision.evaluatedStages()).doesNotContain(TOOL_TRUST);
+        if (boundary.equals("field")) assertThat(decision.evaluatedStages()).doesNotContain(CARDINALITY);
+        assertThat(registryCalls).hasValue(0);
+        assertInternalProjectionOnly();
+    }
+
+    @Test
+    void cardinalityProjectionDoesNotParseFieldArgumentsOrFieldPolicy() {
+        ObjectNode policy = (ObjectNode) source.policy();
+        ((ObjectNode) policy.path("fieldPolicy")).put(CUSTOMER_TOOL, ERROR_CANARY);
+        ObjectNode args = arguments();
+        args.put("fields", ERROR_CANARY);
+        args.putArray("customerIds").add(CUSTOMER_CANARY).add("SECOND-CUSTOMER");
+        var inputs = assembler.approvedInputs(malformedSource(policy, source.catalog()));
+        var facts = assembler.cardinalityFor(inputs, proposal(args));
+        assertThat(facts.normalizedRequestedRecordCount()).isEqualTo(2);
+        assertThat(cardinality.evaluate(CARDINALITY, facts)).isEqualTo(StageOutcome.deny(CARDINALITY, RECORD_LIMIT_EXCEEDED));
+        assertInternalProjectionOnly();
+    }
+
+    @Test
+    void stageTenReadsIndependentUnitRegistryOnceAndKeepsItsMismatchingDigest() {
+        var inputs = assembler.approvedInputs(source);
+        AtomicInteger registryCalls = new AtomicInteger();
+        var registry = independentUnitRegistry(ARTIFACT);
+        var decision = evaluateInputs(inputs, proposal(arguments()), () -> { registryCalls.incrementAndGet(); return registry; });
+        assertThat(registryCalls).hasValue(1);
+        assertThat(decision.failedStage()).contains(TOOL_TRUST);
+        assertThat(decision.reason()).contains(TOOL_INTEGRITY_FAILURE);
+        var facts = assembler.toolTrustFor(inputs, CUSTOMER_TOOL, FINGERPRINT, registry);
+        assertThat(facts.registryEntries()).isEqualTo(registry);
+        assertThat(facts.registryEntries().stream().filter(value -> value.toolName().equals(CUSTOMER_TOOL)).findFirst().orElseThrow().schemaDigest())
+                .isEqualTo(ARTIFACT);
+        assertThat(facts.releaseBindings()).hasSize(5);
+        assertInternalProjectionOnly();
+    }
+
+    @Test
+    void incompleteOrMalformedRegistryAndSourceErrorsKeepSeparateSafeBoundaries() {
+        var inputs = assembler.approvedInputs(source);
+        safe(() -> assembler.toolTrustFor(inputs, CUSTOMER_TOOL, FINGERPRINT,
+                List.of(new ToolRegistryEntry(CUSTOMER_TOOL, "1.0.0", TrustLevel.TRUSTED_INTERNAL, HASH, HASH))), FailureCode.INVALID_REQUEST);
+        safe(() -> assembler.toolTrustFor(inputs, CUSTOMER_TOOL, ERROR_CANARY, independentUnitRegistry(HASH)), FailureCode.INVALID_REQUEST);
+        safe(() -> assembler.fieldScopeFor(inputs, null), FailureCode.INVALID_REQUEST);
+        ObjectNode duplicates = arguments();
+        duplicates.putArray("customerIds").add(CUSTOMER_CANARY).add(CUSTOMER_CANARY);
+        safe(() -> assembler.cardinalityFor(inputs, proposal(duplicates)), FailureCode.INVALID_REQUEST);
+        safe(() -> assembler.approvedInputs(null), FailureCode.INVALID_POLICY_SOURCE);
+        ObjectNode policy = (ObjectNode) source.policy();
+        ((ObjectNode) policy.path("toolTrust")).putArray("allowedTrustLevels").add(ERROR_CANARY);
+        var malformed = assembler.approvedInputs(malformedSource(policy, source.catalog()));
+        safe(() -> assembler.toolTrustFor(malformed, CUSTOMER_TOOL, FINGERPRINT, independentUnitRegistry(HASH)), FailureCode.INVALID_POLICY_SOURCE);
+        assertInternalProjectionOnly();
+    }
+
+    @Test
+    void internalInputAndRequestCopiesKeepTheConsumedPolicyAndFieldsStable() {
+        var inputs = assembler.approvedInputs(source);
+        ObjectNode args = arguments();
+        var facts = assembler.fieldScopeFor(inputs, proposal(args));
+        ((ObjectNode) source.policy().at("/fieldPolicy/CUSTOMER_DATA_READ")).putArray("allowed").add("accountNumber");
+        ((ObjectNode) ownerPolicy.at("/fieldPolicy/CUSTOMER_DATA_READ")).putArray("allowed").add("accountNumber");
+        args.putArray("fields").add("accountNumber");
+        assertThat(facts.requestedFields()).contains(List.of("employmentStatus", "incomeBand"));
+        assertThat(fields.evaluate(FIELD_SCOPE, facts)).isEqualTo(StageOutcome.pass(FIELD_SCOPE));
+        assertThatThrownBy(() -> facts.requestedFields().orElseThrow().clear()).isInstanceOf(UnsupportedOperationException.class);
+        assertThat(fields.evaluate(FIELD_SCOPE, assembler.fieldScopeFor(inputs, proposal(args))))
+                .isEqualTo(StageOutcome.deny(FIELD_SCOPE, FIELD_SCOPE_VIOLATION));
+        assertThat(facts.toString()).doesNotContain(CUSTOMER_CANARY, ERROR_CANARY, "customerIds");
+        assertInternalProjectionOnly();
+    }
+
+    private PolicyEvaluationDecision evaluateInputs(PolicyInputs inputs, ToolProposal request,
+            Supplier<List<ToolRegistryEntry>> registry) {
+        String tool = request.toolName();
+        String operation = declarations().stream().filter(value -> value.name().equals(tool)).findFirst()
+                .map(CatalogTool::operation).orElse("READ");
+        // Deterministic timing here isolates lazy factory order; evaluator deadline behavior has its own tests.
+        var evaluator = new EnforcePolicyEvaluator(authorization, business, objects, fields, cardinality, egress,
+                workflow, human, new PolicyToolTrustEvaluator(), () -> 0L);
+        return evaluator.evaluateStages(() -> StageOutcome.pass(PREFLIGHT), stage -> switch (stage) {
+            case TOOL, OPERATION -> authorization.evaluate(stage, assembler.authorizationFor(inputs, tool, operation));
+            case BUSINESS_CONTEXT -> business.evaluate(stage, assembler.businessContextFor(inputs, true,
+                    Optional.of(PURPOSE), Optional.of(PURPOSE), Optional.of(PURPOSE), Optional.of("server-namespace"),
+                    Optional.of(CASE), Optional.of(CUSTOMER_CANARY), Optional.of("DOCUMENT_REVIEW"), Optional.of(List.of(DOCUMENT))));
+            case OBJECT_SCOPE -> objects.evaluate(stage, assembler.objectScopeFor(inputs, tool, Optional.of(CASE), Optional.empty(),
+                    tool.equals(CUSTOMER_TOOL) ? Optional.of(List.of(request.arguments().path("customerIds").get(0).stringValue())) : Optional.empty(),
+                    Optional.of(CASE), Optional.of(CUSTOMER_CANARY), Optional.of(List.of(DOCUMENT)), Optional.empty()));
+            case FIELD_SCOPE -> fields.evaluate(stage, assembler.fieldScopeFor(inputs, request));
+            case CARDINALITY -> cardinality.evaluate(stage, assembler.cardinalityFor(inputs, request));
+            case EGRESS -> egress.evaluate(stage, assembler.egressFor(inputs, tool));
+            case WORKFLOW -> workflow.evaluate(stage, assembler.workflowFor(inputs, tool, "DOCUMENT_REVIEW"));
+            case HUMAN_BOUNDARY -> human.evaluate(stage, assembler.humanBoundaryFor(inputs, tool));
+            case TOOL_TRUST -> new PolicyToolTrustEvaluator().evaluate(stage, assembler.toolTrustFor(inputs, tool, FINGERPRINT, registry.get()));
+            case PREFLIGHT -> throw new AssertionError("Preflight must use its dedicated callback");
+        });
+    }
+
+    private List<ToolRegistryEntry> independentUnitRegistry(String customerSchema) {
+        // Independently supplied synthetic observations, never copied from expected catalog bindings or called runtime evidence.
+        return List.of(new ToolRegistryEntry("CASE_CONTEXT_READ", "1.0.0", TrustLevel.TRUSTED_INTERNAL, HASH, HASH),
+                new ToolRegistryEntry("DOCUMENT_READER", "1.0.0", TrustLevel.TRUSTED_INTERNAL, HASH, HASH),
+                new ToolRegistryEntry(CUSTOMER_TOOL, "1.0.0", TrustLevel.TRUSTED_INTERNAL, customerSchema, HASH),
+                new ToolRegistryEntry("LOAN_POLICY_SEARCH", "1.0.0", TrustLevel.TRUSTED_INTERNAL, HASH, HASH),
+                new ToolRegistryEntry("REVIEW_NOTE_WRITE", "1.0.0", TrustLevel.TRUSTED_INTERNAL, HASH, HASH));
+    }
+
+    private void addNoncustomerRule(ObjectNode policy, String rule) {
+        if (rule.equals("field")) ((ObjectNode) policy.path("fieldPolicy")).putObject("DOCUMENT_READER")
+                .put("denyUnknown", true).putArray("allowed").add("content");
+        else ((ObjectNode) policy.path("cardinality")).putObject("DOCUMENT_READER")
+                .put(rule.equals("returned-count-only") ? "maxReturnedRecords" : "maxRequestedRecords", 1);
+    }
+
+    private void assertInternalProjectionOnly() {
+        verifyNoInteractions(proposals);
+        verify(adapter, never()).validateArguments(any());
+    }
+
     private PolicyBusinessContextFacts businessFacts(ApprovedPolicySource supplied) {
         return assembler.businessContext(supplied, true, Optional.of(PURPOSE), Optional.of(PURPOSE), Optional.of(PURPOSE),
                 Optional.of("server-namespace"), Optional.of(CASE), Optional.of(CUSTOMER_CANARY),
@@ -1531,6 +1800,10 @@ class GatewayPolicyFactsAssemblerTest {
     }
 
     private ApprovedPolicySource approvedSourceFixture() throws Exception {
+        return approvedSourceFixture(policy -> {}, false);
+    }
+
+    private ApprovedPolicySource approvedSourceFixture(Consumer<ObjectNode> policyChange, boolean actualCatalog) throws Exception {
         UUID workspace = UUID.randomUUID();
         UUID release = UUID.randomUUID();
         UUID run = UUID.randomUUID();
@@ -1541,6 +1814,7 @@ class GatewayPolicyFactsAssemblerTest {
         try (var input = getClass().getResourceAsStream("/fixtures/loan-review-safety-contract.json")) {
             ownerPolicy = (ObjectNode) json.readTree(input);
         }
+        policyChange.accept(ownerPolicy);
         var schema = new SafetyContractSchemaValidator();
         var canonicalizer = new SafetyContractCanonicalizer(schema, new CanonicalJsonService(json), new DigestService());
         var validator = new SafetyContractSemanticValidator(schema);
@@ -1563,8 +1837,11 @@ class GatewayPolicyFactsAssemblerTest {
         var bindings = semanticCatalog.enabledReleaseTools().stream()
                 .map(tool -> new PolicyToolTrustFacts.ReleaseToolBinding(tool.toolName(), "1.0.0", true, HASH, HASH))
                 .toList();
-        when(catalogs.load(release, reviewer.actorId())).thenReturn(new SourceBoundCatalog(release, "1.1", ARTIFACT,
-                FINGERPRINT, HASH, semanticCatalog, bindings, declarations(), customerOutputMetadata()));
+        SourceBoundCatalog boundCatalog = actualCatalog
+                ? manifestCatalog(release, reviewer.actorId(), releaseManifest())
+                : new SourceBoundCatalog(release, "1.1", ARTIFACT, FINGERPRINT, HASH, semanticCatalog,
+                        bindings, declarations(), customerOutputMetadata());
+        when(catalogs.load(release, reviewer.actorId())).thenReturn(boundCatalog);
         var loader = new GatewayApprovedPolicySourceService(runs, contracts, cases, catalogs, validator, canonicalizer);
         // Guard fixture only: actual owner approval and physical PostgreSQL transactions are not simulated here.
         boolean active = TransactionSynchronizationManager.isActualTransactionActive();
@@ -1579,7 +1856,73 @@ class GatewayPolicyFactsAssemblerTest {
             TransactionSynchronizationManager.setActualTransactionActive(active);
             TransactionSynchronizationManager.setCurrentTransactionReadOnly(readOnly);
             TransactionSynchronizationManager.setCurrentTransactionIsolationLevel(isolation);
+            clearInvocations(runs, contracts, cases, catalogs);
         }
+    }
+
+    private BaselinePolicySource baselineSourceFixture(String allowedStage) throws Exception {
+        UUID workspace = UUID.randomUUID(), releaseId = UUID.randomUUID(), agentId = UUID.randomUUID();
+        UUID runId = UUID.randomUUID(), caseRunId = UUID.randomUUID();
+        var reviewer = new ReviewerContext(workspace, "baseline-facts-test", "AI_SECURITY_REVIEWER", ERROR_CANARY, true, true, false);
+        ObjectNode manifest = releaseManifest();
+        ((ObjectNode) manifest.path("businessWorkflow")).putArray("allowedStages").add(allowedStage);
+        var release = mock(AgentReleaseEntity.class);
+        when(release.getId()).thenReturn(releaseId);
+        when(release.getAgentId()).thenReturn(agentId);
+        when(release.getManifestSchemaVersion()).thenReturn("1.1");
+        when(release.getAgentArtifactFingerprint()).thenReturn(ARTIFACT);
+        when(release.getReleaseFingerprint()).thenReturn(FINGERPRINT);
+        when(release.getBusinessPurpose()).thenReturn(PURPOSE);
+        when(release.getManifestJson()).thenReturn(manifest);
+        when(release.getLifecycleState()).thenReturn(ReleaseLifecycleState.ANALYZED);
+        when(release.getAnalyzedAt()).thenReturn(Instant.parse("2026-09-08T00:00:00Z"));
+        var agent = mock(AgentEntity.class);
+        when(agent.getId()).thenReturn(agentId);
+        when(agent.getWorkspaceId()).thenReturn(workspace);
+        var releases = mock(ReleaseService.class);
+        var agents = mock(AgentService.class);
+        when(releases.getRequired(releaseId)).thenReturn(release);
+        when(agents.getRequired(agentId)).thenReturn(agent);
+        when(runs.find(runId)).thenReturn(new Projection(runId, releaseId, UUID.randomUUID(), null,
+                TestRunMode.BASELINE, TestRunStatus.RUNNING, ARTIFACT, FINGERPRINT, "fixture/1", HASH,
+                1, 0, 0, 0, null, null, json.createObjectNode(), null, null, null));
+        when(cases.findCase(caseRunId)).thenReturn(new CaseRun(caseRunId, runId, UUID.randomUUID(), 0,
+                TestCaseRunStatus.EXECUTING, null, null, HASH, null, null, null, json.createObjectNode()));
+        SourceBoundCatalog boundCatalog = manifestCatalog(releaseId, reviewer.actorId(), manifest);
+        when(catalogs.load(releaseId, reviewer.actorId())).thenReturn(boundCatalog);
+        var loader = new GatewayBaselinePolicySourceService(runs, cases, catalogs, releases, agents);
+        // Actual C loader over mocked owner projections; these flags provide no physical PostgreSQL or A approval evidence.
+        boolean active = TransactionSynchronizationManager.isActualTransactionActive();
+        boolean readOnly = TransactionSynchronizationManager.isCurrentTransactionReadOnly();
+        Integer isolation = TransactionSynchronizationManager.getCurrentTransactionIsolationLevel();
+        try {
+            TransactionSynchronizationManager.setActualTransactionActive(true);
+            TransactionSynchronizationManager.setCurrentTransactionReadOnly(false);
+            TransactionSynchronizationManager.setCurrentTransactionIsolationLevel(Connection.TRANSACTION_REPEATABLE_READ);
+            return loader.load(runId, caseRunId, reviewer);
+        } finally {
+            TransactionSynchronizationManager.setActualTransactionActive(active);
+            TransactionSynchronizationManager.setCurrentTransactionReadOnly(readOnly);
+            TransactionSynchronizationManager.setCurrentTransactionIsolationLevel(isolation);
+            clearInvocations(runs, contracts, cases, catalogs);
+        }
+    }
+
+    private ObjectNode releaseManifest() throws Exception {
+        try (var input = getClass().getResourceAsStream("/fixtures/valid-release-manifest-v1.1.json")) {
+            return (ObjectNode) json.readTree(input);
+        }
+    }
+
+    private SourceBoundCatalog manifestCatalog(UUID releaseId, String actor, ObjectNode manifest) {
+        var canonical = new CanonicalJsonService(json);
+        var digests = new DigestService();
+        String serverHash = new FingerprintService(canonical, digests, json).fingerprint(manifest, null)
+                .componentDigests().get("serverToolCatalogHash");
+        var owner = mock(ReleaseService.class);
+        when(owner.toolCatalog(releaseId, actor)).thenReturn(new ToolCatalogResponse(releaseId, "1.1", ARTIFACT,
+                FINGERPRINT, serverHash, manifest.path("tools"), manifest.path("serverToolCatalog")));
+        return new ReleaseToolCatalogContractAdapter(owner, canonical, digests, json).load(releaseId, actor);
     }
 
     private ApprovedPolicySource malformedSource(JsonNode policy, SourceBoundCatalog catalog) {
