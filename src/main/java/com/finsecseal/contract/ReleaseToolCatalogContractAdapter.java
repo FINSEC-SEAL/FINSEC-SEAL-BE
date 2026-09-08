@@ -12,12 +12,14 @@ import com.finsecseal.release.DigestService;
 import com.finsecseal.release.ReleaseDto.ToolCatalogResponse;
 import com.finsecseal.release.ReleaseService;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import org.springframework.stereotype.Component;
@@ -129,8 +131,26 @@ public final class ReleaseToolCatalogContractAdapter {
                 new ContractValidationCatalog(enabledTools, highImpactTools),
                 extractReleaseToolBindings(toolsSnapshot),
                 extractDeclaredTools(toolsSnapshot, serverCatalogSnapshot.path("tools")),
-                extractCustomerOutputFields(toolsSnapshot)
+                extractCustomerOutputFields(toolsSnapshot),
+                extractInputSchemas(toolsSnapshot, serverCatalogSnapshot.path("tools"))
         );
+    }
+
+    private Map<String, JsonNode> extractInputSchemas(JsonNode enabled, JsonNode highImpact) {
+        Map<String, JsonNode> schemas = new TreeMap<>();
+        appendInputSchemas(schemas, enabled, FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+        appendInputSchemas(schemas, highImpact, FailureCode.INVALID_HIGH_IMPACT_CATALOG);
+        return schemas;
+    }
+
+    private void appendInputSchemas(Map<String, JsonNode> schemas, JsonNode tools, FailureCode code) {
+        for (JsonNode tool : tools) {
+            JsonNode schema = tool.get("inputSchema");
+            if (schema == null || !schema.isObject()
+                    || schemas.putIfAbsent(tool.path("name").stringValue(), schema) != null) {
+                throw failure(code);
+            }
+        }
     }
 
     private List<CatalogOutputField> extractCustomerOutputFields(JsonNode tools) {
@@ -419,7 +439,8 @@ public final class ReleaseToolCatalogContractAdapter {
             ContractValidationCatalog semanticCatalog,
             List<ReleaseToolBinding> releaseToolBindings,
             List<CatalogTool> declaredTools,
-            List<CatalogOutputField> customerOutputFields
+            List<CatalogOutputField> customerOutputFields,
+            Map<String, JsonNode> inputSchemas
     ) {
 
         /** Compatibility for semantic-only callers; empty bindings cannot supply Gateway trust. */
@@ -427,7 +448,7 @@ public final class ReleaseToolCatalogContractAdapter {
                 String agentArtifactFingerprint, String releaseFingerprint,
                 String serverToolCatalogHash, ContractValidationCatalog semanticCatalog) {
             this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
-                    serverToolCatalogHash, semanticCatalog, List.of(), List.of(), List.of());
+                    serverToolCatalogHash, semanticCatalog, List.of(), List.of(), List.of(), Map.of());
         }
 
         /** Compatibility for trust consumers; absent declarations cannot supply other stages. */
@@ -436,7 +457,7 @@ public final class ReleaseToolCatalogContractAdapter {
                 String serverToolCatalogHash, ContractValidationCatalog semanticCatalog,
                 List<ReleaseToolBinding> releaseToolBindings) {
             this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
-                    serverToolCatalogHash, semanticCatalog, releaseToolBindings, List.of(), List.of());
+                    serverToolCatalogHash, semanticCatalog, releaseToolBindings, List.of(), List.of(), Map.of());
         }
 
         /** Compatibility for pre-call consumers; absent metadata cannot supply response expectations. */
@@ -445,7 +466,18 @@ public final class ReleaseToolCatalogContractAdapter {
                 String serverToolCatalogHash, ContractValidationCatalog semanticCatalog,
                 List<ReleaseToolBinding> releaseToolBindings, List<CatalogTool> declaredTools) {
             this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
-                    serverToolCatalogHash, semanticCatalog, releaseToolBindings, declaredTools, List.of());
+                    serverToolCatalogHash, semanticCatalog, releaseToolBindings, declaredTools, List.of(), Map.of());
+        }
+
+        /** Compatibility for response consumers; absent input schemas cannot establish preflight. */
+        public SourceBoundCatalog(UUID releaseId, String manifestSchemaVersion,
+                String agentArtifactFingerprint, String releaseFingerprint,
+                String serverToolCatalogHash, ContractValidationCatalog semanticCatalog,
+                List<ReleaseToolBinding> releaseToolBindings, List<CatalogTool> declaredTools,
+                List<CatalogOutputField> customerOutputFields) {
+            this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
+                    serverToolCatalogHash, semanticCatalog, releaseToolBindings, declaredTools,
+                    customerOutputFields, Map.of());
         }
 
         public SourceBoundCatalog {
@@ -469,6 +501,22 @@ public final class ReleaseToolCatalogContractAdapter {
             releaseToolBindings = List.copyOf(releaseToolBindings);
             declaredTools = List.copyOf(declaredTools);
             customerOutputFields = List.copyOf(customerOutputFields);
+            inputSchemas = copyInputSchemas(inputSchemas);
+        }
+
+        /** The map and its nested schema trees never expose the stored snapshot for mutation. */
+        @Override
+        public Map<String, JsonNode> inputSchemas() {
+            return copyInputSchemas(inputSchemas);
+        }
+
+        private static Map<String, JsonNode> copyInputSchemas(Map<String, JsonNode> schemas) {
+            Objects.requireNonNull(schemas, "inputSchemas must not be null");
+            Map<String, JsonNode> copy = new TreeMap<>();
+            schemas.forEach((name, schema) -> copy.put(
+                    Objects.requireNonNull(name, "input schema name must not be null"),
+                    Objects.requireNonNull(schema, "input schema must not be null").deepCopy()));
+            return Collections.unmodifiableMap(copy);
         }
     }
 
