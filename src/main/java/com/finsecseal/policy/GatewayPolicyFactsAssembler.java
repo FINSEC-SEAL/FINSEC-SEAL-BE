@@ -1,12 +1,16 @@
 package com.finsecseal.policy;
 
+import com.finsecseal.contract.LoanReviewFinancialTemplate;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ContractValidationCatalog;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.CatalogOutputField;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.ApprovedPolicySource;
 import com.finsecseal.policy.PolicyCardinalityFacts.CardinalityPolicy;
 import com.finsecseal.policy.PolicyFieldScopeFacts.FieldPolicy;
 import com.finsecseal.policy.PolicyFieldScopeFacts.ToolOutputSchema;
 import com.finsecseal.policy.PolicyHumanBoundaryFacts.BoundaryMode;
 import com.finsecseal.policy.PolicyHumanBoundaryFacts.HighImpactAction;
+import com.finsecseal.policy.PolicyObjectScopeFacts.DocumentOwnership;
+import com.finsecseal.policy.PolicyObjectScopeFacts.ObjectScopePolicy;
 import com.finsecseal.runtime.ToolProposal;
 import com.finsecseal.runtime.ToolProposalValidator;
 import java.util.ArrayList;
@@ -15,6 +19,8 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.TreeMap;
+import java.util.UUID;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.JsonNode;
 
@@ -37,10 +43,7 @@ public final class GatewayPolicyFactsAssembler {
         try {
             JsonNode policy = policy(source);
             ContractValidationCatalog catalog = catalog(source);
-            JsonNode fieldPolicy = object(policy.at("/fieldPolicy/" + CUSTOMER_DATA_READ));
-            JsonNode denyUnknown = fieldPolicy.path("denyUnknown");
-            if (!denyUnknown.isBoolean() || !denyUnknown.booleanValue()) throw invalidSource();
-            List<String> allowed = policyValues(fieldPolicy.path("allowed"));
+            FieldPolicy fieldPolicy = customerFieldPolicy(policy);
             JsonNode limit = object(policy.at("/cardinality/" + CUSTOMER_DATA_READ)).path("maxRequestedRecords");
             if (!limit.isIntegralNumber() || !limit.canConvertToInt() || limit.intValue() <= 0) {
                 throw invalidSource();
@@ -50,7 +53,7 @@ public final class GatewayPolicyFactsAssembler {
             var tools = catalog.enabledReleaseTools().stream().map(tool -> tool.toolName()).toList();
             return new CustomerDataReadFacts(
                     new PolicyFieldScopeFacts(CUSTOMER_DATA_READ, Optional.of(fields), schemas,
-                            List.of(new FieldPolicy(CUSTOMER_DATA_READ, allowed, true))),
+                            List.of(fieldPolicy)),
                     new PolicyCardinalityFacts(CUSTOMER_DATA_READ, customerIds.size(), tools,
                             List.of(new CardinalityPolicy(CUSTOMER_DATA_READ, limit.intValue()))));
         } catch (FactAssemblyException exception) {
@@ -125,6 +128,187 @@ public final class GatewayPolicyFactsAssembler {
         } catch (RuntimeException exception) {
             throw invalidSource();
         }
+    }
+
+    /** Server stage is independent input; only CASE_CONTEXT_READ is a workflow bootstrap. */
+    public PolicyWorkflowFacts workflow(ApprovedPolicySource source, String requestedTool,
+            String serverWorkflowStage) {
+        requireToolName(requestedTool);
+        if (serverWorkflowStage == null || serverWorkflowStage.isBlank()) {
+            throw failure(FailureCode.INVALID_REQUEST);
+        }
+        try {
+            var stages = policyValues(object(policy(source).path("workflow")).path("allowedStages"));
+            var tools = catalogToolNames(source).stream()
+                    .map(name -> new PolicyWorkflowFacts.CatalogTool(name, "CASE_CONTEXT_READ".equals(name)))
+                    .toList();
+            return new PolicyWorkflowFacts(requestedTool, serverWorkflowStage, stages, tools);
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+    }
+
+    /** Only contractPurpose comes from policy; caller context is not repaired or authenticated here. */
+    public PolicyBusinessContextFacts businessContext(ApprovedPolicySource source, boolean serverResolved,
+            Optional<String> releasePurpose, Optional<String> runPurpose, Optional<String> casePurpose,
+            Optional<String> namespaceId, Optional<String> caseId, Optional<String> currentApplicantId,
+            Optional<String> workflowStage, Optional<List<String>> allowedDocumentIds) {
+        String contractPurpose;
+        try {
+            JsonNode purpose = policy(source).path("purpose");
+            if (!purpose.isString() || purpose.stringValue().isBlank()) throw invalidSource();
+            contractPurpose = purpose.stringValue();
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+        try {
+            return new PolicyBusinessContextFacts(serverResolved, Optional.of(contractPurpose),
+                    releasePurpose, runPurpose, casePurpose, namespaceId, caseId, currentApplicantId,
+                    workflowStage, allowedDocumentIds);
+        } catch (RuntimeException exception) {
+            throw failure(FailureCode.INVALID_REQUEST);
+        }
+    }
+
+    /** Keeps malformed request identities distinct from missing/ambiguous server context. */
+    public PolicyObjectScopeFacts objectScope(ApprovedPolicySource source, String requestedTool,
+            Optional<String> requestedCaseId, Optional<List<String>> requestedDocumentIds,
+            Optional<List<String>> requestedCustomerIds, Optional<String> currentCaseId,
+            Optional<String> currentApplicantId, Optional<List<String>> allowedDocumentIds,
+            Optional<List<DocumentOwnership>> documentOwnerships) {
+        requireToolName(requestedTool);
+        List<String> tools;
+        List<ObjectScopePolicy> scopes;
+        try {
+            tools = catalogToolNames(source);
+            scopes = objectScopes(policy(source), catalog(source));
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+        try {
+            return new PolicyObjectScopeFacts(requestedTool, tools, scopes, requestedCaseId,
+                    requestedDocumentIds, requestedCustomerIds, currentCaseId, currentApplicantId,
+                    allowedDocumentIds, documentOwnerships);
+        } catch (InvalidPolicyScopeRequestException | PolicyScopeContextIntegrityException exception) {
+            throw exception;
+        } catch (RuntimeException exception) {
+            throw failure(FailureCode.INVALID_REQUEST);
+        }
+    }
+
+    /** Builds response expectations; invocation authenticity and actual execution remain caller obligations. */
+    public EnforcePolicyPostCallFacts customerDataReadPostCall(ApprovedPolicySource source,
+            ToolProposal executedProposal, String currentApplicantId, JsonNode adapterResponse,
+            JsonNode adapterClassificationMap, JsonNode adapterStateDeltaProvenance) {
+        ToolProposal request = customerRequest(executedProposal);
+        List<String> fields = requestValues(request.arguments().path("fields"));
+        List<String> customers = requestValues(request.arguments().path("customerIds"));
+        if (currentApplicantId == null || currentApplicantId.isBlank()) {
+            throw failure(FailureCode.INVALID_REQUEST);
+        }
+        List<CatalogOutputField> expectedFields;
+        List<String> projection;
+        int returnedLimit;
+        String namespace;
+        UUID caseRunId;
+        var catalogNames = new HashSet<String>();
+        try {
+            JsonNode policy = policy(source);
+            if (!LoanReviewFinancialTemplate.PURPOSE.equals(policy.path("purpose").stringValue())
+                    || !LoanReviewFinancialTemplate.KEY.equals(
+                            policy.at("/metadata/templateVersion").stringValue())) throw invalidSource();
+            projection = customerFieldPolicy(policy).allowedFields();
+            var semanticFields = catalog(source).enabledReleaseTools().stream()
+                    .filter(tool -> CUSTOMER_DATA_READ.equals(tool.toolName())).findFirst()
+                    .orElseThrow(GatewayPolicyFactsAssembler::invalidSource).outputFields();
+            expectedFields = List.copyOf(source.catalog().customerOutputFields());
+            for (var field : expectedFields) {
+                if (!catalogNames.add(field.fieldName())) throw invalidSource();
+            }
+            if (catalogNames.isEmpty() || !catalogNames.equals(new HashSet<>(semanticFields))
+                    || !catalogNames.containsAll(projection)) throw invalidSource();
+            JsonNode limit = object(policy.at("/cardinality/" + CUSTOMER_DATA_READ)).path("maxReturnedRecords");
+            if (!limit.isIntegralNumber() || !limit.canConvertToInt() || limit.intValue() <= 0) {
+                throw invalidSource();
+            }
+            returnedLimit = limit.intValue();
+            if (source.runId() == null || source.testCaseRunId() == null) throw invalidSource();
+            // Current B SandboxExecutionContext/FixtureService contract: namespace UUID == Run UUID.
+            // This is an expected identity, not proof of namespace state or execution provenance.
+            namespace = source.runId().toString();
+            caseRunId = source.testCaseRunId();
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+        if (!catalogNames.containsAll(fields)) throw failure(FailureCode.INVALID_REQUEST);
+        try {
+            // Raw malformed/null adapter values are snapshotted by Facts for the existing guard.
+            return new EnforcePolicyPostCallFacts(CUSTOMER_DATA_READ, currentApplicantId, customers, fields,
+                    projection, expectedFields, returnedLimit, namespace, caseRunId,
+                    adapterResponse, adapterClassificationMap, adapterStateDeltaProvenance);
+        } catch (RuntimeException exception) {
+            throw failure(FailureCode.INVALID_REQUEST);
+        }
+    }
+
+    private static FieldPolicy customerFieldPolicy(JsonNode policy) {
+        JsonNode fieldPolicy = object(policy.at("/fieldPolicy/" + CUSTOMER_DATA_READ));
+        JsonNode denyUnknown = fieldPolicy.path("denyUnknown");
+        if (!denyUnknown.isBoolean() || !denyUnknown.booleanValue()) throw invalidSource();
+        return new FieldPolicy(CUSTOMER_DATA_READ, policyValues(fieldPolicy.path("allowed")), true);
+    }
+
+    private static List<ObjectScopePolicy> objectScopes(JsonNode policy, ContractValidationCatalog catalog) {
+        JsonNode resources = object(policy.path("resourcePolicies"));
+        var scopes = new TreeMap<String, ObjectScopePolicy>();
+        for (var entry : resources.properties()) {
+            String tool = entry.getKey();
+            if (!catalog.hasEnabledTool(tool)) throw invalidSource();
+            JsonNode resource = object(entry.getValue());
+            boolean caseOnly = false;
+            boolean documentsOnly = false;
+            for (var rule : resource.properties()) {
+                if (!rule.getValue().isString()) throw invalidSource();
+                switch (rule.getKey()) {
+                    case "caseScope" -> {
+                        if (!"CURRENT_CASE_ONLY".equals(rule.getValue().stringValue())) throw invalidSource();
+                        caseOnly = true;
+                    }
+                    case "documentScope" -> {
+                        if (!"ALLOWED_DOCUMENTS_ONLY".equals(rule.getValue().stringValue())) throw invalidSource();
+                        documentsOnly = true;
+                    }
+                    default -> throw invalidSource();
+                }
+            }
+            // Existing policy type rejects empty rules rather than treating them as unrestricted.
+            scopes.put(tool, new ObjectScopePolicy(tool, caseOnly, documentsOnly, false));
+        }
+        var document = scopes.get("DOCUMENT_READER");
+        var note = scopes.get("REVIEW_NOTE_WRITE");
+        if (document == null || !document.currentCaseOnly() || !document.allowedDocumentsOnly()
+                || note == null || !note.currentCaseOnly()) throw invalidSource();
+        JsonNode customer = object(policy.path("customerScope"));
+        if (!"CURRENT_APPLICANT_ONLY".equals(customer.path("type").stringValue())
+                || !catalog.hasEnabledTool(CUSTOMER_DATA_READ)) throw invalidSource();
+        var existing = scopes.get(CUSTOMER_DATA_READ);
+        scopes.put(CUSTOMER_DATA_READ, new ObjectScopePolicy(CUSTOMER_DATA_READ,
+                existing != null && existing.currentCaseOnly(),
+                existing != null && existing.allowedDocumentsOnly(), true));
+        return List.copyOf(scopes.values());
+    }
+
+    private static List<String> catalogToolNames(ApprovedPolicySource source) {
+        ContractValidationCatalog catalog = catalog(source);
+        var names = new LinkedHashSet<String>();
+        for (var tool : catalog.enabledReleaseTools()) {
+            if (!names.add(tool.toolName())) throw invalidSource();
+        }
+        for (String tool : catalog.highImpactToolNames()) {
+            if (!names.add(tool)) throw invalidSource();
+        }
+        if (names.isEmpty()) throw invalidSource();
+        return List.copyOf(names);
     }
 
     private static PolicyEgressFacts egress(JsonNode policy, String requestedTool,
