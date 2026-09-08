@@ -22,6 +22,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import com.finsecseal.common.domain.Sensitivity;
 import com.finsecseal.contract.ReleaseToolCatalogContractAdapter.CatalogAdapterException;
 import com.finsecseal.contract.ReleaseToolCatalogContractAdapter.FailureCode;
 import com.finsecseal.contract.ReleaseToolCatalogContractAdapter.SourceBoundCatalog;
@@ -29,6 +30,8 @@ import com.finsecseal.contract.SafetyContractSemanticValidator.EnabledTool;
 import com.finsecseal.contract.SafetyContractSemanticValidator.Issue;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ValidationResult;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ValidationStatus;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.CatalogOutputField;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.OutputValueType;
 import com.finsecseal.policy.PolicyToolAuthorizationFacts.CatalogTool;
 import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
 import com.finsecseal.release.CanonicalJsonService;
@@ -113,6 +116,9 @@ class ReleaseToolCatalogContractAdapterTest {
                 );
         assertThat(enabledTool(result, "CUSTOMER_DATA_READ").outputFields())
                 .containsExactly("accountNumber", "employmentStatus", "incomeBand");
+        assertThat(result.customerOutputFields()).containsExactlyElementsOf(expectedCustomerOutputFields());
+        assertThat(result.customerOutputFields()).extracting(CatalogOutputField::fieldName)
+                .doesNotContain("customerId");
         assertThat(result.semanticCatalog().highImpactToolNames())
                 .containsExactly("LOAN_DECISION_UPDATE");
         assertThat(result.releaseToolBindings())
@@ -245,6 +251,8 @@ class ReleaseToolCatalogContractAdapterTest {
         ));
         assertThat(enabledTool(source, "CUSTOMER_DATA_READ").outputFields())
                 .contains("accountNumber");
+        assertThat(source.customerOutputFields())
+                .contains(new CatalogOutputField("accountNumber", Sensitivity.FINANCIAL, OutputValueType.STRING));
         ObjectNode contract = fixture("loan-review-safety-contract.json");
         ((ArrayNode) contract.at("/fieldPolicy/CUSTOMER_DATA_READ/allowed"))
                 .add("accountNumber");
@@ -288,6 +296,9 @@ class ReleaseToolCatalogContractAdapterTest {
         assertThat(enabledTool(result, "DOCUMENT_READER").outputFields())
                 .contains("documentTopLevelField")
                 .doesNotContain("nestedDecoy");
+        assertThat(result.customerOutputFields()).containsExactlyElementsOf(expectedCustomerOutputFields());
+        assertThat(result.customerOutputFields()).extracting(CatalogOutputField::fieldName)
+                .doesNotContain("customerId", "customerTopLevelDecoy", "customerInputDecoy", "documentTopLevelField");
     }
 
     @Test
@@ -324,6 +335,9 @@ class ReleaseToolCatalogContractAdapterTest {
         SourceBoundCatalog beforeMutation = result;
         List<ReleaseToolBinding> bindingsBeforeMutation = List.copyOf(result.releaseToolBindings());
         List<CatalogTool> declarationsBeforeMutation = List.copyOf(result.declaredTools());
+        List<CatalogOutputField> outputFieldsBeforeMutation = List.copyOf(result.customerOutputFields());
+        ((ObjectNode) customerFields(manifest).path("incomeBand")).put("type", "integer");
+        customerFields(manifest).removeAll();
         tool(tools, "CUSTOMER_DATA_READ").put("description", RAW_SENTINEL);
         tool(tools, "CUSTOMER_DATA_READ").put("version", "2.0.0");
         tool(tools, "CUSTOMER_DATA_READ").put("operation", "POST");
@@ -340,6 +354,10 @@ class ReleaseToolCatalogContractAdapterTest {
         assertThat(result.releaseToolBindings()).hasSize(5);
         assertThat(result.declaredTools()).containsExactlyElementsOf(declarationsBeforeMutation);
         assertThat(result.declaredTools()).hasSize(6);
+        assertThat(result.customerOutputFields()).containsExactlyElementsOf(outputFieldsBeforeMutation)
+                .containsExactlyElementsOf(expectedCustomerOutputFields());
+        assertThatThrownBy(() -> result.customerOutputFields().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> result.declaredTools().clear())
                 .isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> result.releaseToolBindings().clear())
@@ -395,6 +413,7 @@ class ReleaseToolCatalogContractAdapterTest {
         ));
 
         assertThat(second).isEqualTo(first);
+        assertThat(second.customerOutputFields()).containsExactlyElementsOf(expectedCustomerOutputFields());
         assertThat(second.semanticCatalog().highImpactToolNames())
                 .containsExactly("ACCOUNT_OVERRIDE", "LOAN_DECISION_UPDATE");
         assertThat(second.declaredTools()).extracting(CatalogTool::name)
@@ -616,6 +635,9 @@ class ReleaseToolCatalogContractAdapterTest {
 
         assertThat(copy.releaseToolBindings()).containsExactlyElementsOf(actual.releaseToolBindings());
         assertThat(copy.declaredTools()).isEmpty();
+        assertThat(copy.customerOutputFields()).isEmpty();
+        assertThatThrownBy(() -> copy.customerOutputFields().add(actual.customerOutputFields().getFirst()))
+                .isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> copy.declaredTools().add(actual.declaredTools().getFirst()))
                 .isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> copy.releaseToolBindings().add(actual.releaseToolBindings().getFirst()))
@@ -633,10 +655,13 @@ class ReleaseToolCatalogContractAdapterTest {
 
         assertThat(semanticOnly.releaseToolBindings()).isEmpty();
         assertThat(semanticOnly.declaredTools()).isEmpty();
+        assertThat(semanticOnly.customerOutputFields()).isEmpty();
         assertThat(semanticOnly.semanticCatalog()).isEqualTo(actual.semanticCatalog());
         assertThat(semanticValidator.validate(fixture("loan-review-safety-contract.json"),
                 semanticOnly.semanticCatalog()).status()).isEqualTo(ValidationStatus.VALID);
         assertThatThrownBy(() -> semanticOnly.releaseToolBindings().add(actual.releaseToolBindings().getFirst()))
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> semanticOnly.customerOutputFields().add(actual.customerOutputFields().getFirst()))
                 .isInstanceOf(UnsupportedOperationException.class);
     }
 
@@ -653,11 +678,106 @@ class ReleaseToolCatalogContractAdapterTest {
         declarations.clear();
         bindings.clear();
 
-        assertThat(copy).isEqualTo(actual);
-        assertThat(copy.declaredTools()).hasSize(6);
-        assertThat(copy.releaseToolBindings()).hasSize(5);
+        assertThat(copy.releaseId()).isEqualTo(actual.releaseId());
+        assertThat(copy.manifestSchemaVersion()).isEqualTo(actual.manifestSchemaVersion());
+        assertThat(copy.agentArtifactFingerprint()).isEqualTo(actual.agentArtifactFingerprint());
+        assertThat(copy.releaseFingerprint()).isEqualTo(actual.releaseFingerprint());
+        assertThat(copy.serverToolCatalogHash()).isEqualTo(actual.serverToolCatalogHash());
+        assertThat(copy.semanticCatalog()).isEqualTo(actual.semanticCatalog());
+        assertThat(copy.declaredTools()).containsExactlyElementsOf(actual.declaredTools()).hasSize(6);
+        assertThat(copy.releaseToolBindings()).containsExactlyElementsOf(actual.releaseToolBindings()).hasSize(5);
+        assertThat(copy.customerOutputFields()).isEmpty();
+        assertThat(semanticValidator.validate(fixture("loan-review-safety-contract.json"),
+                copy.semanticCatalog()).status()).isEqualTo(ValidationStatus.VALID);
         assertThatThrownBy(() -> copy.declaredTools().add(new CatalogTool("EXTRA_TOOL", "READ", false)))
                 .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> copy.customerOutputFields().add(actual.customerOutputFields().getFirst()))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void ninthArgumentConstructorSnapshotsCustomerMetadataAndPreservesPriorComponents() throws IOException {
+        SourceBoundCatalog actual = load(authoritativeSource(fixture("valid-release-manifest-v1.1.json")));
+        List<CatalogOutputField> metadata = new ArrayList<>(actual.customerOutputFields());
+        SourceBoundCatalog copy = new SourceBoundCatalog(
+                actual.releaseId(), actual.manifestSchemaVersion(), actual.agentArtifactFingerprint(),
+                actual.releaseFingerprint(), actual.serverToolCatalogHash(), actual.semanticCatalog(),
+                actual.releaseToolBindings(), actual.declaredTools(), metadata
+        );
+        metadata.set(0, new CatalogOutputField("accountNumber", Sensitivity.NORMAL, OutputValueType.INTEGER));
+        metadata.clear();
+
+        assertThat(copy).isEqualTo(actual);
+        assertThat(copy.customerOutputFields()).containsExactlyElementsOf(expectedCustomerOutputFields());
+        assertThatThrownBy(() -> copy.customerOutputFields().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"string", "integer"})
+    void syntheticCustomerSchemaTypeComesFromTheSelectedSnapshot(String schemaType) throws IOException {
+        // INTEGER exercises the supported conversion only; A's actual v1.1 customer fields are STRING.
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode customer = tool(manifest.path("tools"), "CUSTOMER_DATA_READ");
+        ((ObjectNode) customerFields(manifest).path("incomeBand")).put("type", schemaType);
+        ObjectNode before = manifest.deepCopy();
+
+        SourceBoundCatalog result = load(authoritativeSource(manifest));
+
+        assertThat(result.customerOutputFields()).containsExactly(
+                new CatalogOutputField("accountNumber", Sensitivity.FINANCIAL, OutputValueType.STRING),
+                new CatalogOutputField("employmentStatus", Sensitivity.NORMAL, OutputValueType.STRING),
+                new CatalogOutputField("incomeBand", Sensitivity.FINANCIAL,
+                        "integer".equals(schemaType) ? OutputValueType.INTEGER : OutputValueType.STRING)
+        );
+        assertThat(binding(result, "CUSTOMER_DATA_READ").schemaDigest()).isEqualTo(roleASchemaHash(customer));
+        assertThat(manifest).isEqualTo(before);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"field-missing", "field-null", "field-array", "field-string", "field-boolean",
+            "field-number", "type-missing", "type-null", "type-array", "type-boolean", "type-number",
+            "type-object", "type-empty", "type-blank", "type-padded", "type-uppercase", "type-number-name",
+            "type-object-name", "type-unknown"})
+    void missingOrMalformedCustomerFieldMetadataNeverGetsATypeDefault(String problem) throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode properties = customerFields(manifest);
+        ObjectNode selected = (ObjectNode) properties.path("incomeBand");
+        switch (problem) {
+            case "field-missing" -> properties.remove("incomeBand");
+            case "field-null" -> properties.putNull("incomeBand");
+            case "field-array" -> properties.putArray("incomeBand");
+            case "field-string" -> properties.put("incomeBand", RAW_SENTINEL);
+            case "field-boolean" -> properties.put("incomeBand", true);
+            case "field-number" -> properties.put("incomeBand", 42);
+            case "type-missing" -> selected.remove("type");
+            case "type-null" -> selected.putNull("type");
+            case "type-array" -> selected.putArray("type").add("string");
+            case "type-boolean" -> selected.put("type", true);
+            case "type-number" -> selected.put("type", 42);
+            case "type-object" -> selected.putObject("type");
+            case "type-empty" -> selected.put("type", "");
+            case "type-blank" -> selected.put("type", " ");
+            case "type-padded" -> selected.put("type", "string ");
+            case "type-uppercase" -> selected.put("type", "STRING");
+            case "type-number-name" -> selected.put("type", "number");
+            case "type-object-name" -> selected.put("type", "object");
+            case "type-unknown" -> selected.put("type", RAW_SENTINEL);
+            default -> throw new IllegalArgumentException(problem);
+        }
+        ObjectNode before = manifest.deepCopy();
+
+        assertSafeFailure(failureFor(authoritativeSource(manifest)), INVALID_ENABLED_TOOL_CATALOG);
+        assertThat(manifest).isEqualTo(before);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"customerId", "creditScoreBand", "IncomeBand", RAW_SENTINEL})
+    void unknownCustomerFieldsNeverReceiveAnInferredClassification(String field) throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        customerFields(manifest).putObject(field).put("type", "string");
+
+        assertSafeFailure(failureFor(authoritativeSource(manifest)), INVALID_ENABLED_TOOL_CATALOG);
     }
 
     @ParameterizedTest
@@ -1139,6 +1259,19 @@ class ReleaseToolCatalogContractAdapterTest {
                 canonicalJsonService,
                 digestService,
                 objectMapper
+        );
+    }
+
+    private ObjectNode customerFields(ObjectNode manifest) {
+        return (ObjectNode) tool(manifest.path("tools"), "CUSTOMER_DATA_READ")
+                .at("/outputSchema/properties/rows/items/properties/fields/properties");
+    }
+
+    private static List<CatalogOutputField> expectedCustomerOutputFields() {
+        return List.of(
+                new CatalogOutputField("accountNumber", Sensitivity.FINANCIAL, OutputValueType.STRING),
+                new CatalogOutputField("employmentStatus", Sensitivity.NORMAL, OutputValueType.STRING),
+                new CatalogOutputField("incomeBand", Sensitivity.FINANCIAL, OutputValueType.STRING)
         );
     }
 

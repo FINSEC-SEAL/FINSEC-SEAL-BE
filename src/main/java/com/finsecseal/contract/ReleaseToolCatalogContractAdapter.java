@@ -1,7 +1,10 @@
 package com.finsecseal.contract;
 
+import com.finsecseal.common.domain.Sensitivity;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ContractValidationCatalog;
 import com.finsecseal.contract.SafetyContractSemanticValidator.EnabledTool;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.CatalogOutputField;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.OutputValueType;
 import com.finsecseal.policy.PolicyToolAuthorizationFacts.CatalogTool;
 import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
 import com.finsecseal.release.CanonicalJsonService;
@@ -12,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
@@ -37,6 +41,12 @@ public final class ReleaseToolCatalogContractAdapter {
             "loan-review-server/1.0";
 
     private static final String CUSTOMER_DATA_READ = "CUSTOMER_DATA_READ";
+    // loan-review/1: docs/predev/05_FINANCIAL_DOMAIN_MODEL.md, Customer classification rules.
+    // These are expected classifications, never classifications inferred from adapter output.
+    private static final Map<String, Sensitivity> CUSTOMER_CLASSIFICATIONS = Map.of(
+            "accountNumber", Sensitivity.FINANCIAL,
+            "employmentStatus", Sensitivity.NORMAL,
+            "incomeBand", Sensitivity.FINANCIAL);
     private static final String CUSTOMER_OUTPUT_FIELDS_POINTER =
             "/outputSchema/properties/rows/items/properties/fields/properties";
     private static final String DEFAULT_OUTPUT_FIELDS_POINTER =
@@ -118,8 +128,38 @@ public final class ReleaseToolCatalogContractAdapter {
                 source.serverToolCatalogHash(),
                 new ContractValidationCatalog(enabledTools, highImpactTools),
                 extractReleaseToolBindings(toolsSnapshot),
-                extractDeclaredTools(toolsSnapshot, serverCatalogSnapshot.path("tools"))
+                extractDeclaredTools(toolsSnapshot, serverCatalogSnapshot.path("tools")),
+                extractCustomerOutputFields(toolsSnapshot)
         );
+    }
+
+    private List<CatalogOutputField> extractCustomerOutputFields(JsonNode tools) {
+        for (JsonNode tool : tools) {
+            if (!CUSTOMER_DATA_READ.equals(tool.path("name").stringValue())) continue;
+            JsonNode properties = tool.at(CUSTOMER_OUTPUT_FIELDS_POINTER);
+            var fields = new ArrayList<CatalogOutputField>();
+            var names = new HashSet<String>();
+            for (var entry : properties.properties()) {
+                Sensitivity classification = CUSTOMER_CLASSIFICATIONS.get(entry.getKey());
+                JsonNode schema = entry.getValue();
+                if (classification == null || !schema.isObject() || !schema.path("type").isString()) {
+                    throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+                }
+                OutputValueType type = switch (schema.path("type").stringValue()) {
+                    case "string" -> OutputValueType.STRING;
+                    case "integer" -> OutputValueType.INTEGER;
+                    default -> throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+                };
+                if (!names.add(entry.getKey())) throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+                fields.add(new CatalogOutputField(entry.getKey(), classification, type));
+            }
+            if (!names.equals(CUSTOMER_CLASSIFICATIONS.keySet())) {
+                throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+            }
+            fields.sort(Comparator.comparing(CatalogOutputField::fieldName));
+            return List.copyOf(fields);
+        }
+        throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
     }
 
     private void validateSourceMetadata(
@@ -378,7 +418,8 @@ public final class ReleaseToolCatalogContractAdapter {
             String serverToolCatalogHash,
             ContractValidationCatalog semanticCatalog,
             List<ReleaseToolBinding> releaseToolBindings,
-            List<CatalogTool> declaredTools
+            List<CatalogTool> declaredTools,
+            List<CatalogOutputField> customerOutputFields
     ) {
 
         /** Compatibility for semantic-only callers; empty bindings cannot supply Gateway trust. */
@@ -386,7 +427,7 @@ public final class ReleaseToolCatalogContractAdapter {
                 String agentArtifactFingerprint, String releaseFingerprint,
                 String serverToolCatalogHash, ContractValidationCatalog semanticCatalog) {
             this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
-                    serverToolCatalogHash, semanticCatalog, List.of(), List.of());
+                    serverToolCatalogHash, semanticCatalog, List.of(), List.of(), List.of());
         }
 
         /** Compatibility for trust consumers; absent declarations cannot supply other stages. */
@@ -395,7 +436,16 @@ public final class ReleaseToolCatalogContractAdapter {
                 String serverToolCatalogHash, ContractValidationCatalog semanticCatalog,
                 List<ReleaseToolBinding> releaseToolBindings) {
             this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
-                    serverToolCatalogHash, semanticCatalog, releaseToolBindings, List.of());
+                    serverToolCatalogHash, semanticCatalog, releaseToolBindings, List.of(), List.of());
+        }
+
+        /** Compatibility for pre-call consumers; absent metadata cannot supply response expectations. */
+        public SourceBoundCatalog(UUID releaseId, String manifestSchemaVersion,
+                String agentArtifactFingerprint, String releaseFingerprint,
+                String serverToolCatalogHash, ContractValidationCatalog semanticCatalog,
+                List<ReleaseToolBinding> releaseToolBindings, List<CatalogTool> declaredTools) {
+            this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
+                    serverToolCatalogHash, semanticCatalog, releaseToolBindings, declaredTools, List.of());
         }
 
         public SourceBoundCatalog {
@@ -418,6 +468,7 @@ public final class ReleaseToolCatalogContractAdapter {
             Objects.requireNonNull(semanticCatalog, "semanticCatalog must not be null");
             releaseToolBindings = List.copyOf(releaseToolBindings);
             declaredTools = List.copyOf(declaredTools);
+            customerOutputFields = List.copyOf(customerOutputFields);
         }
     }
 
