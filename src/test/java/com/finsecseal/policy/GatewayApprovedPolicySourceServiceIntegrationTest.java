@@ -34,6 +34,9 @@ import com.finsecseal.platform.contract.ContractPersistenceService.Version;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.ApprovedPolicySource;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.FailureCode;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.PolicySourceException;
+import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
+import com.finsecseal.policy.PolicyToolTrustFacts.ToolTrustPolicy;
+import com.finsecseal.policy.PolicyToolTrustFacts.TrustLevel;
 import com.finsecseal.release.ReleaseService;
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -124,6 +127,7 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
     void actualApprovedSourceUsesWritableRepeatableReadAndCurrentPostApprovalBinding(
             TestRunMode mode, CapturedOutput output) throws Exception {
         Seed seed = seed(mode);
+        List<ReleaseToolBinding> storedBindings = storedReleaseBindings(seed.releaseId());
         var firstRead = new AtomicReference<PhysicalTransaction>();
         var approvalRead = new AtomicReference<PhysicalTransaction>();
         var catalogRead = new AtomicReference<PhysicalTransaction>();
@@ -153,6 +157,19 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
         order.verify(cases).findCase(seed.caseRunId());
         order.verify(catalogs).load(seed.releaseId(), ACTOR);
         assertSource(source, seed, mode);
+        assertThat(storedBindings).hasSize(5).extracting(ReleaseToolBinding::toolName)
+                .containsExactlyInAnyOrder("CASE_CONTEXT_READ", "DOCUMENT_READER", "CUSTOMER_DATA_READ",
+                        "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE");
+        assertThat(storedBindings).allMatch(ReleaseToolBinding::enabled);
+        assertThat(source.releaseToolBindings()).containsExactlyInAnyOrderElementsOf(storedBindings);
+        assertThat(source.releaseToolBindings()).extracting(ReleaseToolBinding::toolName)
+                .doesNotContain("LOAN_DECISION_UPDATE");
+        var expectedTrustPolicy = new ToolTrustPolicy(true, List.of(TrustLevel.TRUSTED_INTERNAL));
+        assertThat(source.toolTrustPolicy()).isEqualTo(expectedTrustPolicy);
+        assertThatThrownBy(() -> source.releaseToolBindings().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> source.toolTrustPolicy().allowedTrustLevels().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
         String proofFingerprint = seed.approved().validation().at("/sourceBinding/releaseFingerprint").stringValue();
         assertThat(proofFingerprint).isEqualTo(seed.preApprovalFingerprint());
         assertThat(source.catalog().releaseFingerprint()).isNotEqualTo(proofFingerprint);
@@ -162,6 +179,11 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
         assertThat(output.getAll()).doesNotContain(SESSION, PROMPT, STORED, RAW_ERROR);
         ((ObjectNode) source.policy()).put("purpose", "FORGED");
         ((ArrayNode) source.policy().path("allowedTools")).removeAll();
+        ObjectNode policyCopy = (ObjectNode) source.policy();
+        ((ObjectNode) policyCopy.path("toolTrust")).put("requireTrustedTool", false);
+        ((ArrayNode) policyCopy.at("/toolTrust/allowedTrustLevels")).removeAll().add("SANDBOXED");
+        assertThat(source.toolTrustPolicy()).isEqualTo(expectedTrustPolicy);
+        assertThat(source.releaseToolBindings()).containsExactlyInAnyOrderElementsOf(storedBindings);
         assertSource(source, seed, mode);
         assertUnchanged(before, seed.releaseId(), 2);
         assertNoAmbientTransaction();
@@ -529,6 +551,15 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
     }
 
     private String etag(Version version) { return '"' + version.resourceHash() + '"'; }
+
+    private List<ReleaseToolBinding> storedReleaseBindings(UUID releaseId) {
+        return jdbc.query("select d.tool_key, d.version, r.enabled, d.schema_hash, d.description_hash "
+                        + "from release_tools r join tool_definitions d on d.id=r.tool_definition_id "
+                        + "where r.release_id=? order by d.tool_key, d.version",
+                (row, index) -> new ReleaseToolBinding(row.getString("tool_key"), row.getString("version"),
+                        row.getBoolean("enabled"), row.getString("schema_hash"), row.getString("description_hash")),
+                releaseId);
+    }
 
     private void assertSource(ApprovedPolicySource source, Seed seed, TestRunMode mode) {
         assertThat(source).isNotNull();

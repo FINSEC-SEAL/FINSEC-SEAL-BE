@@ -477,12 +477,17 @@ class GatewayPolicyFactsAssemblerTest {
         when(contracts.approved(release, versionId, reviewer)).thenReturn(new ApprovedContract(version, ARTIFACT, FINGERPRINT));
         when(cases.findCase(caseRun)).thenReturn(new CaseRun(caseRun, run, UUID.randomUUID(), 0,
                 TestCaseRunStatus.EXECUTING, null, null, HASH, null, null, null, json.createObjectNode()));
-        when(catalogs.load(release, reviewer.actorId())).thenReturn(new SourceBoundCatalog(release, "1.1", ARTIFACT,
-                FINGERPRINT, HASH, new ContractValidationCatalog(List.of(
+        var semanticCatalog = new ContractValidationCatalog(List.of(
                         new EnabledTool("CASE_CONTEXT_READ", List.of()), new EnabledTool("DOCUMENT_READER", List.of()),
                         new EnabledTool(CUSTOMER_TOOL, List.of("incomeBand", "employmentStatus", "accountNumber")),
                         new EnabledTool("LOAN_POLICY_SEARCH", List.of()), new EnabledTool("REVIEW_NOTE_WRITE", List.of())),
-                        List.of(HUMAN_TOOL))));
+                        List.of(HUMAN_TOOL));
+        // Synthetic unit-source binding; the separate PostgreSQL suite verifies A's stored hashes.
+        var bindings = semanticCatalog.enabledReleaseTools().stream()
+                .map(tool -> new PolicyToolTrustFacts.ReleaseToolBinding(tool.toolName(), "1.0.0", true, HASH, HASH))
+                .toList();
+        when(catalogs.load(release, reviewer.actorId())).thenReturn(new SourceBoundCatalog(release, "1.1", ARTIFACT,
+                FINGERPRINT, HASH, semanticCatalog, bindings));
         var loader = new GatewayApprovedPolicySourceService(runs, contracts, cases, catalogs, validator, canonicalizer);
         // Guard fixture only: actual owner approval and physical PostgreSQL transactions are not simulated here.
         boolean active = TransactionSynchronizationManager.isActualTransactionActive();

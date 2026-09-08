@@ -20,9 +20,16 @@ import com.finsecseal.evidence.TestRunProjectionService;
 import com.finsecseal.platform.contract.ContractPersistenceService;
 import com.finsecseal.platform.contract.ContractPersistenceService.ApprovedContract;
 import com.finsecseal.platform.contract.ContractPersistenceService.Version;
+import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
+import com.finsecseal.policy.PolicyToolTrustFacts.ToolTrustPolicy;
+import com.finsecseal.policy.PolicyToolTrustFacts.TrustLevel;
 import java.math.BigInteger;
 import java.sql.Connection;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Isolation;
@@ -85,6 +92,7 @@ public class GatewayApprovedPolicySourceService {
                     || !run.releaseFingerprint().equals(catalog.releaseFingerprint())) {
                 throw failure(FailureCode.CATALOG_BINDING_INVALID);
             }
+            List<ReleaseToolBinding> bindings = requireToolBindings(catalog);
             ValidationResult validation = validator.validate(policy, catalog.semanticCatalog());
             if (validation == null || validation.status() == ValidationStatus.INVALID) {
                 throw failure(FailureCode.POLICY_INVALID);
@@ -93,13 +101,56 @@ public class GatewayApprovedPolicySourceService {
             if (canonical == null || !version.policyHash().equals(canonical.policyHash())) {
                 throw failure(FailureCode.POLICY_INTEGRITY_FAILURE);
             }
-            return new ApprovedPolicySource(run, caseRun, version, policy, catalog, validation, canonical);
+            return new ApprovedPolicySource(run, caseRun, version, policy, catalog, validation, canonical,
+                    bindings, toolTrustPolicy(policy));
         } catch (PolicySourceException | BusinessException exception) {
             // Preserve A's established authorization/not-found/integrity error contract.
             throw exception;
         } catch (RuntimeException exception) {
             // Raw owner/catalog/engine exceptions can contain stored text or SQL details.
             throw failure(FailureCode.SOURCE_UNAVAILABLE);
+        }
+    }
+
+    private static List<ReleaseToolBinding> requireToolBindings(SourceBoundCatalog catalog) {
+        List<ReleaseToolBinding> bindings = catalog.releaseToolBindings();
+        if (bindings == null || bindings.isEmpty()) {
+            throw failure(FailureCode.CATALOG_BINDING_INVALID);
+        }
+        Set<String> expectedNames = new HashSet<>();
+        catalog.semanticCatalog().enabledReleaseTools().forEach(tool -> expectedNames.add(tool.toolName()));
+        Set<String> actualNames = new HashSet<>();
+        for (ReleaseToolBinding binding : bindings) {
+            if (binding == null || !binding.enabled() || !actualNames.add(binding.toolName())
+                    || binding.version() == null || binding.version().isBlank()
+                    || !binding.version().equals(binding.version().strip())
+                    || !hash(binding.schemaDigest()) || !hash(binding.descriptionDigest())) {
+                throw failure(FailureCode.CATALOG_BINDING_INVALID);
+            }
+        }
+        if (!expectedNames.equals(actualNames)) {
+            throw failure(FailureCode.CATALOG_BINDING_INVALID);
+        }
+        return List.copyOf(bindings);
+    }
+
+    private static ToolTrustPolicy toolTrustPolicy(JsonNode policy) {
+        JsonNode required = policy.at("/toolTrust/requireTrustedTool");
+        JsonNode allowed = policy.at("/toolTrust/allowedTrustLevels");
+        if (!required.isBoolean() || !allowed.isArray()) {
+            throw failure(FailureCode.POLICY_INVALID);
+        }
+        List<TrustLevel> levels = new ArrayList<>();
+        try {
+            for (JsonNode level : allowed) {
+                if (!level.isString()) {
+                    throw failure(FailureCode.POLICY_INVALID);
+                }
+                levels.add(TrustLevel.valueOf(level.stringValue()));
+            }
+            return new ToolTrustPolicy(required.booleanValue(), levels);
+        } catch (IllegalArgumentException exception) {
+            throw failure(FailureCode.POLICY_INVALID);
         }
     }
 
@@ -175,9 +226,12 @@ public class GatewayApprovedPolicySourceService {
         private final SourceBoundCatalog catalog;
         private final ValidationResult validation;
         private final CanonicalPolicy canonicalPolicy;
+        private final List<ReleaseToolBinding> releaseToolBindings;
+        private final ToolTrustPolicy toolTrustPolicy;
 
         private ApprovedPolicySource(Projection run, CaseRun caseRun, Version version, JsonNode policy,
-                SourceBoundCatalog catalog, ValidationResult validation, CanonicalPolicy canonicalPolicy) {
+                SourceBoundCatalog catalog, ValidationResult validation, CanonicalPolicy canonicalPolicy,
+                List<ReleaseToolBinding> releaseToolBindings, ToolTrustPolicy toolTrustPolicy) {
             this.runId = run.id();
             this.testCaseRunId = caseRun.id();
             this.testCaseId = caseRun.testCaseId();
@@ -193,6 +247,8 @@ public class GatewayApprovedPolicySourceService {
             this.catalog = catalog;
             this.validation = validation;
             this.canonicalPolicy = canonicalPolicy;
+            this.releaseToolBindings = releaseToolBindings;
+            this.toolTrustPolicy = toolTrustPolicy;
         }
 
         public UUID runId() { return runId; }
@@ -210,6 +266,9 @@ public class GatewayApprovedPolicySourceService {
         public SourceBoundCatalog catalog() { return catalog; }
         public ValidationResult validation() { return validation; }
         public CanonicalPolicy canonicalPolicy() { return canonicalPolicy; }
+        /** Expected declarations only; runtime registry observations must come from their owner. */
+        public List<ReleaseToolBinding> releaseToolBindings() { return releaseToolBindings; }
+        public ToolTrustPolicy toolTrustPolicy() { return toolTrustPolicy; }
     }
 
     public enum FailureCode {

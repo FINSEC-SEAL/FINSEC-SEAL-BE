@@ -2,6 +2,7 @@ package com.finsecseal.contract;
 
 import com.finsecseal.contract.SafetyContractSemanticValidator.ContractValidationCatalog;
 import com.finsecseal.contract.SafetyContractSemanticValidator.EnabledTool;
+import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import com.finsecseal.release.ReleaseDto.ToolCatalogResponse;
@@ -21,7 +22,7 @@ import tools.jackson.databind.node.ObjectNode;
 
 /**
  * Role C boundary that converts Role A's verified Manifest 1.1 Tool catalog into
- * immutable semantic-validation input.
+ * immutable semantic-validation input and expected Tool Trust bindings.
  *
  * <p>A successful conversion proves only source integrity and catalog shape. It
  * does not approve a Safety Contract, pass a Release, authorize deployment, or
@@ -114,7 +115,8 @@ public final class ReleaseToolCatalogContractAdapter {
                 source.agentArtifactFingerprint(),
                 source.releaseFingerprint(),
                 source.serverToolCatalogHash(),
-                new ContractValidationCatalog(enabledTools, highImpactTools)
+                new ContractValidationCatalog(enabledTools, highImpactTools),
+                extractReleaseToolBindings(toolsSnapshot)
         );
     }
 
@@ -254,6 +256,36 @@ public final class ReleaseToolCatalogContractAdapter {
         return List.copyOf(highImpactTools);
     }
 
+    private List<ReleaseToolBinding> extractReleaseToolBindings(JsonNode tools) {
+        List<ReleaseToolBinding> bindings = new ArrayList<>();
+        for (JsonNode tool : tools) {
+            JsonNode version = tool.path("version");
+            JsonNode description = tool.path("description");
+            if (!version.isString() || !isExactNonBlank(version.stringValue())
+                    || !description.isString() || description.stringValue().isBlank()
+                    || !tool.path("inputSchema").isObject() || !tool.path("outputSchema").isObject()) {
+                throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+            }
+            try {
+                // Same wrapper inputs as A's ReleaseCatalogWriter / ReleaseIntegrityVerifier.
+                // A has already verified that manifest.tools are the enabled Release bindings.
+                ObjectNode schemas = objectMapper.createObjectNode();
+                schemas.set("inputSchema", tool.path("inputSchema"));
+                schemas.set("outputSchema", tool.path("outputSchema"));
+                ObjectNode descriptionInput = objectMapper.createObjectNode();
+                descriptionInput.put("description", description.stringValue());
+                bindings.add(new ReleaseToolBinding(tool.path("name").stringValue(),
+                        version.stringValue(), true,
+                        digestService.sha256(canonicalJsonService.canonicalize(schemas)),
+                        digestService.sha256(canonicalJsonService.canonicalize(descriptionInput))));
+            } catch (RuntimeException exception) {
+                throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+            }
+        }
+        bindings.sort(Comparator.comparing(ReleaseToolBinding::toolName));
+        return List.copyOf(bindings);
+    }
+
     private void rejectRoleOverlap(
             List<EnabledTool> enabledTools,
             List<String> highImpactTools
@@ -304,7 +336,7 @@ public final class ReleaseToolCatalogContractAdapter {
     }
 
     /**
-     * Immutable source binding for semantic validation. This is not approval evidence.
+     * Immutable expected source declarations. This is not approval or observed registry evidence.
      */
     public record SourceBoundCatalog(
             UUID releaseId,
@@ -312,8 +344,17 @@ public final class ReleaseToolCatalogContractAdapter {
             String agentArtifactFingerprint,
             String releaseFingerprint,
             String serverToolCatalogHash,
-            ContractValidationCatalog semanticCatalog
+            ContractValidationCatalog semanticCatalog,
+            List<ReleaseToolBinding> releaseToolBindings
     ) {
+
+        /** Compatibility for semantic-only callers; empty bindings cannot supply Gateway trust. */
+        public SourceBoundCatalog(UUID releaseId, String manifestSchemaVersion,
+                String agentArtifactFingerprint, String releaseFingerprint,
+                String serverToolCatalogHash, ContractValidationCatalog semanticCatalog) {
+            this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
+                    serverToolCatalogHash, semanticCatalog, List.of());
+        }
 
         public SourceBoundCatalog {
             Objects.requireNonNull(releaseId, "releaseId must not be null");
@@ -333,6 +374,7 @@ public final class ReleaseToolCatalogContractAdapter {
                     FailureCode.INVALID_SERVER_CATALOG_HASH
             );
             Objects.requireNonNull(semanticCatalog, "semanticCatalog must not be null");
+            releaseToolBindings = List.copyOf(releaseToolBindings);
         }
     }
 
