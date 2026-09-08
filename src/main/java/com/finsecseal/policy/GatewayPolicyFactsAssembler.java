@@ -88,6 +88,79 @@ public final class GatewayPolicyFactsAssembler {
         }
     }
 
+    /** Requested operation is independent runtime input, never inferred from a declaration. */
+    public PolicyToolAuthorizationFacts toolAuthorization(ApprovedPolicySource source,
+            String requestedTool, String requestedOperation) {
+        requireToolName(requestedTool);
+        if (requestedOperation == null || requestedOperation.isBlank()) {
+            throw failure(FailureCode.INVALID_REQUEST);
+        }
+        try {
+            JsonNode policy = policy(source);
+            var declarations = declaredTools(source);
+            var egress = egress(policy, requestedTool, declarations);
+            var human = humanBoundary(source, requestedTool);
+            var allowed = policyValues(policy.path("allowedTools"));
+            ContractValidationCatalog catalog = catalog(source);
+            for (String tool : allowed) {
+                if (!catalog.hasEnabledTool(tool) || catalog.hasHighImpactTool(tool)) throw invalidSource();
+            }
+            return new PolicyToolAuthorizationFacts(requestedTool, requestedOperation, declarations,
+                    allowed, !egress.externalEgressAllowed(),
+                    human.highImpactActions().stream().map(HighImpactAction::toolName).toList());
+        } catch (FactAssemblyException exception) {
+            throw exception;
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+    }
+
+    /** Declared egress classification only; does not establish an observed registry or Tool-stage pass. */
+    public PolicyEgressFacts egress(ApprovedPolicySource source, String requestedTool) {
+        requireToolName(requestedTool);
+        try {
+            return egress(policy(source), requestedTool, declaredTools(source));
+        } catch (FactAssemblyException exception) {
+            throw exception;
+        } catch (RuntimeException exception) {
+            throw invalidSource();
+        }
+    }
+
+    private static PolicyEgressFacts egress(JsonNode policy, String requestedTool,
+            List<PolicyToolAuthorizationFacts.CatalogTool> declarations) {
+        JsonNode egress = object(policy.path("externalEgress"));
+        JsonNode allowed = egress.path("allowed");
+        JsonNode destinations = egress.path("allowedDestinations");
+        if (!allowed.isBoolean() || !destinations.isArray()) throw invalidSource();
+        var values = new ArrayList<String>();
+        for (JsonNode destination : destinations) {
+            if (!destination.isString()) throw invalidSource();
+            values.add(destination.stringValue());
+        }
+        var catalog = declarations.stream().map(tool -> new PolicyEgressFacts.CatalogTool(tool.name(),
+                tool.externalEgressTool() ? PolicyEgressFacts.EgressClassification.EXTERNAL
+                        : PolicyEgressFacts.EgressClassification.INTERNAL)).toList();
+        // Existing facts enforce P0 false + empty destinations; never supply a fallback policy.
+        return new PolicyEgressFacts(requestedTool, catalog, allowed.booleanValue(), values);
+    }
+
+    private static List<PolicyToolAuthorizationFacts.CatalogTool> declaredTools(ApprovedPolicySource source) {
+        ContractValidationCatalog catalog = catalog(source);
+        var expected = new HashSet<String>();
+        catalog.enabledReleaseTools().forEach(tool -> expected.add(tool.toolName()));
+        for (String tool : catalog.highImpactToolNames()) {
+            if (!expected.add(tool)) throw invalidSource();
+        }
+        var declarations = List.copyOf(source.catalog().declaredTools());
+        var actual = new HashSet<String>();
+        for (var tool : declarations) {
+            if (!actual.add(tool.name())) throw invalidSource();
+        }
+        if (actual.isEmpty() || !actual.equals(expected)) throw invalidSource();
+        return declarations;
+    }
+
     private ToolProposal customerRequest(ToolProposal proposal) {
         if (proposal == null) throw failure(FailureCode.INVALID_REQUEST);
         requireToolName(proposal.toolName());

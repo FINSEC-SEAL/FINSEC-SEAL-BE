@@ -2,10 +2,15 @@ package com.finsecseal.policy;
 
 import static com.finsecseal.policy.PolicyEvaluationReason.FIELD_SCOPE_VIOLATION;
 import static com.finsecseal.policy.PolicyEvaluationReason.HUMAN_ONLY_ACTION;
+import static com.finsecseal.policy.PolicyEvaluationReason.OPERATION_NOT_ALLOWED;
 import static com.finsecseal.policy.PolicyEvaluationReason.RECORD_LIMIT_EXCEEDED;
+import static com.finsecseal.policy.PolicyEvaluationReason.TOOL_NOT_ALLOWED;
 import static com.finsecseal.policy.PolicyEvaluationStage.CARDINALITY;
+import static com.finsecseal.policy.PolicyEvaluationStage.EGRESS;
 import static com.finsecseal.policy.PolicyEvaluationStage.FIELD_SCOPE;
 import static com.finsecseal.policy.PolicyEvaluationStage.HUMAN_BOUNDARY;
+import static com.finsecseal.policy.PolicyEvaluationStage.OPERATION;
+import static com.finsecseal.policy.PolicyEvaluationStage.TOOL;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
@@ -41,6 +46,7 @@ import com.finsecseal.policy.GatewayApprovedPolicySourceService.ApprovedPolicySo
 import com.finsecseal.policy.GatewayPolicyFactsAssembler.FactAssemblyException;
 import com.finsecseal.policy.GatewayPolicyFactsAssembler.FailureCode;
 import com.finsecseal.policy.PolicyEvaluationDecision.StageOutcome;
+import com.finsecseal.policy.PolicyToolAuthorizationFacts.CatalogTool;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import com.finsecseal.runtime.ToolProposal;
@@ -50,6 +56,7 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.math.BigInteger;
 import java.sql.Connection;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
@@ -88,6 +95,8 @@ class GatewayPolicyFactsAssemblerTest {
     private final PolicyFieldScopeEvaluator fields = new PolicyFieldScopeEvaluator();
     private final PolicyCardinalityEvaluator cardinality = new PolicyCardinalityEvaluator();
     private final PolicyHumanBoundaryEvaluator human = new PolicyHumanBoundaryEvaluator();
+    private final PolicyToolAuthorizationEvaluator authorization = new PolicyToolAuthorizationEvaluator();
+    private final PolicyEgressEvaluator egress = new PolicyEgressEvaluator();
     private final TestRunProjectionService runs = mock(TestRunProjectionService.class);
     private final ContractPersistenceService contracts = mock(ContractPersistenceService.class);
     private final TestRunPersistenceService cases = mock(TestRunPersistenceService.class);
@@ -107,6 +116,7 @@ class GatewayPolicyFactsAssemblerTest {
         adapter = spy(new CustomerDataReadToolAdapter(jdbc, json));
         proposals = spy(new ToolProposalValidator(json, List.of(adapter)));
         assembler = new GatewayPolicyFactsAssembler(proposals);
+        clearInvocations(adapter); // Measure assembly calls after the validator's fixture indexing.
     }
 
     @AfterEach
@@ -362,6 +372,8 @@ class GatewayPolicyFactsAssemblerTest {
         ApprovedPolicySource malformed = malformedSource(policy, source.catalog());
 
         safe(() -> assembler.humanBoundary(malformed, HUMAN_TOOL), FailureCode.INVALID_POLICY_SOURCE);
+        safe(() -> assembler.toolAuthorization(malformed, HUMAN_TOOL, "UPDATE"), FailureCode.INVALID_POLICY_SOURCE);
+        verifyNoInteractions(proposals, adapter);
     }
 
     @ParameterizedTest
@@ -453,6 +465,267 @@ class GatewayPolicyFactsAssemblerTest {
         safe(() -> assembler.humanBoundary(malformed, HUMAN_TOOL), FailureCode.INVALID_POLICY_SOURCE);
     }
 
+    @ParameterizedTest
+    @MethodSource("declaredOperations")
+    void approvedDeclarationsSupplyExactToolOperationAndInternalEgressFacts(String tool, String operation) {
+        var toolFacts = assembler.toolAuthorization(source, tool, operation);
+        var egressFacts = assembler.egress(source, tool);
+
+        assertThat(toolFacts.requestedTool()).isEqualTo(tool);
+        assertThat(toolFacts.requestedOperation()).isEqualTo(operation);
+        assertThat(toolFacts.catalogTools()).containsExactlyElementsOf(declarations());
+        assertThat(toolFacts.allowedTools()).containsExactly("CASE_CONTEXT_READ", "DOCUMENT_READER", CUSTOMER_TOOL,
+                "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE");
+        assertThat(toolFacts.humanOnlyTools()).containsExactly(HUMAN_TOOL);
+        assertThat(toolFacts.externalEgressExplicitlyDenied()).isTrue();
+        assertThat(authorization.evaluate(TOOL, toolFacts)).isEqualTo(StageOutcome.pass(TOOL));
+        assertThat(authorization.evaluate(OPERATION, toolFacts)).isEqualTo(StageOutcome.pass(OPERATION));
+        assertThat(egressFacts.requestedTool()).isEqualTo(tool);
+        assertThat(egressFacts.catalogTools()).containsExactlyElementsOf(declarations().stream()
+                .map(value -> new PolicyEgressFacts.CatalogTool(value.name(),
+                        PolicyEgressFacts.EgressClassification.INTERNAL)).toList());
+        assertThat(egressFacts.externalEgressAllowed()).isFalse();
+        assertThat(egressFacts.allowedDestinations()).isEmpty();
+        assertThat(egress.evaluate(EGRESS, egressFacts)).isEqualTo(StageOutcome.pass(EGRESS));
+        assertThat(toolFacts.toString()).doesNotContain(CUSTOMER_CANARY, ERROR_CANARY, "customerIds");
+        assertThat(egressFacts.toString()).doesNotContain(CUSTOMER_CANARY, ERROR_CANARY, "customerIds");
+        verifyNoInteractions(proposals, adapter);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"READ", "WRITE", "read", "READ ", "UNRECOGNIZED_OPERATION"})
+    void independentRequestOperationIsPreservedAndComparedExactly(String requestedOperation) {
+        var facts = assembler.toolAuthorization(source, CUSTOMER_TOOL, requestedOperation);
+
+        assertThat(facts.requestedOperation()).isEqualTo(requestedOperation);
+        assertThat(facts.requestedCatalogTool().orElseThrow().operation()).isEqualTo("READ");
+        assertThat(authorization.evaluate(TOOL, facts)).isEqualTo(StageOutcome.pass(TOOL));
+        assertThat(authorization.evaluate(OPERATION, facts)).isEqualTo("READ".equals(requestedOperation)
+                ? StageOutcome.pass(OPERATION) : StageOutcome.deny(OPERATION, OPERATION_NOT_ALLOWED));
+        verifyNoInteractions(proposals, adapter);
+    }
+
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = {" ", "\t\n"})
+    void missingRequestOperationIsRejectedBeforePolicyAssembly(String requestedOperation) {
+        safe(() -> assembler.toolAuthorization(source, CUSTOMER_TOOL, requestedOperation), FailureCode.INVALID_REQUEST);
+        verifyNoInteractions(proposals, adapter);
+    }
+
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = {" ", "customer_data_read", "CUSTOMER_DATA_READ ", "BAD/TOOL", "🦀"})
+    void malformedToolNamesAreRequestFailuresForNewEntrypoints(String tool) {
+        safe(() -> assembler.toolAuthorization(source, tool, "READ"), FailureCode.INVALID_REQUEST);
+        safe(() -> assembler.egress(source, tool), FailureCode.INVALID_REQUEST);
+        verifyNoInteractions(proposals, adapter);
+    }
+
+    @Test
+    void unknownToolIsNotInsertedIntoDeclarationsOrGivenAnEgressPass() {
+        String unknown = "A".repeat(80);
+        var toolFacts = assembler.toolAuthorization(source, unknown, "READ");
+        var egressFacts = assembler.egress(source, unknown);
+
+        assertThat(toolFacts.requestedTool()).isEqualTo(unknown);
+        assertThat(toolFacts.requestedCatalogTool()).isEmpty();
+        assertThat(authorization.evaluate(TOOL, toolFacts)).isEqualTo(StageOutcome.deny(TOOL, TOOL_NOT_ALLOWED));
+        assertThat(egressFacts.requestedTool()).isEqualTo(unknown);
+        assertThat(egressFacts.requestedCatalogTool()).isEmpty();
+        assertThatThrownBy(() -> egress.evaluate(EGRESS, egressFacts))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("Tool stage");
+        safe(() -> assembler.toolAuthorization(source, unknown + "A", "READ"), FailureCode.INVALID_REQUEST);
+        safe(() -> assembler.egress(source, unknown + "A"), FailureCode.INVALID_REQUEST);
+        verifyNoInteractions(proposals, adapter);
+    }
+
+    @Test
+    void humanOnlyToolDefersToHumanBoundaryWithoutAugmentingTheAgentAllowlist() {
+        var facts = assembler.toolAuthorization(source, HUMAN_TOOL, "UPDATE");
+
+        assertThat(facts.allowedTools()).doesNotContain(HUMAN_TOOL);
+        assertThat(facts.isRequestedToolAllowed()).isFalse();
+        assertThat(facts.isRequestedToolHumanOnly()).isTrue();
+        assertThat(authorization.evaluate(TOOL, facts)).isEqualTo(StageOutcome.pass(TOOL));
+        assertThat(authorization.evaluate(OPERATION, facts)).isEqualTo(StageOutcome.pass(OPERATION));
+        assertThat(human.evaluate(HUMAN_BOUNDARY, assembler.humanBoundary(source, HUMAN_TOOL)))
+                .isEqualTo(StageOutcome.deny(HUMAN_BOUNDARY, HUMAN_ONLY_ACTION));
+        verifyNoInteractions(proposals, adapter);
+    }
+
+    @Test
+    void declaredInternalToolOutsideTheSuppliedAllowlistRemainsDenied() {
+        ObjectNode policy = (ObjectNode) source.policy();
+        policy.putArray("allowedTools").add("REVIEW_NOTE_WRITE").add("CASE_CONTEXT_READ");
+
+        var facts = assembler.toolAuthorization(malformedSource(policy, source.catalog()), CUSTOMER_TOOL, "READ");
+
+        assertThat(facts.allowedTools()).containsExactly("REVIEW_NOTE_WRITE", "CASE_CONTEXT_READ");
+        assertThat(facts.isRequestedToolAllowed()).isFalse();
+        assertThat(authorization.evaluate(TOOL, facts)).isEqualTo(StageOutcome.deny(TOOL, TOOL_NOT_ALLOWED));
+        verifyNoInteractions(proposals, adapter);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"six-argument", "seven-argument", "empty", "missing-normal", "missing-human", "extra",
+            "duplicate", "same-name-different-operation"})
+    void incompleteOrAmbiguousDeclarationsCannotSupplyEitherNewEntryPoint(String problem) {
+        var original = source.catalog();
+        var declared = new ArrayList<>(original.declaredTools());
+        switch (problem) {
+            case "empty", "six-argument", "seven-argument" -> declared.clear();
+            case "missing-normal" -> declared.removeIf(tool -> tool.name().equals(CUSTOMER_TOOL));
+            case "missing-human" -> declared.removeIf(tool -> tool.name().equals(HUMAN_TOOL));
+            case "extra" -> declared.add(new CatalogTool(ERROR_CANARY, "READ", false));
+            case "duplicate" -> declared.add(declared.getFirst());
+            case "same-name-different-operation" -> declared.add(new CatalogTool(CUSTOMER_TOOL, "WRITE", false));
+            default -> throw new IllegalArgumentException(problem);
+        }
+        SourceBoundCatalog catalog = switch (problem) {
+            case "six-argument" -> new SourceBoundCatalog(original.releaseId(), "1.1", ARTIFACT, FINGERPRINT, HASH,
+                    original.semanticCatalog());
+            case "seven-argument" -> new SourceBoundCatalog(original.releaseId(), "1.1", ARTIFACT, FINGERPRINT, HASH,
+                    original.semanticCatalog(), original.releaseToolBindings());
+            default -> new SourceBoundCatalog(original.releaseId(), "1.1", ARTIFACT, FINGERPRINT, HASH,
+                    original.semanticCatalog(), original.releaseToolBindings(), declared);
+        };
+        var malformed = malformedSource(source.policy(), catalog);
+
+        safe(() -> assembler.toolAuthorization(malformed, CUSTOMER_TOOL, "READ"), FailureCode.INVALID_POLICY_SOURCE);
+        safe(() -> assembler.egress(malformed, CUSTOMER_TOOL), FailureCode.INVALID_POLICY_SOURCE);
+        verifyNoInteractions(proposals, adapter);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"source-null", "catalog-null", "policy-null", "policy-array", "policy-string"})
+    void missingSourceOrMalformedPolicyCannotSupplyNewFacts(String problem) {
+        ApprovedPolicySource malformed = switch (problem) {
+            case "source-null" -> null;
+            case "catalog-null" -> malformedSource(source.policy(), null);
+            case "policy-null" -> malformedSource(null, source.catalog());
+            case "policy-array" -> malformedSource(json.createArrayNode(), source.catalog());
+            case "policy-string" -> malformedSource(StringNode.valueOf(ERROR_CANARY), source.catalog());
+            default -> throw new IllegalArgumentException(problem);
+        };
+
+        safe(() -> assembler.toolAuthorization(malformed, CUSTOMER_TOOL, "READ"), FailureCode.INVALID_POLICY_SOURCE);
+        safe(() -> assembler.egress(malformed, CUSTOMER_TOOL), FailureCode.INVALID_POLICY_SOURCE);
+        verifyNoInteractions(proposals, adapter);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "null", "object", "string", "empty", "number-member", "boolean-member",
+            "null-member", "blank-member", "duplicate", "unknown", "human-only", "padded", "lowercase"})
+    void malformedAgentAllowlistIsNeverRepairedFromCatalogDeclarations(String problem) {
+        ObjectNode policy = (ObjectNode) source.policy();
+        switch (problem) {
+            case "missing" -> policy.remove("allowedTools");
+            case "null" -> policy.putNull("allowedTools");
+            case "object" -> policy.putObject("allowedTools");
+            case "string" -> policy.put("allowedTools", ERROR_CANARY);
+            case "empty" -> policy.putArray("allowedTools");
+            case "number-member" -> policy.putArray("allowedTools").add(42);
+            case "boolean-member" -> policy.putArray("allowedTools").add(false);
+            case "null-member" -> policy.putArray("allowedTools").addNull();
+            case "blank-member" -> policy.putArray("allowedTools").add(" ");
+            case "duplicate" -> policy.putArray("allowedTools").add(CUSTOMER_TOOL).add(CUSTOMER_TOOL);
+            case "unknown" -> policy.putArray("allowedTools").add(ERROR_CANARY);
+            case "human-only" -> policy.putArray("allowedTools").add(HUMAN_TOOL);
+            case "padded" -> policy.putArray("allowedTools").add(CUSTOMER_TOOL + " ");
+            case "lowercase" -> policy.putArray("allowedTools").add("customer_data_read");
+            default -> throw new IllegalArgumentException(problem);
+        }
+
+        safe(() -> assembler.toolAuthorization(malformedSource(policy, source.catalog()), CUSTOMER_TOOL, "READ"),
+                FailureCode.INVALID_POLICY_SOURCE);
+        verifyNoInteractions(proposals, adapter);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "null", "array", "string", "allowed-missing", "allowed-null",
+            "allowed-string", "allowed-number", "allowed-true", "destinations-missing", "destinations-null",
+            "destinations-string", "destinations-object", "number-member", "boolean-member", "object-member",
+            "null-member", "blank-member", "duplicate", "nonempty"})
+    void sharedMalformedOrPermissiveEgressPolicyRejectsBothNewEntryPoints(String problem) {
+        ObjectNode policy = (ObjectNode) source.policy();
+        ObjectNode external = (ObjectNode) policy.path("externalEgress");
+        switch (problem) {
+            case "missing" -> policy.remove("externalEgress");
+            case "null" -> policy.putNull("externalEgress");
+            case "array" -> policy.putArray("externalEgress");
+            case "string" -> policy.put("externalEgress", ERROR_CANARY);
+            case "allowed-missing" -> external.remove("allowed");
+            case "allowed-null" -> external.putNull("allowed");
+            case "allowed-string" -> external.put("allowed", "false");
+            case "allowed-number" -> external.put("allowed", 0);
+            case "allowed-true" -> external.put("allowed", true);
+            case "destinations-missing" -> external.remove("allowedDestinations");
+            case "destinations-null" -> external.putNull("allowedDestinations");
+            case "destinations-string" -> external.put("allowedDestinations", ERROR_CANARY);
+            case "destinations-object" -> external.putObject("allowedDestinations");
+            case "number-member" -> external.putArray("allowedDestinations").add(42);
+            case "boolean-member" -> external.putArray("allowedDestinations").add(false);
+            case "object-member" -> external.putArray("allowedDestinations").addObject().put("raw", ERROR_CANARY);
+            case "null-member" -> external.putArray("allowedDestinations").addNull();
+            case "blank-member" -> external.putArray("allowedDestinations").add(" ");
+            case "duplicate" -> external.putArray("allowedDestinations").add(ERROR_CANARY).add(ERROR_CANARY);
+            case "nonempty" -> external.putArray("allowedDestinations").add("https://example.invalid/review");
+            default -> throw new IllegalArgumentException(problem);
+        }
+        var malformed = malformedSource(policy, source.catalog());
+
+        safe(() -> assembler.toolAuthorization(malformed, CUSTOMER_TOOL, "READ"), FailureCode.INVALID_POLICY_SOURCE);
+        safe(() -> assembler.egress(malformed, CUSTOMER_TOOL), FailureCode.INVALID_POLICY_SOURCE);
+        verifyNoInteractions(proposals, adapter);
+    }
+
+    @Test
+    void newFactsRemainImmutableAfterCallerPolicyAndSourceCopiesChange() {
+        ObjectNode policy = (ObjectNode) source.policy();
+        var supplied = malformedSource(policy, source.catalog());
+        var toolFacts = assembler.toolAuthorization(supplied, CUSTOMER_TOOL, "READ");
+        var egressFacts = assembler.egress(supplied, CUSTOMER_TOOL);
+
+        policy.putArray("allowedTools").add(ERROR_CANARY);
+        ((ObjectNode) policy.path("highImpactActions")).put(HUMAN_TOOL, "AGENT_ALLOWED");
+        ((ObjectNode) policy.path("externalEgress")).put("allowed", true);
+        ((ObjectNode) policy.path("externalEgress")).putArray("allowedDestinations").add(ERROR_CANARY);
+        ownerPolicy.putArray("allowedTools").add(ERROR_CANARY);
+        ((ObjectNode) source.policy()).putArray("allowedTools").add(ERROR_CANARY);
+
+        assertThat(toolFacts.catalogTools()).containsExactlyElementsOf(declarations());
+        assertThat(toolFacts.allowedTools()).containsExactly("CASE_CONTEXT_READ", "DOCUMENT_READER", CUSTOMER_TOOL,
+                "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE");
+        assertThat(toolFacts.humanOnlyTools()).containsExactly(HUMAN_TOOL);
+        assertThat(toolFacts.externalEgressExplicitlyDenied()).isTrue();
+        assertThat(authorization.evaluate(TOOL, toolFacts)).isEqualTo(StageOutcome.pass(TOOL));
+        assertThat(egressFacts.externalEgressAllowed()).isFalse();
+        assertThat(egressFacts.allowedDestinations()).isEmpty();
+        assertThat(egress.evaluate(EGRESS, egressFacts)).isEqualTo(StageOutcome.pass(EGRESS));
+        assertThatThrownBy(() -> toolFacts.catalogTools().clear()).isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> toolFacts.allowedTools().clear()).isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> toolFacts.humanOnlyTools().clear()).isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> egressFacts.catalogTools().clear()).isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> egressFacts.allowedDestinations().add(ERROR_CANARY))
+                .isInstanceOf(UnsupportedOperationException.class);
+        verifyNoInteractions(proposals, adapter);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"policy", "catalog"})
+    void newEntrypointsSanitizeRawSourceFailuresWithoutCallingB(String brokenAccessor) {
+        var raw = new IllegalStateException(ERROR_CANARY, new IllegalStateException(CUSTOMER_CANARY));
+        raw.addSuppressed(new IllegalStateException(ERROR_CANARY));
+        var malformed = malformedSource(source.policy(), source.catalog());
+        if ("policy".equals(brokenAccessor)) when(malformed.policy()).thenThrow(raw);
+        else when(malformed.catalog()).thenThrow(raw);
+
+        safe(() -> assembler.toolAuthorization(malformed, CUSTOMER_TOOL, "READ"), FailureCode.INVALID_POLICY_SOURCE);
+        safe(() -> assembler.egress(malformed, CUSTOMER_TOOL), FailureCode.INVALID_POLICY_SOURCE);
+        verifyNoInteractions(proposals, adapter);
+    }
+
     private ApprovedPolicySource approvedSourceFixture() throws Exception {
         UUID workspace = UUID.randomUUID();
         UUID release = UUID.randomUUID();
@@ -487,7 +760,7 @@ class GatewayPolicyFactsAssemblerTest {
                 .map(tool -> new PolicyToolTrustFacts.ReleaseToolBinding(tool.toolName(), "1.0.0", true, HASH, HASH))
                 .toList();
         when(catalogs.load(release, reviewer.actorId())).thenReturn(new SourceBoundCatalog(release, "1.1", ARTIFACT,
-                FINGERPRINT, HASH, semanticCatalog, bindings));
+                FINGERPRINT, HASH, semanticCatalog, bindings, declarations()));
         var loader = new GatewayApprovedPolicySourceService(runs, contracts, cases, catalogs, validator, canonicalizer);
         // Guard fixture only: actual owner approval and physical PostgreSQL transactions are not simulated here.
         boolean active = TransactionSynchronizationManager.isActualTransactionActive();
@@ -539,5 +812,19 @@ class GatewayPolicyFactsAssemblerTest {
         return Stream.of("customerIds", "fields").flatMap(field -> Stream.of("missing", "null", "non-array", "empty",
                 "number", "boolean", "object", "null-member", "blank", "81-characters", "21-entries", "duplicate")
                 .map(problem -> Arguments.of(field, problem)));
+    }
+
+    private static List<CatalogTool> declarations() {
+        // Same six declared identities as the fixture; these are not observed runtime registry facts.
+        return List.of(new CatalogTool("CASE_CONTEXT_READ", "READ", false),
+                new CatalogTool(CUSTOMER_TOOL, "READ", false),
+                new CatalogTool("DOCUMENT_READER", "READ", false),
+                new CatalogTool(HUMAN_TOOL, "UPDATE", false),
+                new CatalogTool("LOAN_POLICY_SEARCH", "SEARCH", false),
+                new CatalogTool("REVIEW_NOTE_WRITE", "CREATE", false));
+    }
+
+    private static Stream<Arguments> declaredOperations() {
+        return declarations().stream().map(tool -> Arguments.of(tool.name(), tool.operation()));
     }
 }

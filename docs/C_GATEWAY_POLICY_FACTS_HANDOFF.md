@@ -1,7 +1,7 @@
 # C 승인 정책의 검증 입력 연결
 
 `GatewayPolicyFactsAssembler`는 승인 계약 출처와 요청을 기존 Field Scope,
-Cardinality, Human Boundary 검증기의 입력으로 변환한다. Spring 컴포넌트이며
+Cardinality, Human Boundary, Tool/Operation, Egress 검증기의 입력으로 변환한다. Spring 컴포넌트이며
 `ToolProposalValidator`를 주입받는다. 저장·Tool 실행·정책 판단 기록을 하지 않는다.
 
 ## 진입점과 반환 계약
@@ -12,6 +12,21 @@ Cardinality, Human Boundary 검증기의 입력으로 변환한다. Spring 컴�
 |---|---|---|
 | `customerDataRead(source, proposal)` | `ApprovedPolicySource`, B의 `ToolProposal` | `CustomerDataReadFacts`: `fieldScope()`와 `cardinality()` |
 | `humanBoundary(source, requestedTool)` | 같은 출처, 원문 Tool 이름 `String` | 기존 `PolicyHumanBoundaryFacts` |
+| `toolAuthorization(source, requestedTool, requestedOperation)` | 같은 출처, 요청 Tool 이름과 독립된 원문 operation | 기존 `PolicyToolAuthorizationFacts` |
+| `egress(source, requestedTool)` | 같은 출처, 요청 Tool 이름 | 기존 `PolicyEgressFacts` |
+
+Tool/Operation·Egress 연결에는 **adapter의 `declaredTools` 투영과 assembler의 두 진입점이
+함께 필요**하다. adapter만 갱신한 중간 단계에서는 새 진입점을 사용할 수 없다.
+`source.catalog().declaredTools()`는 검증된 동일 릴리스 snapshot의 normal Tool과 서버
+high-impact Tool을 이름순으로 보관한다. 실제 v1.1의 5개 normal Tool에 인간 전용
+`LOAN_DECISION_UPDATE`를 더한 6개이며, Tool Trust의 활성 binding은 기존 5개다.
+기존 6·7개 인자 catalog 생성자는 호환용으로 빈 선언 목록을 가지므로 두 신규 조립
+메서드에 사용할 수 없다. 조립 시 선언 이름은 semantic catalog 전체와 정확히 일치해야 한다.
+
+operation은 A의 `READ/SEARCH/CREATE/WRITE/UPDATE/POST` 선언을 그대로 투영한다.
+`sideEffectType`의 `NONE/INTERNAL_WRITE/HIGH_IMPACT_WRITE`는 INTERNAL,
+`MOCK_EXTERNAL_WRITE`는 EXTERNAL로 분류한다. 누락·잘못된 타입·알 수 없는 값은
+catalog 오류이며, trim·대소문자 변환·기본 INTERNAL 처리를 하지 않는다.
 
 `source`는 `GatewayApprovedPolicySourceService.load(runId, testCaseRunId, reviewer)`에서
 얻는다. A가 검증할 실제 `ReviewerContext`를 전달해야 한다. actor 문자열로 인증 문맥을
@@ -25,6 +40,9 @@ var customer = facts.customerDataRead(source, invocation.proposal());
 var fieldFacts = customer.fieldScope();
 var cardinalityFacts = customer.cardinality();
 var humanFacts = facts.humanBoundary(source, invocation.proposal().toolName());
+// requestedOperation은 B가 실제 요청에서 전달할 독립 입력이다. 선언 operation을 복사하지 않는다.
+var toolFacts = facts.toolAuthorization(source, invocation.proposal().toolName(), requestedOperation);
+var egressFacts = facts.egress(source, invocation.proposal().toolName());
 ```
 
 고객 조회 메서드는 `CUSTOMER_DATA_READ`만 지원한다. B의 실제 인자 검증기를 JSON
@@ -40,9 +58,22 @@ Human Boundary의 catalog는 enabled Tool과 high-impact Tool의 합집합이다
 미등록 Tool의 사실이 생성되더라도 기존 Human Boundary 검증기는 Tool 단계가 먼저
 해결되지 않은 입력을 예외로 거절하며 PASS를 반환하지 않는다.
 
+Tool/Operation은 요청 operation을 변경 없이 전달한다. 실제 `CUSTOMER_DATA_READ`의
+선언 `READ`에 대해 요청 `WRITE`, `read`, `READ `는 기존 평가기에서
+`OPERATION_NOT_ALLOWED`가 된다. null·공백 operation은 `INVALID_REQUEST`다.
+미등록 Tool은 Tool 단계에서 `TOOL_NOT_ALLOWED`이며, Egress 단계에 곧바로 넣으면
+미해결 Tool 예외가 발생한다. 인간 전용 Tool은 기존 Tool 단계의 위임 규칙을 유지하고
+Human Boundary 단계에서 `HUMAN_ONLY_ACTION`으로 판단한다.
+
+두 신규 메서드는 승인 정책의 `externalEgress.allowed`와 `allowedDestinations`를 함께
+검사한다. P0의 `false`와 빈 배열은 유효하다. true, 비어 있지 않은 목적지,
+누락·타입 오류를 허용 정책으로 보정하지 않는다. 목적지 문자열은 그대로 검사한다.
+실제 현재 catalog의 6개는 모두 INTERNAL이며, 이 결과를 외부 유출 공격 차단 증거로
+해석하면 안 된다. 실제 승인 출처에 없는 외부 Tool을 추가하지 않는다.
+
 ## 실패 전달
 
-두 메서드는 동기 호출이다. 실패하면 `FactAssemblyException`을 던지며 `code()`로
+모든 메서드는 동기 호출이다. 실패하면 `FactAssemblyException`을 던지며 `code()`로
 아래 값을 전달한다. 부분 결과·overall ALLOW·정책 DENY 응답을 반환하지 않는다.
 
 | 코드 | 원인 |
@@ -63,6 +94,12 @@ RECORD_LIMIT_EXCEEDED, HUMAN_ONLY_ACTION 및 정상 단계 PASS를 확인한다.
 출처 서비스의 단위 fixture는 A 조회를 mock한 조합 테스트이며 DB 승인·잠금 증거는
 기존 승인 출처 PostgreSQL 통합 테스트에 있다.
 
+Tool/Operation·Egress 구성 요소 검증은 실제 A 저장 Tool 메타데이터와 버전된 서버
+catalog를 사용한 승인 출처 PostgreSQL 테스트를 포함한다. 정상·불일치 operation,
+미등록 Tool, 인간 전용 위임과 INTERNAL Egress를 기존 평가기로 확인한다.
+source 조회 이후 조립은 추가 A 조회·감사·도메인 변경을 만들지 않으며, 출처 조회의
+기존 감사 2건은 유지한다. 두 신규 메서드는 B 인자 검증기나 Tool 실행기를 호출하지 않는다.
+
 이 조립은 출처와 invocation의 저장 이벤트 결합, preflight, 전체 단계 순서 또는
 실행 권한을 증명하지 않는다. `ToolInvocation.requestDigest`는 B의 저장 이벤트
 payload digest 계약을 유지해야 하며 인자 JSON hash로 새로 만들지 않는다.
@@ -70,7 +107,7 @@ payload digest 계약을 유지해야 하며 인자 JSON hash로 새로 만들�
 | 담당 | 필요한 후속 입력·연결 | 해당 입력이 없으면 남는 C 연결 |
 |---|---|---|
 | A/B | 인증된 reviewer와 Run/CaseRun에 결합된 서버 namespace·case·applicant·workflow·문서 소유 관계 | 출처 조회의 실제 진입점, Business Context/Object Scope/Workflow 사실 조합 |
-| B | 실제 요청 operation과 관찰된 registry/schema/description digest 및 trust 출처 | Tool/Operation/Egress/Trust 검증 입력 조합 |
+| B | 실제 요청 operation과 관찰된 registry/schema/description digest 및 trust 출처 | 구현된 Tool/Operation/Egress 조립기와 expected Trust 기준의 실제 Runtime 연결 |
 | B | 응답 필드 타입·분류 출처, state provenance, Agent 전달/격리 hook | 실제 응답 검증 및 격리 연결 |
 | D | 실제 실행 증거를 이용한 공격 성공·실패와 오류/비교불가 처리 | 공격 결과·Replay 지표 검증 |
 
