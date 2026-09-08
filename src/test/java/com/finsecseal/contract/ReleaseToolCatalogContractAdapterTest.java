@@ -22,6 +22,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import com.finsecseal.common.domain.Sensitivity;
 import com.finsecseal.contract.ReleaseToolCatalogContractAdapter.CatalogAdapterException;
 import com.finsecseal.contract.ReleaseToolCatalogContractAdapter.FailureCode;
 import com.finsecseal.contract.ReleaseToolCatalogContractAdapter.SourceBoundCatalog;
@@ -29,8 +30,14 @@ import com.finsecseal.contract.SafetyContractSemanticValidator.EnabledTool;
 import com.finsecseal.contract.SafetyContractSemanticValidator.Issue;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ValidationResult;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ValidationStatus;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.CatalogOutputField;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.OutputValueType;
+import com.finsecseal.policy.PolicyToolAuthorizationFacts.CatalogTool;
+import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
+import com.finsecseal.release.FingerprintService;
+import com.finsecseal.release.LoanReviewToolCatalog;
 import com.finsecseal.release.ReleaseDto.ToolCatalogResponse;
 import com.finsecseal.release.ReleaseService;
 import java.io.IOException;
@@ -38,11 +45,14 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -69,6 +79,7 @@ class ReleaseToolCatalogContractAdapterTest {
     private ObjectMapper objectMapper;
     private CanonicalJsonService canonicalJsonService;
     private DigestService digestService;
+    private FingerprintService roleAFingerprints;
     private SafetyContractSemanticValidator semanticValidator;
 
     @BeforeEach
@@ -76,6 +87,7 @@ class ReleaseToolCatalogContractAdapterTest {
         objectMapper = new ObjectMapper();
         canonicalJsonService = new CanonicalJsonService(objectMapper);
         digestService = new DigestService();
+        roleAFingerprints = new FingerprintService(canonicalJsonService, digestService, objectMapper);
         semanticValidator = new SafetyContractSemanticValidator(
                 new SafetyContractSchemaValidator()
         );
@@ -107,8 +119,41 @@ class ReleaseToolCatalogContractAdapterTest {
                 );
         assertThat(enabledTool(result, "CUSTOMER_DATA_READ").outputFields())
                 .containsExactly("accountNumber", "employmentStatus", "incomeBand");
+        assertThat(result.customerOutputFields()).containsExactlyElementsOf(expectedCustomerOutputFields());
+        assertThat(result.customerOutputFields()).extracting(CatalogOutputField::fieldName)
+                .doesNotContain("customerId");
         assertThat(result.semanticCatalog().highImpactToolNames())
                 .containsExactly("LOAN_DECISION_UPDATE");
+        assertThat(result.releaseToolBindings())
+                .extracting(ReleaseToolBinding::toolName)
+                .containsExactly(
+                        "CASE_CONTEXT_READ",
+                        "CUSTOMER_DATA_READ",
+                        "DOCUMENT_READER",
+                        "LOAN_POLICY_SEARCH",
+                        "REVIEW_NOTE_WRITE"
+                );
+        for (ReleaseToolBinding binding : result.releaseToolBindings()) {
+            ObjectNode sourceTool = tool(manifest.path("tools"), binding.toolName());
+            assertThat(binding.version()).isEqualTo(sourceTool.path("version").stringValue());
+            assertThat(binding.enabled()).isTrue();
+            assertThat(binding.schemaDigest()).isEqualTo(roleASchemaHash(sourceTool));
+            assertThat(binding.descriptionDigest()).isEqualTo(roleADescriptionHash(sourceTool));
+        }
+        assertThat(result.declaredTools()).containsExactly(
+                new CatalogTool("CASE_CONTEXT_READ", "READ", false),
+                new CatalogTool("CUSTOMER_DATA_READ", "READ", false),
+                new CatalogTool("DOCUMENT_READER", "READ", false),
+                new CatalogTool("LOAN_DECISION_UPDATE", "UPDATE", false),
+                new CatalogTool("LOAN_POLICY_SEARCH", "SEARCH", false),
+                new CatalogTool("REVIEW_NOTE_WRITE", "CREATE", false)
+        );
+        assertThat(result.releaseToolBindings()).extracting(ReleaseToolBinding::toolName)
+                .doesNotContain("LOAN_DECISION_UPDATE");
+        assertThat(result.inputSchemas()).containsOnlyKeys(
+                "CASE_CONTEXT_READ", "CUSTOMER_DATA_READ", "DOCUMENT_READER",
+                "LOAN_DECISION_UPDATE", "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE");
+        assertThat(result.inputSchemas()).isEqualTo(expectedInputSchemas());
         assertThat(semanticValidator.validate(
                 fixture("loan-review-safety-contract.json"),
                 result.semanticCatalog()
@@ -213,6 +258,8 @@ class ReleaseToolCatalogContractAdapterTest {
         ));
         assertThat(enabledTool(source, "CUSTOMER_DATA_READ").outputFields())
                 .contains("accountNumber");
+        assertThat(source.customerOutputFields())
+                .contains(new CatalogOutputField("accountNumber", Sensitivity.FINANCIAL, OutputValueType.STRING));
         ObjectNode contract = fixture("loan-review-safety-contract.json");
         ((ArrayNode) contract.at("/fieldPolicy/CUSTOMER_DATA_READ/allowed"))
                 .add("accountNumber");
@@ -256,6 +303,9 @@ class ReleaseToolCatalogContractAdapterTest {
         assertThat(enabledTool(result, "DOCUMENT_READER").outputFields())
                 .contains("documentTopLevelField")
                 .doesNotContain("nestedDecoy");
+        assertThat(result.customerOutputFields()).containsExactlyElementsOf(expectedCustomerOutputFields());
+        assertThat(result.customerOutputFields()).extracting(CatalogOutputField::fieldName)
+                .doesNotContain("customerId", "customerTopLevelDecoy", "customerInputDecoy", "documentTopLevelField");
     }
 
     @Test
@@ -290,11 +340,40 @@ class ReleaseToolCatalogContractAdapterTest {
 
         SourceBoundCatalog result = load(source);
         SourceBoundCatalog beforeMutation = result;
+        List<ReleaseToolBinding> bindingsBeforeMutation = List.copyOf(result.releaseToolBindings());
+        List<CatalogTool> declarationsBeforeMutation = List.copyOf(result.declaredTools());
+        List<CatalogOutputField> outputFieldsBeforeMutation = List.copyOf(result.customerOutputFields());
+        Map<String, JsonNode> inputSchemasBeforeMutation = expectedInputSchemas();
+        ((ObjectNode) customerFields(manifest).path("incomeBand")).put("type", "integer");
+        customerFields(manifest).removeAll();
+        tool(tools, "CUSTOMER_DATA_READ").put("description", RAW_SENTINEL);
+        tool(tools, "CUSTOMER_DATA_READ").put("version", "2.0.0");
+        tool(tools, "CUSTOMER_DATA_READ").put("operation", "POST");
+        tool(tools, "CUSTOMER_DATA_READ").put("sideEffectType", "MOCK_EXTERNAL_WRITE");
+        ((ObjectNode) serverCatalog.at("/tools/0")).put("operation", "READ");
+        ((ObjectNode) serverCatalog.at("/tools/0")).put("sideEffectType", "MOCK_EXTERNAL_WRITE");
+        ((ObjectNode) tool(tools, "CUSTOMER_DATA_READ").path("inputSchema")).removeAll();
+        ((ArrayNode) serverCatalog.at("/tools/0/inputSchema/properties/decision/enum")).add(RAW_SENTINEL);
         tools.removeAll();
         serverCatalog.removeAll();
 
         assertThat(result).isEqualTo(beforeMutation);
         assertThat(result.semanticCatalog().enabledReleaseTools()).hasSize(5);
+        assertThat(result.releaseToolBindings()).containsExactlyElementsOf(bindingsBeforeMutation);
+        assertThat(result.releaseToolBindings()).hasSize(5);
+        assertThat(result.declaredTools()).containsExactlyElementsOf(declarationsBeforeMutation);
+        assertThat(result.declaredTools()).hasSize(6);
+        assertThat(result.customerOutputFields()).containsExactlyElementsOf(outputFieldsBeforeMutation)
+                .containsExactlyElementsOf(expectedCustomerOutputFields());
+        assertThat(result.inputSchemas()).isEqualTo(inputSchemasBeforeMutation);
+        assertThatThrownBy(() -> result.inputSchemas().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> result.customerOutputFields().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> result.declaredTools().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> result.releaseToolBindings().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
         assertThat(result.semanticCatalog().highImpactToolNames())
                 .containsExactly("LOAN_DECISION_UPDATE");
         assertThatThrownBy(() -> result.semanticCatalog().enabledReleaseTools()
@@ -346,8 +425,12 @@ class ReleaseToolCatalogContractAdapterTest {
         ));
 
         assertThat(second).isEqualTo(first);
+        assertThat(second.customerOutputFields()).containsExactlyElementsOf(expectedCustomerOutputFields());
         assertThat(second.semanticCatalog().highImpactToolNames())
                 .containsExactly("ACCOUNT_OVERRIDE", "LOAN_DECISION_UPDATE");
+        assertThat(second.declaredTools()).extracting(CatalogTool::name)
+                .containsExactly("ACCOUNT_OVERRIDE", "CASE_CONTEXT_READ", "CUSTOMER_DATA_READ", "DOCUMENT_READER",
+                        "LOAN_DECISION_UPDATE", "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE");
     }
 
     @Test
@@ -365,6 +448,469 @@ class ReleaseToolCatalogContractAdapterTest {
         assertThat(second).isEqualTo(first);
         verify(releases, times(2)).toolCatalog(RELEASE_ID, ACTOR_ID);
         verifyNoMoreInteractions(releases);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"inputSchema", "outputSchema", "description"})
+    void tcGw008ExpectedBindingDetectsEachIndependentSourceChange(String field)
+            throws IOException {
+        ObjectNode baselineManifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode changedManifest = baselineManifest.deepCopy();
+        ObjectNode changedTool = tool(changedManifest.path("tools"), "CUSTOMER_DATA_READ");
+        if (field.equals("description")) {
+            changedTool.put(field, "Changed synthetic customer lookup description");
+        } else {
+            ((ObjectNode) changedTool.path(field)).put("title", "Changed schema annotation");
+        }
+
+        SourceBoundCatalog baseline = load(authoritativeSource(baselineManifest));
+        SourceBoundCatalog changed = load(authoritativeSource(changedManifest));
+        ReleaseToolBinding before = binding(baseline, "CUSTOMER_DATA_READ");
+        ReleaseToolBinding after = binding(changed, "CUSTOMER_DATA_READ");
+
+        assertThat(after.schemaDigest()).isEqualTo(roleASchemaHash(changedTool));
+        assertThat(after.descriptionDigest()).isEqualTo(roleADescriptionHash(changedTool));
+        if (field.equals("description")) {
+            assertThat(after.descriptionDigest()).isNotEqualTo(before.descriptionDigest());
+            assertThat(after.schemaDigest()).isEqualTo(before.schemaDigest());
+        } else {
+            assertThat(after.schemaDigest()).isNotEqualTo(before.schemaDigest());
+            assertThat(after.descriptionDigest()).isEqualTo(before.descriptionDigest());
+        }
+        assertThat(changed.releaseToolBindings().stream()
+                .filter(value -> !value.toolName().equals("CUSTOMER_DATA_READ")).toList())
+                .containsExactlyElementsOf(baseline.releaseToolBindings().stream()
+                        .filter(value -> !value.toolName().equals("CUSTOMER_DATA_READ")).toList());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"inputSchema", "outputSchema"})
+    void expectedSchemaDigestPreservesNonVacuousArrayOrder(String field) throws IOException {
+        ObjectNode firstManifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode secondManifest = firstManifest.deepCopy();
+        ObjectNode changedTool = tool(secondManifest.path("tools"), "CUSTOMER_DATA_READ");
+        ArrayNode required = (ArrayNode) changedTool.path(field).path("required");
+        assertThat(required.size()).isGreaterThan(1);
+        reverse(required);
+
+        ReleaseToolBinding first = binding(load(authoritativeSource(firstManifest)), "CUSTOMER_DATA_READ");
+        ReleaseToolBinding second = binding(load(authoritativeSource(secondManifest)), "CUSTOMER_DATA_READ");
+
+        assertThat(second.schemaDigest()).isEqualTo(roleASchemaHash(changedTool))
+                .isNotEqualTo(first.schemaDigest());
+        assertThat(second.descriptionDigest()).isEqualTo(first.descriptionDigest());
+    }
+
+    @Test
+    void normalizesEquivalentUnicodeAndLineEndingsWithoutMutatingSourceStrings()
+            throws IOException {
+        ObjectNode firstManifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode secondManifest = firstManifest.deepCopy();
+        ObjectNode firstTool = tool(firstManifest.path("tools"), "CUSTOMER_DATA_READ");
+        ObjectNode secondTool = tool(secondManifest.path("tools"), "CUSTOMER_DATA_READ");
+        firstTool.put("description", "Caf\u00e9\nsecond\nthird");
+        secondTool.put("description", "Cafe\u0301\r\nsecond\rthird");
+        for (String field : List.of("inputSchema", "outputSchema")) {
+            ((ObjectNode) firstTool.path(field)).put("title", "Caf\u00e9\nvalue");
+            ((ObjectNode) secondTool.path(field)).put("title", "Cafe\u0301\r\nvalue");
+        }
+        ObjectNode firstOriginal = firstManifest.deepCopy();
+        ObjectNode secondOriginal = secondManifest.deepCopy();
+
+        ReleaseToolBinding first = binding(load(authoritativeSource(firstManifest)), "CUSTOMER_DATA_READ");
+        ReleaseToolBinding second = binding(load(authoritativeSource(secondManifest)), "CUSTOMER_DATA_READ");
+
+        assertThat(second).isEqualTo(first);
+        assertThat(second.schemaDigest()).isEqualTo(roleASchemaHash(secondTool));
+        assertThat(second.descriptionDigest()).isEqualTo(roleADescriptionHash(secondTool));
+        assertThat(firstManifest).isEqualTo(firstOriginal);
+        assertThat(secondManifest).isEqualTo(secondOriginal);
+        assertThat(secondTool.path("description").stringValue())
+                .isEqualTo("Cafe\u0301\r\nsecond\rthird");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"inputSchema", "outputSchema", "description"})
+    void meaningfulStringWhitespaceRemainsPartOfExpectedDigest(String field) throws IOException {
+        ObjectNode firstManifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode secondManifest = firstManifest.deepCopy();
+        ObjectNode firstTool = tool(firstManifest.path("tools"), "CUSTOMER_DATA_READ");
+        ObjectNode secondTool = tool(secondManifest.path("tools"), "CUSTOMER_DATA_READ");
+        if (field.equals("description")) {
+            firstTool.put(field, "Synthetic value");
+            secondTool.put(field, "  Synthetic value  ");
+        } else {
+            ((ObjectNode) firstTool.path(field)).put("title", "Synthetic value");
+            ((ObjectNode) secondTool.path(field)).put("title", "  Synthetic value  ");
+        }
+        ObjectNode original = secondManifest.deepCopy();
+
+        ReleaseToolBinding first = binding(load(authoritativeSource(firstManifest)), "CUSTOMER_DATA_READ");
+        ReleaseToolBinding second = binding(load(authoritativeSource(secondManifest)), "CUSTOMER_DATA_READ");
+
+        assertThat(secondManifest).isEqualTo(original);
+        assertThat(second.schemaDigest()).isEqualTo(roleASchemaHash(secondTool));
+        assertThat(second.descriptionDigest()).isEqualTo(roleADescriptionHash(secondTool));
+        if (field.equals("description")) {
+            assertThat(second.descriptionDigest()).isNotEqualTo(first.descriptionDigest());
+            assertThat(second.schemaDigest()).isEqualTo(first.schemaDigest());
+        } else {
+            assertThat(second.schemaDigest()).isNotEqualTo(first.schemaDigest());
+            assertThat(second.descriptionDigest()).isEqualTo(first.descriptionDigest());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"inputSchema", "outputSchema"})
+    void expectedSchemaHashNormalizesNonCollidingObjectKeys(String field) throws IOException {
+        ObjectNode firstManifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode secondManifest = firstManifest.deepCopy();
+        ObjectNode firstTool = tool(firstManifest.path("tools"), "CUSTOMER_DATA_READ");
+        ObjectNode secondTool = tool(secondManifest.path("tools"), "CUSTOMER_DATA_READ");
+        ((ObjectNode) firstTool.path(field)).put("Caf\u00e9", "value");
+        ((ObjectNode) secondTool.path(field)).put("Cafe\u0301", "value");
+        reverseProperties((ObjectNode) secondTool.path(field));
+
+        ReleaseToolBinding first = binding(load(authoritativeSource(firstManifest)), "CUSTOMER_DATA_READ");
+        ReleaseToolBinding second = binding(load(authoritativeSource(secondManifest)), "CUSTOMER_DATA_READ");
+
+        assertThat(second).isEqualTo(first);
+        assertThat(second.schemaDigest()).isEqualTo(roleASchemaHash(secondTool));
+        assertThat(secondTool.path(field).has("Cafe\u0301")).isTrue();
+        assertThat(secondTool.path(field).has("Caf\u00e9")).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"inputSchema", "outputSchema"})
+    void rejectsSchemaObjectKeyNormalizationCollisionWithSafeFailure(String field)
+            throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode schema = (ObjectNode) tool(manifest.path("tools"), "CUSTOMER_DATA_READ").path(field);
+        schema.put("Caf\u00e9", RAW_SENTINEL);
+        schema.put("Cafe\u0301", "other");
+
+        assertSafeFailure(failureFor(authoritativeSource(manifest)), INVALID_ENABLED_TOOL_CATALOG);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"version", "description", "inputSchema", "outputSchema"})
+    void rejectsMissingTrustBindingMetadata(String field) throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        tool(manifest.path("tools"), "CUSTOMER_DATA_READ").remove(field);
+
+        assertSafeFailure(failureFor(authoritativeSource(manifest)), INVALID_ENABLED_TOOL_CATALOG);
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidTrustBindingMetadata")
+    void rejectsMalformedTrustBindingMetadataWithoutFallback(String field, String valueJson)
+            throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        tool(manifest.path("tools"), "CUSTOMER_DATA_READ")
+                .set(field, objectMapper.readTree(valueJson));
+
+        assertSafeFailure(failureFor(authoritativeSource(manifest)), INVALID_ENABLED_TOOL_CATALOG);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {" 1.1.0", "1.1.0 ", "\t1.1.0", "1.1.0\n"})
+    void rejectsPaddedVersionsInsteadOfChangingTheirIdentity(String version) throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        tool(manifest.path("tools"), "CUSTOMER_DATA_READ").put("version", version);
+
+        assertSafeFailure(failureFor(authoritativeSource(manifest)), INVALID_ENABLED_TOOL_CATALOG);
+    }
+
+    @Test
+    void preservesExactDeclaredPrereleaseVersion() throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode customer = tool(manifest.path("tools"), "CUSTOMER_DATA_READ");
+        customer.put("version", "2.1.3-preview.4");
+
+        ReleaseToolBinding result = binding(load(authoritativeSource(manifest)), "CUSTOMER_DATA_READ");
+
+        assertThat(result.version()).isEqualTo("2.1.3-preview.4");
+        assertThat(result.schemaDigest()).isEqualTo(roleASchemaHash(customer));
+        assertThat(result.descriptionDigest()).isEqualTo(roleADescriptionHash(customer));
+    }
+
+    @Test
+    void extendedConstructorSnapshotsBindingsAndDoesNotExposeMutableCollection()
+            throws IOException {
+        SourceBoundCatalog actual = load(authoritativeSource(fixture("valid-release-manifest-v1.1.json")));
+        List<ReleaseToolBinding> supplied = new ArrayList<>(actual.releaseToolBindings());
+        SourceBoundCatalog copy = new SourceBoundCatalog(
+                actual.releaseId(), actual.manifestSchemaVersion(), actual.agentArtifactFingerprint(),
+                actual.releaseFingerprint(), actual.serverToolCatalogHash(), actual.semanticCatalog(), supplied
+        );
+        supplied.clear();
+
+        assertThat(copy.releaseToolBindings()).containsExactlyElementsOf(actual.releaseToolBindings());
+        assertThat(copy.declaredTools()).isEmpty();
+        assertThat(copy.customerOutputFields()).isEmpty();
+        assertThat(copy.inputSchemas()).isEmpty();
+        assertThatThrownBy(() -> copy.customerOutputFields().add(actual.customerOutputFields().getFirst()))
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> copy.declaredTools().add(actual.declaredTools().getFirst()))
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> copy.releaseToolBindings().add(actual.releaseToolBindings().getFirst()))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void sixArgumentConstructorRetainsSemanticOnlyCompatibilityWithoutTrustDefaults()
+            throws IOException {
+        SourceBoundCatalog actual = load(authoritativeSource(fixture("valid-release-manifest-v1.1.json")));
+        SourceBoundCatalog semanticOnly = new SourceBoundCatalog(
+                actual.releaseId(), actual.manifestSchemaVersion(), actual.agentArtifactFingerprint(),
+                actual.releaseFingerprint(), actual.serverToolCatalogHash(), actual.semanticCatalog()
+        );
+
+        assertThat(semanticOnly.releaseToolBindings()).isEmpty();
+        assertThat(semanticOnly.declaredTools()).isEmpty();
+        assertThat(semanticOnly.customerOutputFields()).isEmpty();
+        assertThat(semanticOnly.inputSchemas()).isEmpty();
+        assertThat(semanticOnly.semanticCatalog()).isEqualTo(actual.semanticCatalog());
+        assertThat(semanticValidator.validate(fixture("loan-review-safety-contract.json"),
+                semanticOnly.semanticCatalog()).status()).isEqualTo(ValidationStatus.VALID);
+        assertThatThrownBy(() -> semanticOnly.releaseToolBindings().add(actual.releaseToolBindings().getFirst()))
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> semanticOnly.customerOutputFields().add(actual.customerOutputFields().getFirst()))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void eightArgumentConstructorSnapshotsDeclarationsWithoutChangingPriorInputs() throws IOException {
+        SourceBoundCatalog actual = load(authoritativeSource(fixture("valid-release-manifest-v1.1.json")));
+        List<CatalogTool> declarations = new ArrayList<>(actual.declaredTools());
+        List<ReleaseToolBinding> bindings = new ArrayList<>(actual.releaseToolBindings());
+        SourceBoundCatalog copy = new SourceBoundCatalog(
+                actual.releaseId(), actual.manifestSchemaVersion(), actual.agentArtifactFingerprint(),
+                actual.releaseFingerprint(), actual.serverToolCatalogHash(), actual.semanticCatalog(),
+                bindings, declarations
+        );
+        declarations.clear();
+        bindings.clear();
+
+        assertThat(copy.releaseId()).isEqualTo(actual.releaseId());
+        assertThat(copy.manifestSchemaVersion()).isEqualTo(actual.manifestSchemaVersion());
+        assertThat(copy.agentArtifactFingerprint()).isEqualTo(actual.agentArtifactFingerprint());
+        assertThat(copy.releaseFingerprint()).isEqualTo(actual.releaseFingerprint());
+        assertThat(copy.serverToolCatalogHash()).isEqualTo(actual.serverToolCatalogHash());
+        assertThat(copy.semanticCatalog()).isEqualTo(actual.semanticCatalog());
+        assertThat(copy.declaredTools()).containsExactlyElementsOf(actual.declaredTools()).hasSize(6);
+        assertThat(copy.releaseToolBindings()).containsExactlyElementsOf(actual.releaseToolBindings()).hasSize(5);
+        assertThat(copy.customerOutputFields()).isEmpty();
+        assertThat(copy.inputSchemas()).isEmpty();
+        assertThat(semanticValidator.validate(fixture("loan-review-safety-contract.json"),
+                copy.semanticCatalog()).status()).isEqualTo(ValidationStatus.VALID);
+        assertThatThrownBy(() -> copy.declaredTools().add(new CatalogTool("EXTRA_TOOL", "READ", false)))
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> copy.customerOutputFields().add(actual.customerOutputFields().getFirst()))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void ninthArgumentConstructorSnapshotsCustomerMetadataAndPreservesPriorComponents() throws IOException {
+        SourceBoundCatalog actual = load(authoritativeSource(fixture("valid-release-manifest-v1.1.json")));
+        List<CatalogOutputField> metadata = new ArrayList<>(actual.customerOutputFields());
+        SourceBoundCatalog copy = new SourceBoundCatalog(
+                actual.releaseId(), actual.manifestSchemaVersion(), actual.agentArtifactFingerprint(),
+                actual.releaseFingerprint(), actual.serverToolCatalogHash(), actual.semanticCatalog(),
+                actual.releaseToolBindings(), actual.declaredTools(), metadata
+        );
+        metadata.set(0, new CatalogOutputField("accountNumber", Sensitivity.NORMAL, OutputValueType.INTEGER));
+        metadata.clear();
+
+        assertThat(copy.releaseId()).isEqualTo(actual.releaseId());
+        assertThat(copy.manifestSchemaVersion()).isEqualTo(actual.manifestSchemaVersion());
+        assertThat(copy.agentArtifactFingerprint()).isEqualTo(actual.agentArtifactFingerprint());
+        assertThat(copy.releaseFingerprint()).isEqualTo(actual.releaseFingerprint());
+        assertThat(copy.serverToolCatalogHash()).isEqualTo(actual.serverToolCatalogHash());
+        assertThat(copy.semanticCatalog()).isEqualTo(actual.semanticCatalog());
+        assertThat(copy.releaseToolBindings()).containsExactlyElementsOf(actual.releaseToolBindings());
+        assertThat(copy.declaredTools()).containsExactlyElementsOf(actual.declaredTools());
+        assertThat(copy.customerOutputFields()).containsExactlyElementsOf(expectedCustomerOutputFields());
+        assertThat(copy.inputSchemas()).isEmpty();
+        assertThatThrownBy(() -> copy.customerOutputFields().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void tenthArgumentConstructorAndAccessorIsolateNestedInputSchemas() throws IOException {
+        SourceBoundCatalog actual = load(authoritativeSource(fixture("valid-release-manifest-v1.1.json")));
+        Map<String, JsonNode> expected = expectedInputSchemas();
+        Map<String, JsonNode> supplied = new TreeMap<>(actual.inputSchemas());
+        SourceBoundCatalog copy = new SourceBoundCatalog(
+                actual.releaseId(), actual.manifestSchemaVersion(), actual.agentArtifactFingerprint(),
+                actual.releaseFingerprint(), actual.serverToolCatalogHash(), actual.semanticCatalog(),
+                actual.releaseToolBindings(), actual.declaredTools(), actual.customerOutputFields(), supplied
+        );
+        assertThat(copy).isEqualTo(actual);
+
+        ((ObjectNode) supplied.get("CUSTOMER_DATA_READ").at("/properties/customerIds/items")).put("minLength", 99);
+        ((ArrayNode) supplied.get("LOAN_DECISION_UPDATE").at("/properties/decision/enum")).add(RAW_SENTINEL);
+        supplied.put("EXTRA_TOOL", objectMapper.createObjectNode());
+        supplied.clear();
+
+        assertThat(copy.inputSchemas()).isEqualTo(expected);
+        Map<String, JsonNode> returned = copy.inputSchemas();
+        assertThat(copy.inputSchemas()).isNotSameAs(returned);
+        assertThat(copy.inputSchemas().get("CUSTOMER_DATA_READ"))
+                .isNotSameAs(returned.get("CUSTOMER_DATA_READ"));
+        ((ObjectNode) returned.get("CUSTOMER_DATA_READ").at("/properties/customerIds/items"))
+                .put("description", RAW_SENTINEL);
+        ((ArrayNode) returned.get("CUSTOMER_DATA_READ").path("required")).removeAll();
+        ((ArrayNode) returned.get("LOAN_DECISION_UPDATE").at("/properties/decision/enum")).removeAll();
+        ((ObjectNode) returned.get("DOCUMENT_READER")).removeAll();
+        assertThatThrownBy(returned::clear).isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> copy.inputSchemas().put("EXTRA_TOOL", objectMapper.createObjectNode()))
+                .isInstanceOf(UnsupportedOperationException.class);
+
+        assertThat(copy.inputSchemas()).isEqualTo(expected);
+        assertThat(actual.inputSchemas()).isEqualTo(expected);
+        assertThat(copy).isEqualTo(actual);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "null", "[]", "42", "true", "\"RAW-CATALOG-SENTINEL-DO-NOT-EXPOSE\""})
+    void rejectsMissingOrNonObjectHumanInputSchemaWithoutUsingNormalToolFallback(String value) throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode serverCatalog = copiedServerCatalog(manifest);
+        ObjectNode humanTool = (ObjectNode) serverCatalog.at("/tools/0");
+        if ("missing".equals(value)) {
+            humanTool.remove("inputSchema");
+        } else {
+            humanTool.set("inputSchema", objectMapper.readTree(value));
+        }
+
+        // Recompute the A hash so this exercises the schema carrier, not the existing hash guard.
+        assertSafeFailure(failureFor(sourceWithServerCatalog(manifest, serverCatalog)), INVALID_HIGH_IMPACT_CATALOG);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"string", "integer"})
+    void syntheticCustomerSchemaTypeComesFromTheSelectedSnapshot(String schemaType) throws IOException {
+        // INTEGER exercises the supported conversion only; A's actual v1.1 customer fields are STRING.
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode customer = tool(manifest.path("tools"), "CUSTOMER_DATA_READ");
+        ((ObjectNode) customerFields(manifest).path("incomeBand")).put("type", schemaType);
+        ObjectNode before = manifest.deepCopy();
+
+        SourceBoundCatalog result = load(authoritativeSource(manifest));
+
+        assertThat(result.customerOutputFields()).containsExactly(
+                new CatalogOutputField("accountNumber", Sensitivity.FINANCIAL, OutputValueType.STRING),
+                new CatalogOutputField("employmentStatus", Sensitivity.NORMAL, OutputValueType.STRING),
+                new CatalogOutputField("incomeBand", Sensitivity.FINANCIAL,
+                        "integer".equals(schemaType) ? OutputValueType.INTEGER : OutputValueType.STRING)
+        );
+        assertThat(binding(result, "CUSTOMER_DATA_READ").schemaDigest()).isEqualTo(roleASchemaHash(customer));
+        assertThat(manifest).isEqualTo(before);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"field-missing", "field-null", "field-array", "field-string", "field-boolean",
+            "field-number", "type-missing", "type-null", "type-array", "type-boolean", "type-number",
+            "type-object", "type-empty", "type-blank", "type-padded", "type-uppercase", "type-number-name",
+            "type-object-name", "type-unknown"})
+    void missingOrMalformedCustomerFieldMetadataNeverGetsATypeDefault(String problem) throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode properties = customerFields(manifest);
+        ObjectNode selected = (ObjectNode) properties.path("incomeBand");
+        switch (problem) {
+            case "field-missing" -> properties.remove("incomeBand");
+            case "field-null" -> properties.putNull("incomeBand");
+            case "field-array" -> properties.putArray("incomeBand");
+            case "field-string" -> properties.put("incomeBand", RAW_SENTINEL);
+            case "field-boolean" -> properties.put("incomeBand", true);
+            case "field-number" -> properties.put("incomeBand", 42);
+            case "type-missing" -> selected.remove("type");
+            case "type-null" -> selected.putNull("type");
+            case "type-array" -> selected.putArray("type").add("string");
+            case "type-boolean" -> selected.put("type", true);
+            case "type-number" -> selected.put("type", 42);
+            case "type-object" -> selected.putObject("type");
+            case "type-empty" -> selected.put("type", "");
+            case "type-blank" -> selected.put("type", " ");
+            case "type-padded" -> selected.put("type", "string ");
+            case "type-uppercase" -> selected.put("type", "STRING");
+            case "type-number-name" -> selected.put("type", "number");
+            case "type-object-name" -> selected.put("type", "object");
+            case "type-unknown" -> selected.put("type", RAW_SENTINEL);
+            default -> throw new IllegalArgumentException(problem);
+        }
+        ObjectNode before = manifest.deepCopy();
+
+        assertSafeFailure(failureFor(authoritativeSource(manifest)), INVALID_ENABLED_TOOL_CATALOG);
+        assertThat(manifest).isEqualTo(before);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"customerId", "creditScoreBand", "IncomeBand", RAW_SENTINEL})
+    void unknownCustomerFieldsNeverReceiveAnInferredClassification(String field) throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        customerFields(manifest).putObject(field).put("type", "string");
+
+        assertSafeFailure(failureFor(authoritativeSource(manifest)), INVALID_ENABLED_TOOL_CATALOG);
+    }
+
+    @ParameterizedTest
+    @MethodSource("supportedDeclaredOperations")
+    void syntheticCatalogProjectionPreservesEverySupportedOperation(boolean server, String operation)
+            throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode selected = declarationTool(manifest, server);
+        selected.put("operation", operation);
+        ObjectNode original = manifest.deepCopy();
+
+        SourceBoundCatalog result = load(declarationSource(manifest, server));
+
+        assertThat(declaredTool(result, selected.path("name").stringValue()).operation()).isEqualTo(operation);
+        assertThat(manifest).isEqualTo(original);
+        assertThat(result.releaseToolBindings()).hasSize(5)
+                .extracting(ReleaseToolBinding::toolName).doesNotContain("LOAN_DECISION_UPDATE");
+    }
+
+    @ParameterizedTest
+    @MethodSource("supportedDeclaredSideEffects")
+    void syntheticSideEffectMappingDoesNotCreateAnObservedExternalInvocation(
+            boolean server, String sideEffect, boolean external) throws IOException {
+        // A source double exercises mapping only. This does not add an actual approved EXTERNAL_HTTP Tool.
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode selected = declarationTool(manifest, server);
+        selected.put("sideEffectType", sideEffect);
+        ObjectNode original = manifest.deepCopy();
+
+        SourceBoundCatalog result = load(declarationSource(manifest, server));
+
+        CatalogTool declaration = declaredTool(result, selected.path("name").stringValue());
+        assertThat(declaration.externalEgressTool()).isEqualTo(external);
+        assertThat(declaration.operation()).isEqualTo(selected.path("operation").stringValue());
+        assertThat(result.declaredTools()).hasSize(6)
+                .extracting(CatalogTool::name).doesNotContain("EXTERNAL_HTTP");
+        assertThat(manifest).isEqualTo(original);
+    }
+
+    @ParameterizedTest
+    @MethodSource("declaredMetadataLocations")
+    void rejectsMissingDeclaredMetadataInItsOwningCatalog(boolean server, String field) throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        declarationTool(manifest, server).remove(field);
+
+        assertSafeFailure(failureFor(declarationSource(manifest, server)),
+                server ? INVALID_HIGH_IMPACT_CATALOG : INVALID_ENABLED_TOOL_CATALOG);
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidDeclaredMetadata")
+    void rejectsInvalidDeclaredMetadataWithoutNormalizationOrInternalFallback(
+            boolean server, String field, String valueJson) throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        declarationTool(manifest, server).set(field, objectMapper.readTree(valueJson));
+
+        assertSafeFailure(failureFor(declarationSource(manifest, server)),
+                server ? INVALID_HIGH_IMPACT_CATALOG : INVALID_ENABLED_TOOL_CATALOG);
     }
 
     @Test
@@ -791,6 +1337,30 @@ class ReleaseToolCatalogContractAdapterTest {
         );
     }
 
+    private ObjectNode customerFields(ObjectNode manifest) {
+        return (ObjectNode) tool(manifest.path("tools"), "CUSTOMER_DATA_READ")
+                .at("/outputSchema/properties/rows/items/properties/fields/properties");
+    }
+
+    private static Map<String, JsonNode> expectedInputSchemas() {
+        Map<String, JsonNode> schemas = new TreeMap<>();
+        for (JsonNode tool : LoanReviewToolCatalog.normalTools()) {
+            schemas.put(tool.path("name").stringValue(), tool.path("inputSchema").deepCopy());
+        }
+        for (JsonNode tool : LoanReviewToolCatalog.serverToolCatalog().path("tools")) {
+            schemas.put(tool.path("name").stringValue(), tool.path("inputSchema").deepCopy());
+        }
+        return schemas;
+    }
+
+    private static List<CatalogOutputField> expectedCustomerOutputFields() {
+        return List.of(
+                new CatalogOutputField("accountNumber", Sensitivity.FINANCIAL, OutputValueType.STRING),
+                new CatalogOutputField("employmentStatus", Sensitivity.NORMAL, OutputValueType.STRING),
+                new CatalogOutputField("incomeBand", Sensitivity.FINANCIAL, OutputValueType.STRING)
+        );
+    }
+
     private SourceBoundCatalog load(ToolCatalogResponse source) {
         ReleaseService releases = mock(ReleaseService.class);
         when(releases.toolCatalog(RELEASE_ID, ACTOR_ID)).thenReturn(source);
@@ -903,6 +1473,45 @@ class ReleaseToolCatalogContractAdapterTest {
         return digestService.sha256(canonicalJsonService.canonicalize(normalized));
     }
 
+    // Role A's public hash path and the wrappers stored by ReleaseCatalogWriter are the oracle.
+    private String roleASchemaHash(JsonNode sourceTool) {
+        ObjectNode schemas = objectMapper.createObjectNode();
+        schemas.set("inputSchema", sourceTool.path("inputSchema").deepCopy());
+        schemas.set("outputSchema", sourceTool.path("outputSchema").deepCopy());
+        return roleAFingerprints.hash(schemas);
+    }
+
+    private String roleADescriptionHash(JsonNode sourceTool) {
+        ObjectNode description = objectMapper.createObjectNode();
+        description.put("description", sourceTool.path("description").stringValue());
+        return roleAFingerprints.hash(description);
+    }
+
+    private ReleaseToolBinding binding(SourceBoundCatalog source, String toolName) {
+        return source.releaseToolBindings().stream()
+                .filter(value -> value.toolName().equals(toolName))
+                .findFirst()
+                .orElseThrow();
+    }
+
+    private CatalogTool declaredTool(SourceBoundCatalog source, String name) {
+        return source.declaredTools().stream()
+                .filter(value -> value.name().equals(name))
+                .findFirst()
+                .orElseThrow();
+    }
+
+    private ObjectNode declarationTool(ObjectNode manifest, boolean server) {
+        return server ? (ObjectNode) manifest.at("/serverToolCatalog/tools/0")
+                : tool(manifest.path("tools"), "CUSTOMER_DATA_READ");
+    }
+
+    private ToolCatalogResponse declarationSource(ObjectNode manifest, boolean server) {
+        // Rebind the changed server catalog hash so its metadata, rather than a stale hash, is tested.
+        return server ? sourceWithServerCatalog(manifest, manifest.path("serverToolCatalog"))
+                : authoritativeSource(manifest);
+    }
+
     private ArrayNode copiedTools(ObjectNode manifest) {
         return (ArrayNode) manifest.path("tools").deepCopy();
     }
@@ -986,6 +1595,45 @@ class ReleaseToolCatalogContractAdapterTest {
                 "sha512:" + "a".repeat(64),
                 "sha256:" + "a".repeat(64) + " "
         );
+    }
+
+    private static Stream<Arguments> invalidTrustBindingMetadata() {
+        Stream<Arguments> strings = Stream.of("version", "description")
+                .flatMap(field -> Stream.of("null", "false", "42", "[]", "{}", "\"\"", "\"   \"")
+                        .map(json -> Arguments.of(field, json)));
+        Stream<Arguments> schemas = Stream.of("inputSchema", "outputSchema")
+                .flatMap(field -> Stream.of("null", "false", "42", "[]", "\"schema\"")
+                        .map(json -> Arguments.of(field, json)));
+        return Stream.concat(strings, schemas);
+    }
+
+    private static Stream<Arguments> supportedDeclaredOperations() {
+        return Stream.of(false, true).flatMap(server ->
+                Stream.of("READ", "SEARCH", "CREATE", "WRITE", "UPDATE", "POST")
+                        .map(operation -> Arguments.of(server, operation)));
+    }
+
+    private static Stream<Arguments> supportedDeclaredSideEffects() {
+        return Stream.of(false, true).flatMap(server ->
+                Stream.of("NONE", "INTERNAL_WRITE", "HIGH_IMPACT_WRITE", "MOCK_EXTERNAL_WRITE")
+                        .map(effect -> Arguments.of(server, effect, effect.equals("MOCK_EXTERNAL_WRITE"))));
+    }
+
+    private static Stream<Arguments> declaredMetadataLocations() {
+        return Stream.of(false, true).flatMap(server -> Stream.of("operation", "sideEffectType")
+                .map(field -> Arguments.of(server, field)));
+    }
+
+    private static Stream<Arguments> invalidDeclaredMetadata() {
+        return declaredMetadataLocations().flatMap(location -> {
+            boolean server = (boolean) location.get()[0];
+            String field = (String) location.get()[1];
+            String valid = field.equals("operation") ? "READ" : "NONE";
+            String lowercase = field.equals("operation") ? "read" : "none";
+            return Stream.of("null", "false", "42", "[]", "{}", "\"\"", "\" \"", "\"" + RAW_SENTINEL + "\"",
+                            "\"" + lowercase + "\"", "\" " + valid + "\"", "\"" + valid + " \"")
+                    .map(value -> Arguments.of(server, field, value));
+        });
     }
 
     private record FieldValue(String name, JsonNode value) {

@@ -1,5 +1,15 @@
 package com.finsecseal.policy;
 
+import static com.finsecseal.policy.PolicyEvaluationReason.HUMAN_ONLY_ACTION;
+import static com.finsecseal.policy.PolicyEvaluationReason.OPERATION_NOT_ALLOWED;
+import static com.finsecseal.policy.PolicyEvaluationReason.TOOL_NOT_ALLOWED;
+import static com.finsecseal.policy.PolicyEvaluationStage.BUSINESS_CONTEXT;
+import static com.finsecseal.policy.PolicyEvaluationStage.EGRESS;
+import static com.finsecseal.policy.PolicyEvaluationStage.HUMAN_BOUNDARY;
+import static com.finsecseal.policy.PolicyEvaluationStage.OBJECT_SCOPE;
+import static com.finsecseal.policy.PolicyEvaluationStage.OPERATION;
+import static com.finsecseal.policy.PolicyEvaluationStage.TOOL;
+import static com.finsecseal.policy.PolicyEvaluationStage.WORKFLOW;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
@@ -7,6 +17,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
@@ -15,6 +26,7 @@ import com.finsecseal.agent.AgentService;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.ExecutionEventType;
+import com.finsecseal.common.domain.Sensitivity;
 import com.finsecseal.common.domain.TestCaseRunStatus;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.common.domain.TestRunStatus;
@@ -31,17 +43,31 @@ import com.finsecseal.evidence.TestRunPersistenceService;
 import com.finsecseal.evidence.TestRunProjectionService;
 import com.finsecseal.platform.contract.ContractPersistenceService;
 import com.finsecseal.platform.contract.ContractPersistenceService.Version;
+import com.finsecseal.policy.CatalogBoundInputSchemaEvaluator.InputOutcome;
+import com.finsecseal.policy.EnforcePolicyPostCallDecision.OperationalReason;
+import com.finsecseal.policy.EnforcePolicyPostCallDecision.Outcome;
+import com.finsecseal.policy.EnforcePolicyPostCallDecision.PostCallCheck;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.CatalogOutputField;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.OutputValueType;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.ApprovedPolicySource;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.FailureCode;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.PolicySourceException;
+import com.finsecseal.policy.PolicyEvaluationDecision.StageOutcome;
+import com.finsecseal.policy.PolicyToolAuthorizationFacts.CatalogTool;
+import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
+import com.finsecseal.policy.PolicyToolTrustFacts.ToolTrustPolicy;
+import com.finsecseal.policy.PolicyToolTrustFacts.TrustLevel;
 import com.finsecseal.release.ReleaseService;
+import com.finsecseal.runtime.ToolProposal;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -105,6 +131,7 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
     static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:17.11-alpine");
 
     @Autowired GatewayApprovedPolicySourceService sources;
+    @Autowired GatewayPolicyFactsAssembler assembler;
     @MockitoSpyBean TestRunProjectionService runs;
     @MockitoSpyBean ContractPersistenceService contracts;
     @MockitoSpyBean TestRunPersistenceService cases;
@@ -124,6 +151,10 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
     void actualApprovedSourceUsesWritableRepeatableReadAndCurrentPostApprovalBinding(
             TestRunMode mode, CapturedOutput output) throws Exception {
         Seed seed = seed(mode);
+        List<ReleaseToolBinding> storedBindings = storedReleaseBindings(seed.releaseId());
+        List<CatalogTool> expectedDeclarations = expectedDeclaredTools(seed.releaseId());
+        List<CatalogOutputField> expectedCustomerFields = expectedCustomerOutputFields(seed.releaseId());
+        Map<String, JsonNode> expectedInputSchemas = storedInputSchemas(seed.releaseId());
         var firstRead = new AtomicReference<PhysicalTransaction>();
         var approvalRead = new AtomicReference<PhysicalTransaction>();
         var catalogRead = new AtomicReference<PhysicalTransaction>();
@@ -153,6 +184,26 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
         order.verify(cases).findCase(seed.caseRunId());
         order.verify(catalogs).load(seed.releaseId(), ACTOR);
         assertSource(source, seed, mode);
+        assertThat(storedBindings).hasSize(5).extracting(ReleaseToolBinding::toolName)
+                .containsExactlyInAnyOrder("CASE_CONTEXT_READ", "DOCUMENT_READER", "CUSTOMER_DATA_READ",
+                        "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE");
+        assertThat(storedBindings).allMatch(ReleaseToolBinding::enabled);
+        assertThat(source.releaseToolBindings()).containsExactlyInAnyOrderElementsOf(storedBindings);
+        assertThat(source.releaseToolBindings()).extracting(ReleaseToolBinding::toolName)
+                .doesNotContain("LOAN_DECISION_UPDATE");
+        var expectedTrustPolicy = new ToolTrustPolicy(true, List.of(TrustLevel.TRUSTED_INTERNAL));
+        assertThat(source.toolTrustPolicy()).isEqualTo(expectedTrustPolicy);
+        assertThatThrownBy(() -> source.releaseToolBindings().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> source.toolTrustPolicy().allowedTrustLevels().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+        Baseline afterSource = baseline(seed.releaseId());
+        List<Integer> callsBeforeAssembly = ownerInvocationCounts();
+        assertDeclaredToolAssembly(source, expectedDeclarations);
+        assertContextAndCustomerResponseAssembly(source, expectedCustomerFields);
+        assertInputSchemaComposition(source, expectedInputSchemas);
+        assertThat(ownerInvocationCounts()).isEqualTo(callsBeforeAssembly);
+        assertUnchanged(afterSource, seed.releaseId(), 0);
         String proofFingerprint = seed.approved().validation().at("/sourceBinding/releaseFingerprint").stringValue();
         assertThat(proofFingerprint).isEqualTo(seed.preApprovalFingerprint());
         assertThat(source.catalog().releaseFingerprint()).isNotEqualTo(proofFingerprint);
@@ -162,6 +213,11 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
         assertThat(output.getAll()).doesNotContain(SESSION, PROMPT, STORED, RAW_ERROR);
         ((ObjectNode) source.policy()).put("purpose", "FORGED");
         ((ArrayNode) source.policy().path("allowedTools")).removeAll();
+        ObjectNode policyCopy = (ObjectNode) source.policy();
+        ((ObjectNode) policyCopy.path("toolTrust")).put("requireTrustedTool", false);
+        ((ArrayNode) policyCopy.at("/toolTrust/allowedTrustLevels")).removeAll().add("SANDBOXED");
+        assertThat(source.toolTrustPolicy()).isEqualTo(expectedTrustPolicy);
+        assertThat(source.releaseToolBindings()).containsExactlyInAnyOrderElementsOf(storedBindings);
         assertSource(source, seed, mode);
         assertUnchanged(before, seed.releaseId(), 2);
         assertNoAmbientTransaction();
@@ -529,6 +585,215 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
     }
 
     private String etag(Version version) { return '"' + version.resourceHash() + '"'; }
+
+    private List<ReleaseToolBinding> storedReleaseBindings(UUID releaseId) {
+        return jdbc.query("select d.tool_key, d.version, r.enabled, d.schema_hash, d.description_hash "
+                        + "from release_tools r join tool_definitions d on d.id=r.tool_definition_id "
+                        + "where r.release_id=? order by d.tool_key, d.version",
+                (row, index) -> new ReleaseToolBinding(row.getString("tool_key"), row.getString("version"),
+                        row.getBoolean("enabled"), row.getString("schema_hash"), row.getString("description_hash")),
+                releaseId);
+    }
+
+    private List<CatalogTool> expectedDeclaredTools(UUID releaseId) throws Exception {
+        List<CatalogTool> expected = new ArrayList<>(jdbc.query(
+                "select d.tool_key, d.operation, d.side_effect_type from release_tools r "
+                        + "join tool_definitions d on d.id=r.tool_definition_id "
+                        + "where r.release_id=? and r.enabled=true order by d.tool_key",
+                (row, index) -> {
+                    assertThat(row.getString("side_effect_type")).isIn("NONE", "INTERNAL_WRITE");
+                    return new CatalogTool(row.getString("tool_key"), row.getString("operation"), false);
+                }, releaseId));
+        assertThat(expected).hasSize(5);
+        JsonNode serverCatalog;
+        try (var stream = getClass().getResourceAsStream("/release/loan-review-tool-catalog-1.1.json")) {
+            serverCatalog = mapper.readTree(stream).path("serverToolCatalog");
+        }
+        assertThat(serverCatalog.path("version").stringValue()).isEqualTo("loan-review-server/1.0");
+        assertThat(serverCatalog.path("tools").size()).isEqualTo(1);
+        JsonNode humanTool = serverCatalog.path("tools").get(0);
+        assertThat(humanTool.path("name").stringValue()).isEqualTo("LOAN_DECISION_UPDATE");
+        assertThat(humanTool.path("version").stringValue()).isEqualTo("1.0.0");
+        assertThat(humanTool.path("operation").stringValue()).isEqualTo("UPDATE");
+        assertThat(humanTool.path("sideEffectType").stringValue()).isEqualTo("HIGH_IMPACT_WRITE");
+        assertThat(humanTool.path("agentExecutable").booleanValue()).isFalse();
+        assertThat(humanTool.path("executionBoundary").stringValue()).isEqualTo("HUMAN_ONLY");
+        expected.add(new CatalogTool(humanTool.path("name").stringValue(),
+                humanTool.path("operation").stringValue(), false));
+        return List.copyOf(expected);
+    }
+
+    private void assertDeclaredToolAssembly(ApprovedPolicySource source, List<CatalogTool> expectedDeclarations) {
+        assertThat(source.catalog().declaredTools()).containsExactlyInAnyOrderElementsOf(expectedDeclarations);
+        assertThatThrownBy(() -> source.catalog().declaredTools().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+        var authorization = new PolicyToolAuthorizationEvaluator();
+        // These operations are independent caller inputs, not observations of a B invocation.
+        var read = assembler.toolAuthorization(source, "CUSTOMER_DATA_READ", "READ");
+        assertThat(read.catalogTools()).containsExactlyInAnyOrderElementsOf(expectedDeclarations);
+        assertThat(authorization.evaluate(TOOL, read)).isEqualTo(StageOutcome.pass(TOOL));
+        assertThat(authorization.evaluate(OPERATION, read)).isEqualTo(StageOutcome.pass(OPERATION));
+        var write = assembler.toolAuthorization(source, "CUSTOMER_DATA_READ", "WRITE");
+        assertThat(write.requestedOperation()).isEqualTo("WRITE");
+        assertThat(authorization.evaluate(OPERATION, write))
+                .isEqualTo(StageOutcome.deny(OPERATION, OPERATION_NOT_ALLOWED));
+        var unknown = assembler.toolAuthorization(source, "UNKNOWN_TOOL", "READ");
+        assertThat(unknown.requestedCatalogTool()).isEmpty();
+        assertThat(authorization.evaluate(TOOL, unknown))
+                .isEqualTo(StageOutcome.deny(TOOL, TOOL_NOT_ALLOWED));
+        var human = assembler.toolAuthorization(source, "LOAN_DECISION_UPDATE", "UPDATE");
+        assertThat(human.allowedTools()).doesNotContain("LOAN_DECISION_UPDATE");
+        assertThat(human.humanOnlyTools()).contains("LOAN_DECISION_UPDATE");
+        assertThat(authorization.evaluate(TOOL, human)).isEqualTo(StageOutcome.pass(TOOL));
+        assertThat(new PolicyHumanBoundaryEvaluator().evaluate(HUMAN_BOUNDARY,
+                assembler.humanBoundary(source, "LOAN_DECISION_UPDATE")))
+                .isEqualTo(StageOutcome.deny(HUMAN_BOUNDARY, HUMAN_ONLY_ACTION));
+        var egress = assembler.egress(source, "CUSTOMER_DATA_READ");
+        assertThat(egress.externalEgressAllowed()).isFalse();
+        assertThat(egress.allowedDestinations()).isEmpty();
+        assertThat(egress.requestedCatalogTool().orElseThrow().egressClassification())
+                .isEqualTo(PolicyEgressFacts.EgressClassification.INTERNAL);
+        var egressEvaluator = new PolicyEgressEvaluator();
+        assertThat(egressEvaluator.evaluate(EGRESS, egress)).isEqualTo(StageOutcome.pass(EGRESS));
+        var unknownEgress = assembler.egress(source, "UNKNOWN_TOOL");
+        assertThat(unknownEgress.requestedCatalogTool()).isEmpty();
+        assertThatThrownBy(() -> egressEvaluator.evaluate(EGRESS, unknownEgress))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    private List<CatalogOutputField> expectedCustomerOutputFields(UUID releaseId) {
+        JsonNode storedFields = mapper.readTree(jdbc.queryForObject(
+                "select (d.output_schema_json #> '{properties,rows,items,properties,fields,properties}')::text "
+                        + "from release_tools r join tool_definitions d on d.id=r.tool_definition_id "
+                        + "where r.release_id=? and r.enabled=true and d.tool_key='CUSTOMER_DATA_READ'",
+                String.class, releaseId));
+        // C loan-review/1 classifications; field presence and types are checked against actual A storage.
+        List<CatalogOutputField> expected = List.of(
+                new CatalogOutputField("accountNumber", Sensitivity.FINANCIAL, OutputValueType.STRING),
+                new CatalogOutputField("employmentStatus", Sensitivity.NORMAL, OutputValueType.STRING),
+                new CatalogOutputField("incomeBand", Sensitivity.FINANCIAL, OutputValueType.STRING));
+        assertThat(storedFields.isObject()).isTrue();
+        assertThat(storedFields.size()).isEqualTo(expected.size());
+        for (CatalogOutputField field : expected) {
+            assertThat(storedFields.path(field.fieldName()).path("type").stringValue()).isEqualTo("string");
+        }
+        return expected;
+    }
+
+    private void assertContextAndCustomerResponseAssembly(ApprovedPolicySource source,
+            List<CatalogOutputField> expectedCustomerFields) {
+        assertThat(source.catalog().customerOutputFields()).containsExactlyInAnyOrderElementsOf(expectedCustomerFields);
+        // Synthetic server context and adapter observations: no namespace creation or Tool execution occurs.
+        String applicant = "synthetic-current-applicant";
+        String businessCase = "synthetic-business-case";
+        var purpose = Optional.of("LOAN_DOCUMENT_COMPLETENESS_REVIEW");
+        var workflow = assembler.workflow(source, "CUSTOMER_DATA_READ", "DOCUMENT_REVIEW");
+        assertThat(new PolicyWorkflowEvaluator().evaluate(WORKFLOW, workflow)).isEqualTo(StageOutcome.pass(WORKFLOW));
+        var business = assembler.businessContext(source, true, purpose, purpose, purpose,
+                Optional.of(source.runId().toString()), Optional.of(businessCase), Optional.of(applicant),
+                Optional.of("DOCUMENT_REVIEW"), Optional.of(List.of("synthetic-allowed-document")));
+        assertThat(business.contractPurpose()).isEqualTo(purpose);
+        assertThat(new PolicyBusinessContextEvaluator().evaluate(BUSINESS_CONTEXT, business))
+                .isEqualTo(StageOutcome.pass(BUSINESS_CONTEXT));
+        var scope = assembler.objectScope(source, "CUSTOMER_DATA_READ", Optional.empty(), Optional.empty(),
+                Optional.of(List.of(applicant)), Optional.empty(), Optional.of(applicant), Optional.empty(), Optional.empty());
+        assertThat(scope.requestedScopePolicy()).contains(
+                new PolicyObjectScopeFacts.ObjectScopePolicy("CUSTOMER_DATA_READ", false, false, true));
+        assertThat(new PolicyObjectScopeEvaluator().evaluate(OBJECT_SCOPE, scope)).isEqualTo(StageOutcome.pass(OBJECT_SCOPE));
+
+        ObjectNode arguments = mapper.createObjectNode();
+        arguments.putArray("customerIds").add(applicant);
+        arguments.putArray("fields").add("incomeBand").add("employmentStatus");
+        var proposal = new ToolProposal("CUSTOMER_DATA_READ", arguments);
+        ObjectNode response = mapper.createObjectNode().put("status", 200);
+        response.putArray("rows").addObject().put("customerId", applicant).putObject("fields")
+                .put("incomeBand", "SYNTHETIC_BAND").put("employmentStatus", "SYNTHETIC_STATUS");
+        ObjectNode classifications = mapper.createObjectNode().put("accountNumber", "FINANCIAL")
+                .put("employmentStatus", "NORMAL").put("incomeBand", "FINANCIAL");
+        ObjectNode provenance = mapper.createObjectNode().put("namespaceId", source.runId().toString())
+                .put("testCaseRunId", source.testCaseRunId().toString());
+        var facts = assembler.customerDataReadPostCall(source, proposal, applicant, response, classifications, provenance);
+        assertThat(facts.catalogOutputFields()).containsExactlyInAnyOrderElementsOf(expectedCustomerFields);
+        assertThat(facts.approvedProjection()).containsExactlyInAnyOrder("incomeBand", "employmentStatus");
+        assertThat(facts.maxReturnedRecords()).isEqualTo(1);
+        assertThat(facts.expectedNamespaceId()).isEqualTo(source.runId().toString());
+        assertThat(facts.expectedTestCaseRunId()).isEqualTo(source.testCaseRunId());
+        var guard = new EnforcePolicyPostCallResponseGuard();
+        var passed = guard.evaluate(facts);
+        assertThat(passed.outcome()).isEqualTo(Outcome.PASS);
+        assertThat(passed.evaluatedChecks()).containsExactlyElementsOf(PostCallCheck.completeOrder());
+        assertThat(passed.deliverableOutput()).contains(response);
+
+        ObjectNode forbidden = (ObjectNode) response.deepCopy();
+        ((ObjectNode) forbidden.at("/rows/0/fields")).put("accountNumber", "SYNTHETIC_FORBIDDEN_ACCOUNT");
+        var quarantined = guard.evaluate(assembler.customerDataReadPostCall(
+                source, proposal, applicant, forbidden, classifications, provenance));
+        assertThat(quarantined.outcome()).isEqualTo(Outcome.QUARANTINE);
+        assertThat(quarantined.failedCheck()).contains(PostCallCheck.FIELD_PROJECTION);
+        assertThat(quarantined.evaluatedChecks()).containsExactly(PostCallCheck.OUTPUT_SCHEMA,
+                PostCallCheck.CLASSIFICATION, PostCallCheck.OBJECT_SCOPE, PostCallCheck.FIELD_PROJECTION);
+        assertThat(quarantined.reason()).contains(OperationalReason.ADAPTER_CONTRACT_FAILURE);
+        assertThat(quarantined.deliverableOutput()).isEmpty();
+        assertThat(quarantined.operationalFailure()).isTrue();
+        assertThat(quarantined.successfulSecurityBlock()).isFalse();
+    }
+
+    private Map<String, JsonNode> storedInputSchemas(UUID releaseId) {
+        JsonNode storedCatalog = mapper.readTree(jdbc.queryForObject(
+                "select jsonb_build_object('tools', manifest_json->'tools', "
+                        + "'serverToolCatalog', manifest_json->'serverToolCatalog')::text "
+                        + "from agent_releases where id=?", String.class, releaseId));
+        JsonNode normalTools = storedCatalog.path("tools");
+        JsonNode serverCatalog = storedCatalog.path("serverToolCatalog");
+        assertThat(normalTools.isArray()).isTrue();
+        assertThat(normalTools.size()).isEqualTo(5);
+        assertThat(serverCatalog.path("version").stringValue()).isEqualTo("loan-review-server/1.0");
+        JsonNode humanTools = serverCatalog.path("tools");
+        assertThat(humanTools.isArray()).isTrue();
+        assertThat(humanTools.size()).isEqualTo(1);
+        JsonNode human = humanTools.get(0);
+        assertThat(human.path("name").stringValue()).isEqualTo("LOAN_DECISION_UPDATE");
+        assertThat(human.path("version").stringValue()).isEqualTo("1.0.0");
+        assertThat(human.path("agentExecutable").booleanValue()).isFalse();
+        assertThat(human.path("executionBoundary").stringValue()).isEqualTo("HUMAN_ONLY");
+        Map<String, JsonNode> expected = new LinkedHashMap<>();
+        for (JsonNode tools : List.of(normalTools, humanTools)) {
+            for (JsonNode tool : tools) {
+                JsonNode schema = tool.path("inputSchema");
+                assertThat(schema.isObject()).isTrue();
+                assertThat(expected.put(tool.path("name").stringValue(), schema)).isNull();
+            }
+        }
+        assertThat(expected).hasSize(6);
+        assertThat(expected.keySet()).containsExactlyInAnyOrder("CASE_CONTEXT_READ", "DOCUMENT_READER",
+                "CUSTOMER_DATA_READ", "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE", "LOAN_DECISION_UPDATE");
+        return Map.copyOf(expected);
+    }
+
+    private void assertInputSchemaComposition(ApprovedPolicySource source, Map<String, JsonNode> expectedSchemas) {
+        assertThat(source.catalog().inputSchemas()).isEqualTo(expectedSchemas);
+        var input = new CatalogBoundInputSchemaEvaluator();
+        // Synthetic request operands; schema MATCH does not resolve business objects or authorize execution.
+        ObjectNode document = mapper.createObjectNode().put("caseId", "synthetic-business-case")
+                .put("documentId", "synthetic-document");
+        assertThat(input.evaluate(source, new ToolProposal("DOCUMENT_READER", document)))
+                .isEqualTo(InputOutcome.MATCH);
+        ObjectNode invalidDocument = (ObjectNode) document.deepCopy();
+        invalidDocument.put("documentId", false);
+        assertThat(input.evaluate(source, new ToolProposal("DOCUMENT_READER", invalidDocument)))
+                .isEqualTo(InputOutcome.INVALID_REQUEST_SCHEMA);
+        ObjectNode human = mapper.createObjectNode().put("caseId", "synthetic-business-case")
+                .put("decision", "APPROVED");
+        assertThat(input.evaluate(source, new ToolProposal("LOAN_DECISION_UPDATE", human)))
+                .isEqualTo(InputOutcome.MATCH);
+        assertThat(input.evaluate(source, new ToolProposal("UNKNOWN_TOOL", mapper.createObjectNode())))
+                .isEqualTo(InputOutcome.TOOL_NOT_IN_CATALOG);
+    }
+
+    private List<Integer> ownerInvocationCounts() {
+        return List.of(runs, contracts, cases, catalogs, validator, canonicalizer).stream()
+                .map(owner -> mockingDetails(owner).getInvocations().size()).toList();
+    }
 
     private void assertSource(ApprovedPolicySource source, Seed seed, TestRunMode mode) {
         assertThat(source).isNotNull();

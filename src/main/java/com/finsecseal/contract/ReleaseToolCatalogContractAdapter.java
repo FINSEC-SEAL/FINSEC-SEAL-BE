@@ -1,17 +1,25 @@
 package com.finsecseal.contract;
 
+import com.finsecseal.common.domain.Sensitivity;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ContractValidationCatalog;
 import com.finsecseal.contract.SafetyContractSemanticValidator.EnabledTool;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.CatalogOutputField;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.OutputValueType;
+import com.finsecseal.policy.PolicyToolAuthorizationFacts.CatalogTool;
+import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import com.finsecseal.release.ReleaseDto.ToolCatalogResponse;
 import com.finsecseal.release.ReleaseService;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import org.springframework.stereotype.Component;
@@ -21,7 +29,7 @@ import tools.jackson.databind.node.ObjectNode;
 
 /**
  * Role C boundary that converts Role A's verified Manifest 1.1 Tool catalog into
- * immutable semantic-validation input.
+ * immutable semantic-validation input, expected Tool Trust bindings and declarations.
  *
  * <p>A successful conversion proves only source integrity and catalog shape. It
  * does not approve a Safety Contract, pass a Release, authorize deployment, or
@@ -35,6 +43,12 @@ public final class ReleaseToolCatalogContractAdapter {
             "loan-review-server/1.0";
 
     private static final String CUSTOMER_DATA_READ = "CUSTOMER_DATA_READ";
+    // loan-review/1: docs/predev/05_FINANCIAL_DOMAIN_MODEL.md, Customer classification rules.
+    // These are expected classifications, never classifications inferred from adapter output.
+    private static final Map<String, Sensitivity> CUSTOMER_CLASSIFICATIONS = Map.of(
+            "accountNumber", Sensitivity.FINANCIAL,
+            "employmentStatus", Sensitivity.NORMAL,
+            "incomeBand", Sensitivity.FINANCIAL);
     private static final String CUSTOMER_OUTPUT_FIELDS_POINTER =
             "/outputSchema/properties/rows/items/properties/fields/properties";
     private static final String DEFAULT_OUTPUT_FIELDS_POINTER =
@@ -114,8 +128,58 @@ public final class ReleaseToolCatalogContractAdapter {
                 source.agentArtifactFingerprint(),
                 source.releaseFingerprint(),
                 source.serverToolCatalogHash(),
-                new ContractValidationCatalog(enabledTools, highImpactTools)
+                new ContractValidationCatalog(enabledTools, highImpactTools),
+                extractReleaseToolBindings(toolsSnapshot),
+                extractDeclaredTools(toolsSnapshot, serverCatalogSnapshot.path("tools")),
+                extractCustomerOutputFields(toolsSnapshot),
+                extractInputSchemas(toolsSnapshot, serverCatalogSnapshot.path("tools"))
         );
+    }
+
+    private Map<String, JsonNode> extractInputSchemas(JsonNode enabled, JsonNode highImpact) {
+        Map<String, JsonNode> schemas = new TreeMap<>();
+        appendInputSchemas(schemas, enabled, FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+        appendInputSchemas(schemas, highImpact, FailureCode.INVALID_HIGH_IMPACT_CATALOG);
+        return schemas;
+    }
+
+    private void appendInputSchemas(Map<String, JsonNode> schemas, JsonNode tools, FailureCode code) {
+        for (JsonNode tool : tools) {
+            JsonNode schema = tool.get("inputSchema");
+            if (schema == null || !schema.isObject()
+                    || schemas.putIfAbsent(tool.path("name").stringValue(), schema) != null) {
+                throw failure(code);
+            }
+        }
+    }
+
+    private List<CatalogOutputField> extractCustomerOutputFields(JsonNode tools) {
+        for (JsonNode tool : tools) {
+            if (!CUSTOMER_DATA_READ.equals(tool.path("name").stringValue())) continue;
+            JsonNode properties = tool.at(CUSTOMER_OUTPUT_FIELDS_POINTER);
+            var fields = new ArrayList<CatalogOutputField>();
+            var names = new HashSet<String>();
+            for (var entry : properties.properties()) {
+                Sensitivity classification = CUSTOMER_CLASSIFICATIONS.get(entry.getKey());
+                JsonNode schema = entry.getValue();
+                if (classification == null || !schema.isObject() || !schema.path("type").isString()) {
+                    throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+                }
+                OutputValueType type = switch (schema.path("type").stringValue()) {
+                    case "string" -> OutputValueType.STRING;
+                    case "integer" -> OutputValueType.INTEGER;
+                    default -> throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+                };
+                if (!names.add(entry.getKey())) throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+                fields.add(new CatalogOutputField(entry.getKey(), classification, type));
+            }
+            if (!names.equals(CUSTOMER_CLASSIFICATIONS.keySet())) {
+                throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+            }
+            fields.sort(Comparator.comparing(CatalogOutputField::fieldName));
+            return List.copyOf(fields);
+        }
+        throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
     }
 
     private void validateSourceMetadata(
@@ -254,6 +318,66 @@ public final class ReleaseToolCatalogContractAdapter {
         return List.copyOf(highImpactTools);
     }
 
+    private List<ReleaseToolBinding> extractReleaseToolBindings(JsonNode tools) {
+        List<ReleaseToolBinding> bindings = new ArrayList<>();
+        for (JsonNode tool : tools) {
+            JsonNode version = tool.path("version");
+            JsonNode description = tool.path("description");
+            if (!version.isString() || !isExactNonBlank(version.stringValue())
+                    || !description.isString() || description.stringValue().isBlank()
+                    || !tool.path("inputSchema").isObject() || !tool.path("outputSchema").isObject()) {
+                throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+            }
+            try {
+                // Same wrapper inputs as A's ReleaseCatalogWriter / ReleaseIntegrityVerifier.
+                // A has already verified that manifest.tools are the enabled Release bindings.
+                ObjectNode schemas = objectMapper.createObjectNode();
+                schemas.set("inputSchema", tool.path("inputSchema"));
+                schemas.set("outputSchema", tool.path("outputSchema"));
+                ObjectNode descriptionInput = objectMapper.createObjectNode();
+                descriptionInput.put("description", description.stringValue());
+                bindings.add(new ReleaseToolBinding(tool.path("name").stringValue(),
+                        version.stringValue(), true,
+                        digestService.sha256(canonicalJsonService.canonicalize(schemas)),
+                        digestService.sha256(canonicalJsonService.canonicalize(descriptionInput))));
+            } catch (RuntimeException exception) {
+                throw failure(FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+            }
+        }
+        bindings.sort(Comparator.comparing(ReleaseToolBinding::toolName));
+        return List.copyOf(bindings);
+    }
+
+    private List<CatalogTool> extractDeclaredTools(JsonNode enabled, JsonNode highImpact) {
+        List<CatalogTool> declarations = new ArrayList<>();
+        appendDeclaredTools(declarations, enabled, FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+        appendDeclaredTools(declarations, highImpact, FailureCode.INVALID_HIGH_IMPACT_CATALOG);
+        declarations.sort(Comparator.comparing(CatalogTool::name));
+        return List.copyOf(declarations);
+    }
+
+    private void appendDeclaredTools(List<CatalogTool> declarations, JsonNode tools,
+            FailureCode code) {
+        for (JsonNode tool : tools) {
+            JsonNode operation = tool.path("operation");
+            JsonNode sideEffect = tool.path("sideEffectType");
+            if (!operation.isString() || !sideEffect.isString()) {
+                throw failure(code);
+            }
+            switch (operation.stringValue()) {
+                case "READ", "SEARCH", "CREATE", "WRITE", "UPDATE", "POST" -> { }
+                default -> throw failure(code);
+            }
+            boolean external = switch (sideEffect.stringValue()) {
+                case "NONE", "INTERNAL_WRITE", "HIGH_IMPACT_WRITE" -> false;
+                case "MOCK_EXTERNAL_WRITE" -> true;
+                default -> throw failure(code);
+            };
+            declarations.add(new CatalogTool(tool.path("name").stringValue(),
+                    operation.stringValue(), external));
+        }
+    }
+
     private void rejectRoleOverlap(
             List<EnabledTool> enabledTools,
             List<String> highImpactTools
@@ -304,7 +428,7 @@ public final class ReleaseToolCatalogContractAdapter {
     }
 
     /**
-     * Immutable source binding for semantic validation. This is not approval evidence.
+     * Immutable expected source declarations. This is not approval or observed registry evidence.
      */
     public record SourceBoundCatalog(
             UUID releaseId,
@@ -312,8 +436,49 @@ public final class ReleaseToolCatalogContractAdapter {
             String agentArtifactFingerprint,
             String releaseFingerprint,
             String serverToolCatalogHash,
-            ContractValidationCatalog semanticCatalog
+            ContractValidationCatalog semanticCatalog,
+            List<ReleaseToolBinding> releaseToolBindings,
+            List<CatalogTool> declaredTools,
+            List<CatalogOutputField> customerOutputFields,
+            Map<String, JsonNode> inputSchemas
     ) {
+
+        /** Compatibility for semantic-only callers; empty bindings cannot supply Gateway trust. */
+        public SourceBoundCatalog(UUID releaseId, String manifestSchemaVersion,
+                String agentArtifactFingerprint, String releaseFingerprint,
+                String serverToolCatalogHash, ContractValidationCatalog semanticCatalog) {
+            this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
+                    serverToolCatalogHash, semanticCatalog, List.of(), List.of(), List.of(), Map.of());
+        }
+
+        /** Compatibility for trust consumers; absent declarations cannot supply other stages. */
+        public SourceBoundCatalog(UUID releaseId, String manifestSchemaVersion,
+                String agentArtifactFingerprint, String releaseFingerprint,
+                String serverToolCatalogHash, ContractValidationCatalog semanticCatalog,
+                List<ReleaseToolBinding> releaseToolBindings) {
+            this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
+                    serverToolCatalogHash, semanticCatalog, releaseToolBindings, List.of(), List.of(), Map.of());
+        }
+
+        /** Compatibility for pre-call consumers; absent metadata cannot supply response expectations. */
+        public SourceBoundCatalog(UUID releaseId, String manifestSchemaVersion,
+                String agentArtifactFingerprint, String releaseFingerprint,
+                String serverToolCatalogHash, ContractValidationCatalog semanticCatalog,
+                List<ReleaseToolBinding> releaseToolBindings, List<CatalogTool> declaredTools) {
+            this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
+                    serverToolCatalogHash, semanticCatalog, releaseToolBindings, declaredTools, List.of(), Map.of());
+        }
+
+        /** Compatibility for response consumers; absent input schemas cannot establish preflight. */
+        public SourceBoundCatalog(UUID releaseId, String manifestSchemaVersion,
+                String agentArtifactFingerprint, String releaseFingerprint,
+                String serverToolCatalogHash, ContractValidationCatalog semanticCatalog,
+                List<ReleaseToolBinding> releaseToolBindings, List<CatalogTool> declaredTools,
+                List<CatalogOutputField> customerOutputFields) {
+            this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
+                    serverToolCatalogHash, semanticCatalog, releaseToolBindings, declaredTools,
+                    customerOutputFields, Map.of());
+        }
 
         public SourceBoundCatalog {
             Objects.requireNonNull(releaseId, "releaseId must not be null");
@@ -333,6 +498,25 @@ public final class ReleaseToolCatalogContractAdapter {
                     FailureCode.INVALID_SERVER_CATALOG_HASH
             );
             Objects.requireNonNull(semanticCatalog, "semanticCatalog must not be null");
+            releaseToolBindings = List.copyOf(releaseToolBindings);
+            declaredTools = List.copyOf(declaredTools);
+            customerOutputFields = List.copyOf(customerOutputFields);
+            inputSchemas = copyInputSchemas(inputSchemas);
+        }
+
+        /** The map and its nested schema trees never expose the stored snapshot for mutation. */
+        @Override
+        public Map<String, JsonNode> inputSchemas() {
+            return copyInputSchemas(inputSchemas);
+        }
+
+        private static Map<String, JsonNode> copyInputSchemas(Map<String, JsonNode> schemas) {
+            Objects.requireNonNull(schemas, "inputSchemas must not be null");
+            Map<String, JsonNode> copy = new TreeMap<>();
+            schemas.forEach((name, schema) -> copy.put(
+                    Objects.requireNonNull(name, "input schema name must not be null"),
+                    Objects.requireNonNull(schema, "input schema must not be null").deepCopy()));
+            return Collections.unmodifiableMap(copy);
         }
     }
 
