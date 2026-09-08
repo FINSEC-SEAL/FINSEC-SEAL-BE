@@ -78,7 +78,13 @@ public class ReleaseAssuranceService {
 
     public ReleaseAssuranceDto.MetricsView metrics(UUID releaseId) {
         requireRelease(releaseId, false);
-        return new ReleaseAssuranceDto.MetricsView(releaseId, metricsCalculator.calculate(loadTrials(releaseId)));
+        List<TrialEvaluation> trials = loadTrials(releaseId);
+        ReplayAssessment replay = assessReplay(releaseId, null);
+        return new ReleaseAssuranceDto.MetricsView(
+                releaseId,
+                metricsCalculator.calculate(comparableTrials(trials, replay)),
+                replay.summary()
+        );
     }
 
     @Transactional
@@ -183,13 +189,15 @@ public class ReleaseAssuranceService {
 
     private SnapshotBuild buildSnapshot(ReleaseRow release, DecisionValue override) {
         EvidenceContext evidence = requireEvidenceContext(release);
-        List<TrialEvaluation> trials = loadTrials(release.id()).stream()
+        List<TrialEvaluation> loadedTrials = loadTrials(release.id()).stream()
                 .filter(trial -> evidence.runIds().contains(trial.runId()))
                 .toList();
+        ReplayAssessment replay = assessReplay(release.id(), Set.copyOf(evidence.runIds()));
+        List<TrialEvaluation> trials = comparableTrials(loadedTrials, replay);
         ReleaseMetrics metrics = metricsCalculator.calculate(trials);
         boolean criticalSuccess = trials.stream().anyMatch(trial ->
                 trial.attackSuccess() && trial.reasonCodes().stream().anyMatch(CRITICAL_REASONS::contains));
-        boolean evidenceComplete = completeDecisionEvidence(metrics, trials);
+        boolean evidenceComplete = completeDecisionEvidence(metrics, trials) && replay.summary().evidenceComplete();
         boolean coverage = criticalCoverageComplete(trials);
         boolean openHigh = hasOpenHighFinding(release.id());
         GateDecision gate = releaseGate.evaluate(metrics, new ReleaseGate.GateContext(
@@ -224,6 +232,7 @@ public class ReleaseAssuranceService {
         snapshot.set("sandbox", objectMapper.createObjectNode()
                 .put("fixtureVersion", evidence.fixtureVersion()).put("fixtureDigest", evidence.fixtureDigest()));
         snapshot.set("results", resultSummary(metrics, trials));
+        snapshot.set("replayComparability", objectMapper.valueToTree(replay.summary()));
         snapshot.set("metrics", metricArray(metrics));
         snapshot.set("remainingFindings", remainingFindings(release.id()));
         snapshot.set("approvedPatch", approvedPatch(release.id()));
@@ -288,6 +297,87 @@ public class ReleaseAssuranceService {
             return null;
         }, releaseId);
         return trials.values().stream().map(MutableTrial::immutable).toList();
+    }
+
+    private List<TrialEvaluation> comparableTrials(List<TrialEvaluation> trials, ReplayAssessment replay) {
+        return trials.stream()
+                .filter(trial -> !"SEAL_REPLAY".equals(trial.mode())
+                        || replay.comparableCaseRunIds().contains(trial.caseRunId()))
+                .toList();
+    }
+
+    private ReplayAssessment assessReplay(UUID releaseId, Set<UUID> includedRunIds) {
+        Set<UUID> comparableCaseRunIds = new LinkedHashSet<>();
+        List<ReleaseAssuranceDto.ReplayComparison> items = jdbcTemplate.query("""
+                select replay_case.id replay_case_run_id, replay_run.id replay_run_id,
+                       baseline_run.id baseline_run_id, test_case.category,
+                       replay_link.id replay_link_id,
+                       replay_link.same_agent_artifact_fingerprint,
+                       replay_link.same_fixture_digest,
+                       replay_link.same_model_config,
+                       replay_link.same_variant_hash,
+                       replay_link.expected_policy_difference,
+                       replay_link.comparison_json::text comparison_json
+                  from test_runs replay_run
+                  join test_case_runs replay_case on replay_case.test_run_id = replay_run.id
+                  join test_cases test_case on test_case.id = replay_case.test_case_id
+                  left join replay_links replay_link on replay_link.replay_case_run_id = replay_case.id
+                  left join test_case_runs baseline_case on baseline_case.id = replay_link.baseline_case_run_id
+                  left join test_runs baseline_run on baseline_run.id = baseline_case.test_run_id
+                 where replay_run.release_id = ? and replay_run.mode = 'SEAL_REPLAY'
+                   and replay_run.status = 'COMPLETED'
+                   and (?::uuid[] is null or replay_run.id = any(?::uuid[]))
+                 order by replay_run.created_at, replay_case.created_at
+                """, (rs, row) -> {
+            UUID caseRunId = rs.getObject("replay_case_run_id", UUID.class);
+            List<String> reasons = replayMismatchReasons(rs);
+            boolean comparable = reasons.isEmpty();
+            if (comparable) {
+                comparableCaseRunIds.add(caseRunId);
+            }
+            return new ReleaseAssuranceDto.ReplayComparison(
+                    rs.getObject("baseline_run_id", UUID.class),
+                    rs.getObject("replay_run_id", UUID.class),
+                    rs.getString("category"), comparable, reasons
+            );
+        }, releaseId, uuidArray(includedRunIds), uuidArray(includedRunIds));
+        int comparableCount = comparableCaseRunIds.size();
+        ReleaseAssuranceDto.ReplaySummary summary = new ReleaseAssuranceDto.ReplaySummary(
+                items.size(), comparableCount, items.size() - comparableCount,
+                items.stream().allMatch(ReleaseAssuranceDto.ReplayComparison::comparable), items
+        );
+        return new ReplayAssessment(Set.copyOf(comparableCaseRunIds), summary);
+    }
+
+    private UUID[] uuidArray(Set<UUID> values) {
+        return values == null ? null : values.toArray(UUID[]::new);
+    }
+
+    private List<String> replayMismatchReasons(ResultSet rs) throws SQLException {
+        LinkedHashSet<String> reasons = new LinkedHashSet<>();
+        if (rs.getObject("replay_link_id") == null) {
+            return List.of("REPLAY_LINK_MISSING");
+        }
+        if (!rs.getBoolean("same_agent_artifact_fingerprint")) reasons.add("AGENT_ARTIFACT_MISMATCH");
+        if (!rs.getBoolean("same_fixture_digest")) reasons.add("FIXTURE_DIGEST_MISMATCH");
+        if (!rs.getBoolean("same_model_config")) reasons.add("MODEL_CONFIG_MISMATCH");
+        if (!rs.getBoolean("same_variant_hash")) reasons.add("VARIANT_HASH_MISMATCH");
+        if (!rs.getBoolean("expected_policy_difference")) reasons.add("EXPECTED_POLICY_DIFFERENCE_MISSING");
+        JsonNode comparison = parseJson(rs.getString("comparison_json"));
+        for (String field : List.of("mismatchReasons", "mismatches")) {
+            JsonNode values = comparison.path(field);
+            if (values.isArray()) {
+                values.forEach(value -> {
+                    if (value.isTextual() && !value.asText().isBlank()) reasons.add(value.asText());
+                    else if (value.path("code").isTextual()) reasons.add(value.path("code").asText());
+                    else if (value.path("reason").isTextual()) reasons.add(value.path("reason").asText());
+                });
+            }
+        }
+        if (!comparison.path("comparable").asBoolean(reasons.isEmpty()) && reasons.isEmpty()) {
+            reasons.add("REPLAY_NOT_COMPARABLE");
+        }
+        return List.copyOf(reasons);
     }
 
     private boolean criticalCoverageComplete(List<TrialEvaluation> trials) {
@@ -575,4 +665,6 @@ public class ReleaseAssuranceService {
                                    String fixtureVersion, String fixtureDigest, Instant testedAt,
                                    List<UUID> runIds) { }
     private record SnapshotBuild(GateDecision decision, ObjectNode snapshot) { }
+    private record ReplayAssessment(Set<UUID> comparableCaseRunIds,
+                                    ReleaseAssuranceDto.ReplaySummary summary) { }
 }

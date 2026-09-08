@@ -95,6 +95,85 @@ class ReleaseAssuranceIntegrationTest {
                 exception -> assertThat(exception.errorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR));
     }
 
+    @Test
+    void excludesReplayWithoutComparisonLinkAndReportsIncompleteEvidence() throws Exception {
+        Seed seed = seedCriticalRelease();
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ? and mode = 'BASELINE'", UUID.class, seed.releaseId());
+        UUID suiteId = jdbcTemplate.queryForObject(
+                "select suite_id from test_runs where id = ?", UUID.class, baselineRunId);
+        UUID testCaseId = jdbcTemplate.queryForObject(
+                "select test_case_id from test_case_runs where test_run_id = ?", UUID.class, baselineRunId);
+        UUID replayRunId = UUID.randomUUID();
+        UUID replayCaseRunId = UUID.randomUUID();
+        UUID contractId = UUID.randomUUID();
+        UUID contractVersionId = UUID.randomUUID();
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+
+        jdbcTemplate.update("""
+                insert into safety_contracts
+                    (id, workspace_id, release_id, contract_key, status, created_at, updated_at)
+                values (?, ?, ?, 'replay-assurance', 'APPROVED', ?, ?)
+                """, contractId, AgentService.DEMO_WORKSPACE_ID, seed.releaseId(),
+                Timestamp.from(now), Timestamp.from(now));
+        jdbcTemplate.update("""
+                insert into safety_contract_versions
+                    (id, contract_id, version, state, policy_json, policy_hash, validation_json,
+                     created_by, approved_by, approved_at, created_at, updated_at)
+                values (?, ?, 1, 'APPROVED', '{}'::jsonb, ?, '{}'::jsonb,
+                        'test', 'test', ?, ?, ?)
+                """, contractVersionId, contractId, HASH_A, Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
+
+        jdbcTemplate.update("""
+                insert into test_runs
+                    (id, release_id, suite_id, contract_version_id, mode, status, agent_artifact_fingerprint,
+                     release_fingerprint, config_json, fixture_version, fixture_digest,
+                     model_config_hash, total_cases, completed_cases, operational_error_count,
+                     started_at, completed_at, summary_json, created_at, updated_at)
+                select ?, release_id, ?, ?, 'SEAL_REPLAY', 'QUEUED', agent_artifact_fingerprint,
+                       release_fingerprint, config_json, fixture_version, fixture_digest,
+                       model_config_hash, 1, 0, 0, null, null, '{}'::jsonb, ?, ?
+                  from test_runs where id = ?
+                """, replayRunId, suiteId, contractVersionId,
+                Timestamp.from(now), Timestamp.from(now), baselineRunId);
+        jdbcTemplate.update("""
+                insert into test_case_runs
+                    (id, test_run_id, test_case_id, trial_index, status, security_outcome,
+                     variant_hash, started_at, completed_at, result_json, created_at, updated_at)
+                values (?, ?, ?, 0, 'PENDING', null, ?, null, null, '{}'::jsonb, ?, ?)
+                """, replayCaseRunId, replayRunId, testCaseId, HASH_A, Timestamp.from(now), Timestamp.from(now));
+        jdbcTemplate.update("""
+                update test_case_runs set status = 'PASSED', security_outcome = 'ATTACK_BLOCKED',
+                       started_at = ?, completed_at = ?, updated_at = ? where id = ?
+                """, Timestamp.from(now.minusSeconds(1)), Timestamp.from(now), Timestamp.from(now), replayCaseRunId);
+        jdbcTemplate.update("update test_runs set status = 'PREPARING', updated_at = ? where id = ?",
+                Timestamp.from(now.minusSeconds(2)), replayRunId);
+        jdbcTemplate.update("update test_runs set status = 'RUNNING', started_at = ?, updated_at = ? where id = ?",
+                Timestamp.from(now.minusSeconds(1)), Timestamp.from(now.minusSeconds(1)), replayRunId);
+        jdbcTemplate.update("insert into run_event_counters (run_id, last_sequence) values (?, 0)", replayRunId);
+        UUID replayTraceId = UUID.randomUUID();
+        eventService.append(replayRunId, new ExecutionEventDto.AppendRequest(
+                null, replayTraceId, ExecutionEventType.RUN_STARTED,
+                null, null, null, null, "RUN_STARTED", objectMapper.createObjectNode()
+        ), "test");
+        eventService.append(replayRunId, new ExecutionEventDto.AppendRequest(
+                null, replayTraceId, ExecutionEventType.RUN_COMPLETED,
+                null, null, null, null, "RUN_COMPLETED", objectMapper.createObjectNode()
+        ), "test");
+        jdbcTemplate.update("""
+                update test_runs set status = 'COMPLETED', completed_cases = 1,
+                       completed_at = ?, updated_at = ? where id = ?
+                """, Timestamp.from(now), Timestamp.from(now), replayRunId);
+
+        var view = assuranceService.metrics(seed.releaseId());
+
+        assertThat(view.replaySummary().totalCount()).isEqualTo(1);
+        assertThat(view.replaySummary().nonComparableCount()).isEqualTo(1);
+        assertThat(view.replaySummary().evidenceComplete()).isFalse();
+        assertThat(view.replaySummary().items().getFirst().mismatchReasons())
+                .containsExactly("REPLAY_LINK_MISSING");
+    }
+
     private Seed seedCriticalRelease() throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         AgentDto.Response agent = agentService.create(new AgentDto.CreateRequest(
