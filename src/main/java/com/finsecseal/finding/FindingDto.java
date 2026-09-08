@@ -44,4 +44,10 @@ public final class FindingDto {
 
     public record TriageRequest(String comment) {
     }
+
+    public record ResolveRequest(
+            UUID replayCaseRunId,
+            String comment
+    ) {
+    }
 }
