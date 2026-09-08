@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.ExecutionEventType;
+import com.finsecseal.common.domain.TestCaseRunStatus;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.common.domain.TestRunStatus;
 import com.finsecseal.evidence.ExecutionEventDto;
@@ -13,6 +14,7 @@ import com.finsecseal.evidence.ExecutionEventService;
 import com.finsecseal.evidence.TestRunPersistenceDto;
 import com.finsecseal.evidence.TestRunPersistenceService;
 import com.finsecseal.finding.FindingService;
+import com.finsecseal.finding.FindingDto;
 import com.finsecseal.oracle.domain.CustomerDataRow;
 import com.finsecseal.oracle.domain.CustomerResponseEvidence;
 import com.finsecseal.oracle.domain.HighImpactMutationEvidence;
@@ -43,6 +45,7 @@ class OracleFindingIntegrationTest {
 
     private static final String HASH_A = "sha256:" + "a".repeat(64);
     private static final String HASH_B = "sha256:" + "b".repeat(64);
+    private static final String HASH_C = "sha256:" + "c".repeat(64);
     private static final UUID WORKSPACE_ID = UUID.fromString("0198f1e2-0000-7000-8000-000000000001");
 
     @Container
@@ -293,6 +296,62 @@ class OracleFindingIntegrationTest {
     }
 
     @Test
+    void resolvesFindingAfterComparableReplayBlocksAttack() {
+        Seed baseline = seedRunningAttack("resolve-replay", false);
+        OracleAssessmentService.Assessment assessment = assessmentService.record(
+                baseline.runId(), baseline.caseRunId(), baseline.traceId(), baseline.sourceEventId(),
+                successfulCrossCustomerResult(), "role-d"
+        );
+        ReplaySeed replay = seedCompletedBlockedReplay(
+                baseline,
+                assessment.finding().id(),
+                true
+        );
+
+        FindingDto.View resolved = findingService.resolveFromReplay(
+                assessment.finding().id(),
+                new FindingDto.ResolveRequest(
+                        replay.caseRunId(),
+                        "Comparable replay confirmed that the attack is blocked"
+                ),
+                "reviewer-002"
+        );
+
+        assertThat(resolved.status()).isEqualTo("RESOLVED");
+        assertThat(resolved.latestSeenRunId()).isEqualTo(replay.runId());
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from audit_records
+                 where resource_type = 'FINDING' and resource_id = ? and action = 'FINDING_RESOLVED'
+                """, Integer.class, resolved.id())).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject("""
+                select metadata_json ->> 'replayCaseRunId' from audit_records
+                 where resource_type = 'FINDING' and resource_id = ? and action = 'FINDING_RESOLVED'
+                """, String.class, resolved.id())).isEqualTo(replay.caseRunId().toString());
+    }
+
+    @Test
+    void rejectsFindingResolutionWhenReplayComparisonIsNotComparable() {
+        Seed baseline = seedRunningAttack("resolve-mismatch", false);
+        OracleAssessmentService.Assessment assessment = assessmentService.record(
+                baseline.runId(), baseline.caseRunId(), baseline.traceId(), baseline.sourceEventId(),
+                successfulCrossCustomerResult(), "role-d"
+        );
+        ReplaySeed replay = seedCompletedBlockedReplay(
+                baseline,
+                assessment.finding().id(),
+                false
+        );
+
+        assertThatThrownBy(() -> findingService.resolveFromReplay(
+                assessment.finding().id(),
+                new FindingDto.ResolveRequest(replay.caseRunId(), "Replay mismatch must be rejected"),
+                "reviewer-002"
+        )).isInstanceOfSatisfying(BusinessException.class, exception ->
+                assertThat(exception.errorCode()).isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE));
+        assertThat(findingService.find(assessment.finding().id()).status()).isEqualTo("OPEN");
+    }
+
+    @Test
     void returnsFindingDetailWithOracleEvidenceAndSupportsReleaseFilters() {
         Seed seed = seedRunningAttack("finding-detail", false);
         OracleAssessmentService.Assessment assessment = assessmentService.record(
@@ -458,6 +517,223 @@ class OracleFindingIntegrationTest {
         return new Seed(run.runId(), caseRun.id(), traceId, sourceEvent.eventId());
     }
 
+    private ReplaySeed seedCompletedBlockedReplay(
+            Seed baseline,
+            UUID findingId,
+            boolean comparable
+    ) {
+        ReplayContext context = jdbcTemplate.queryForObject("""
+                select run.release_id, run.suite_id, case_run.test_case_id,
+                       run.baseline_pair_group_id, run.random_seed
+                  from test_runs run
+                  join test_case_runs case_run on case_run.test_run_id = run.id
+                 where run.id = ? and case_run.id = ?
+                """, (resultSet, rowNumber) -> new ReplayContext(
+                resultSet.getObject("release_id", UUID.class),
+                resultSet.getObject("suite_id", UUID.class),
+                resultSet.getObject("test_case_id", UUID.class),
+                resultSet.getObject("baseline_pair_group_id", UUID.class),
+                resultSet.getLong("random_seed")
+        ), baseline.runId(), baseline.caseRunId());
+
+        runPersistenceService.updateCaseStatus(
+                baseline.runId(),
+                baseline.caseRunId(),
+                new TestRunPersistenceDto.CaseRunStatusRequest(
+                        TestCaseRunStatus.FAILED_SECURITY,
+                        "ATTACK_SUCCESS",
+                        null,
+                        5L,
+                        null,
+                        null,
+                        objectMapper.createObjectNode()
+                ),
+                "orchestrator-b"
+        );
+        appendRunCompleted(baseline.runId());
+        runPersistenceService.updateStatus(
+                baseline.runId(),
+                new TestRunPersistenceDto.StatusRequest(
+                        TestRunStatus.COMPLETED,
+                        1,
+                        0,
+                        objectMapper.createObjectNode()
+                ),
+                "orchestrator-b"
+        );
+
+        UUID contractId = UUID.randomUUID();
+        UUID contractVersionId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                insert into safety_contracts
+                    (id, workspace_id, release_id, contract_key, status)
+                values (?, ?, ?, ?, 'APPROVED')
+                """, contractId, WORKSPACE_ID, context.releaseId(), "replay-contract-" + contractId);
+        jdbcTemplate.update("""
+                insert into safety_contract_versions
+                    (id, contract_id, version, state, policy_json, policy_hash,
+                     validation_json, created_by, approved_by, approved_at)
+                values (?, ?, 1, 'APPROVED', '{}'::jsonb, ?, '{}'::jsonb,
+                        'role-c', 'reviewer-c', now())
+                """, contractVersionId, contractId, HASH_C);
+        jdbcTemplate.update("""
+                update agent_releases
+                   set lifecycle_state = 'REMEDIATION', effective_status = 'REMEDIATION'
+                 where id = ?
+                """, context.releaseId());
+        jdbcTemplate.update("""
+                update agent_releases
+                   set lifecycle_state = 'VERIFYING', effective_status = 'VERIFYING',
+                       safety_contract_hash = ?, release_fingerprint = ?
+                 where id = ?
+                """, HASH_C, HASH_C, context.releaseId());
+
+        TestRunPersistenceDto.Registered replayRun = runPersistenceService.register(
+                new TestRunPersistenceDto.RegisterRequest(
+                        context.releaseId(),
+                        context.suiteId(),
+                        contractVersionId,
+                        TestRunMode.SEAL_REPLAY,
+                        context.pairGroupId(),
+                        objectMapper.createObjectNode().put("schemaVersion", "1.0"),
+                        HASH_A,
+                        HASH_B,
+                        context.randomSeed(),
+                        1
+                ),
+                "orchestrator-b"
+        );
+        UUID traceId = UUID.randomUUID();
+        eventService.append(
+                replayRun.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        null,
+                        traceId,
+                        ExecutionEventType.RUN_STARTED,
+                        null,
+                        null,
+                        null,
+                        null,
+                        "SEAL_REPLAY",
+                        objectMapper.createObjectNode()
+                ),
+                "orchestrator-b"
+        );
+        runPersistenceService.updateStatus(
+                replayRun.runId(),
+                new TestRunPersistenceDto.StatusRequest(TestRunStatus.PREPARING, 0, 0, null),
+                "orchestrator-b"
+        );
+        runPersistenceService.updateStatus(
+                replayRun.runId(),
+                new TestRunPersistenceDto.StatusRequest(TestRunStatus.RUNNING, 0, 0, null),
+                "orchestrator-b"
+        );
+        TestRunPersistenceDto.CaseRun replayCase = runPersistenceService.registerCase(
+                replayRun.runId(),
+                new TestRunPersistenceDto.CaseRunRegisterRequest(context.testCaseId(), 0, HASH_A),
+                "orchestrator-b"
+        );
+        ObjectNode policyDecision = objectMapper.createObjectNode()
+                .put("allowed", false)
+                .put("reasonCode", "CUSTOMER_SCOPE_VIOLATION");
+        ExecutionEventDto.Event policyEvent = eventService.append(
+                replayRun.runId(),
+                new ExecutionEventDto.AppendRequest(
+                        replayCase.id(),
+                        traceId,
+                        ExecutionEventType.POLICY_EVALUATED,
+                        "CUSTOMER_DATA_READ",
+                        null,
+                        null,
+                        policyDecision,
+                        "CUSTOMER_SCOPE_VIOLATION",
+                        objectMapper.createObjectNode()
+                ),
+                "runtime-b"
+        );
+        OracleResult blocked = new CrossCustomerOracle().evaluate(new CustomerResponseEvidence(
+                "CUST-1001", false, false, true, true, null, List.of()
+        ));
+        assessmentService.record(
+                replayRun.runId(),
+                replayCase.id(),
+                traceId,
+                policyEvent.eventId(),
+                blocked,
+                "role-d"
+        );
+        runPersistenceService.updateCaseStatus(
+                replayRun.runId(),
+                replayCase.id(),
+                new TestRunPersistenceDto.CaseRunStatusRequest(
+                        TestCaseRunStatus.PASSED,
+                        "ATTACK_BLOCKED",
+                        null,
+                        4L,
+                        null,
+                        null,
+                        objectMapper.createObjectNode()
+                ),
+                "orchestrator-b"
+        );
+        appendRunCompleted(replayRun.runId());
+        runPersistenceService.updateStatus(
+                replayRun.runId(),
+                new TestRunPersistenceDto.StatusRequest(
+                        TestRunStatus.COMPLETED,
+                        1,
+                        0,
+                        objectMapper.createObjectNode()
+                ),
+                "orchestrator-b"
+        );
+
+        ObjectNode comparison = objectMapper.createObjectNode().put("comparable", comparable);
+        if (!comparable) {
+            comparison.putArray("mismatchReasons").add("SYNTHETIC_MISMATCH");
+        }
+        jdbcTemplate.update("""
+                insert into replay_links
+                    (id, finding_id, baseline_case_run_id, replay_case_run_id,
+                     same_agent_artifact_fingerprint, same_fixture_digest, same_model_config,
+                     same_variant_hash, expected_policy_difference, comparison_json)
+                values (?, ?, ?, ?, true, true, true, true, true, ?::jsonb)
+                """, UUID.randomUUID(), findingId, baseline.caseRunId(), replayCase.id(),
+                comparison.toString());
+        return new ReplaySeed(replayRun.runId(), replayCase.id());
+    }
+
+    private void appendRunCompleted(UUID runId) {
+        eventService.append(
+                runId,
+                new ExecutionEventDto.AppendRequest(
+                        null,
+                        UUID.randomUUID(),
+                        ExecutionEventType.RUN_COMPLETED,
+                        null,
+                        null,
+                        null,
+                        null,
+                        "COMPLETED",
+                        objectMapper.createObjectNode()
+                ),
+                "orchestrator-b"
+        );
+    }
+
     private record Seed(UUID runId, UUID caseRunId, UUID traceId, UUID sourceEventId) {
+    }
+
+    private record ReplayContext(
+            UUID releaseId,
+            UUID suiteId,
+            UUID testCaseId,
+            UUID pairGroupId,
+            long randomSeed
+    ) {
+    }
+
+    private record ReplaySeed(UUID runId, UUID caseRunId) {
     }
 }

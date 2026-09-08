@@ -56,4 +56,16 @@ public class FindingController {
                 TraceIdFilter.currentTraceId()
         );
     }
+
+    @PostMapping("/findings/{findingId}:resolve")
+    ApiResponse<FindingDto.View> resolve(
+            @PathVariable UUID findingId,
+            @RequestBody FindingDto.ResolveRequest request,
+            @RequestHeader(value = "X-Actor-Id", required = false) String actorId
+    ) {
+        return ApiResponse.success(
+                findingService.resolveFromReplay(findingId, request, actorId),
+                TraceIdFilter.currentTraceId()
+        );
+    }
 }
