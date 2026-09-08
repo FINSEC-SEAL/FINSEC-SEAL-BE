@@ -37,6 +37,9 @@ import tools.jackson.databind.node.ObjectNode;
 @Order(Ordered.HIGHEST_PRECEDENCE + 10)
 public class IdempotencyFilter extends OncePerRequestFilter {
 
+    public static final String WORKSPACE = IdempotencyFilter.class.getName()+".workspace";
+    public static final String ADMISSION = IdempotencyFilter.class.getName()+".admission";
+    public record Admission(UUID recordId, String requestDigest) {}
     private static final Set<String> MUTATION_METHODS = Set.of("POST", "PUT", "PATCH", "DELETE");
     private static final Pattern KEY = Pattern.compile("^[A-Za-z0-9._:-]{1,128}$");
     private static final int MAX_REQUEST_BYTES = 2 * 1024 * 1024;
@@ -73,6 +76,7 @@ public class IdempotencyFilter extends OncePerRequestFilter {
             HttpServletResponse response,
             FilterChain filterChain
     ) throws ServletException, IOException {
+        UUID workspace = request.getAttribute(WORKSPACE) instanceof UUID value ? value : AgentService.DEMO_WORKSPACE_ID;
         String key = request.getHeader("Idempotency-Key");
         if (key == null || !KEY.matcher(key).matches()) {
             writeProblem(
@@ -103,10 +107,10 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                 request.getContentType(),
                 request.getHeader(HttpHeaders.IF_MATCH)
         );
-        deleteExpiredCompleted(actor, request.getMethod(), path, key);
-        boolean reserved = reserve(actor, request.getMethod(), path, key, requestDigest);
+        deleteExpiredCompleted(workspace, actor, request.getMethod(), path, key);
+        boolean reserved = reserve(workspace, actor, request.getMethod(), path, key, requestDigest);
         if (!reserved) {
-            StoredResponse stored = find(actor, request.getMethod(), path, key);
+            StoredResponse stored = find(workspace, actor, request.getMethod(), path, key);
             if (stored == null) {
                 writeProblem(response, ErrorCode.IDEMPOTENCY_IN_PROGRESS, "Idempotency reservation is being created");
                 return;
@@ -131,20 +135,25 @@ public class IdempotencyFilter extends OncePerRequestFilter {
             return;
         }
 
+        UUID admissionId = jdbcTemplate.queryForObject("""
+                select id from api_idempotency_records where workspace_id=? and actor_id=? and http_method=?
+                    and request_path=? and idempotency_key=? and request_digest=?
+                """, UUID.class, workspace, actor, request.getMethod(), path, key, requestDigest);
+        request.setAttribute(ADMISSION, new Admission(admissionId, requestDigest));
         CachedBodyRequest cachedRequest = new CachedBodyRequest(request, body);
         ContentCachingResponseWrapper cachedResponse = new ContentCachingResponseWrapper(response);
         try {
             filterChain.doFilter(cachedRequest, cachedResponse);
         } catch (ServletException | IOException | RuntimeException | Error exception) {
             markRecoveryRequired(
-                    actor, request.getMethod(), path, key, requestDigest, "REQUEST_CHAIN_FAILED"
+                    workspace, actor, request.getMethod(), path, key, requestDigest, "REQUEST_CHAIN_FAILED"
             );
             throw exception;
         }
         byte[] responseBody = cachedResponse.getContentAsByteArray();
         if (cachedResponse.getStatus() < 500) {
             store(
-                    actor,
+                    workspace, actor,
                     request.getMethod(),
                     path,
                     key,
@@ -157,13 +166,13 @@ public class IdempotencyFilter extends OncePerRequestFilter {
             );
         } else {
             markRecoveryRequired(
-                    actor, request.getMethod(), path, key, requestDigest, "HTTP_5XX_RESPONSE"
+                    workspace, actor, request.getMethod(), path, key, requestDigest, "HTTP_5XX_RESPONSE"
             );
         }
         cachedResponse.copyBodyToResponse();
     }
 
-    private StoredResponse find(String actor, String method, String path, String key) {
+    private StoredResponse find(UUID workspace, String actor, String method, String path, String key) {
         return jdbcTemplate.query("""
                 select request_digest, state, response_status, response_content_type, response_location,
                        response_trace_id, response_body
@@ -181,10 +190,10 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                                 resultSet.getBytes("response_body")
                         )
                         : null,
-                AgentService.DEMO_WORKSPACE_ID, actor, method, path, key);
+                workspace, actor, method, path, key);
     }
 
-    private boolean reserve(String actor, String method, String path, String key, String requestDigest) {
+    private boolean reserve(UUID workspace, String actor, String method, String path, String key, String requestDigest) {
         Instant now = Instant.now();
         return jdbcTemplate.update("""
                 insert into api_idempotency_records
@@ -195,7 +204,7 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                 do nothing
                 """,
                 UuidV7.generate(),
-                AgentService.DEMO_WORKSPACE_ID,
+                workspace,
                 actor,
                 method,
                 path,
@@ -206,16 +215,17 @@ public class IdempotencyFilter extends OncePerRequestFilter {
         ) == 1;
     }
 
-    private void deleteExpiredCompleted(String actor, String method, String path, String key) {
+    private void deleteExpiredCompleted(UUID workspace, String actor, String method, String path, String key) {
         jdbcTemplate.update("""
                 delete from api_idempotency_records
                  where workspace_id = ? and actor_id = ? and http_method = ?
                    and request_path = ? and idempotency_key = ?
                    and state = 'COMPLETED' and expires_at <= now()
-                """, AgentService.DEMO_WORKSPACE_ID, actor, method, path, key);
+                """, workspace, actor, method, path, key);
     }
 
     private void store(
+            UUID workspace,
             String actor,
             String method,
             String path,
@@ -250,7 +260,7 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                 Timestamp.from(now),
                 Timestamp.from(now),
                 Timestamp.from(now.plus(ttl)),
-                AgentService.DEMO_WORKSPACE_ID,
+                workspace,
                 actor,
                 method,
                 path,
@@ -263,6 +273,7 @@ public class IdempotencyFilter extends OncePerRequestFilter {
     }
 
     private void markRecoveryRequired(
+            UUID workspace,
             String actor,
             String method,
             String path,
@@ -285,7 +296,7 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                 instanceLease.transitionSecret(),
                 Timestamp.from(now),
                 reason,
-                AgentService.DEMO_WORKSPACE_ID,
+                workspace,
                 actor,
                 method,
                 path,
