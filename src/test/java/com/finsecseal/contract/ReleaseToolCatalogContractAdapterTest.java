@@ -37,6 +37,7 @@ import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import com.finsecseal.release.FingerprintService;
+import com.finsecseal.release.LoanReviewToolCatalog;
 import com.finsecseal.release.ReleaseDto.ToolCatalogResponse;
 import com.finsecseal.release.ReleaseService;
 import java.io.IOException;
@@ -44,6 +45,8 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
@@ -147,6 +150,10 @@ class ReleaseToolCatalogContractAdapterTest {
         );
         assertThat(result.releaseToolBindings()).extracting(ReleaseToolBinding::toolName)
                 .doesNotContain("LOAN_DECISION_UPDATE");
+        assertThat(result.inputSchemas()).containsOnlyKeys(
+                "CASE_CONTEXT_READ", "CUSTOMER_DATA_READ", "DOCUMENT_READER",
+                "LOAN_DECISION_UPDATE", "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE");
+        assertThat(result.inputSchemas()).isEqualTo(expectedInputSchemas());
         assertThat(semanticValidator.validate(
                 fixture("loan-review-safety-contract.json"),
                 result.semanticCatalog()
@@ -336,6 +343,7 @@ class ReleaseToolCatalogContractAdapterTest {
         List<ReleaseToolBinding> bindingsBeforeMutation = List.copyOf(result.releaseToolBindings());
         List<CatalogTool> declarationsBeforeMutation = List.copyOf(result.declaredTools());
         List<CatalogOutputField> outputFieldsBeforeMutation = List.copyOf(result.customerOutputFields());
+        Map<String, JsonNode> inputSchemasBeforeMutation = expectedInputSchemas();
         ((ObjectNode) customerFields(manifest).path("incomeBand")).put("type", "integer");
         customerFields(manifest).removeAll();
         tool(tools, "CUSTOMER_DATA_READ").put("description", RAW_SENTINEL);
@@ -345,6 +353,7 @@ class ReleaseToolCatalogContractAdapterTest {
         ((ObjectNode) serverCatalog.at("/tools/0")).put("operation", "READ");
         ((ObjectNode) serverCatalog.at("/tools/0")).put("sideEffectType", "MOCK_EXTERNAL_WRITE");
         ((ObjectNode) tool(tools, "CUSTOMER_DATA_READ").path("inputSchema")).removeAll();
+        ((ArrayNode) serverCatalog.at("/tools/0/inputSchema/properties/decision/enum")).add(RAW_SENTINEL);
         tools.removeAll();
         serverCatalog.removeAll();
 
@@ -356,6 +365,9 @@ class ReleaseToolCatalogContractAdapterTest {
         assertThat(result.declaredTools()).hasSize(6);
         assertThat(result.customerOutputFields()).containsExactlyElementsOf(outputFieldsBeforeMutation)
                 .containsExactlyElementsOf(expectedCustomerOutputFields());
+        assertThat(result.inputSchemas()).isEqualTo(inputSchemasBeforeMutation);
+        assertThatThrownBy(() -> result.inputSchemas().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> result.customerOutputFields().clear())
                 .isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> result.declaredTools().clear())
@@ -636,6 +648,7 @@ class ReleaseToolCatalogContractAdapterTest {
         assertThat(copy.releaseToolBindings()).containsExactlyElementsOf(actual.releaseToolBindings());
         assertThat(copy.declaredTools()).isEmpty();
         assertThat(copy.customerOutputFields()).isEmpty();
+        assertThat(copy.inputSchemas()).isEmpty();
         assertThatThrownBy(() -> copy.customerOutputFields().add(actual.customerOutputFields().getFirst()))
                 .isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> copy.declaredTools().add(actual.declaredTools().getFirst()))
@@ -656,6 +669,7 @@ class ReleaseToolCatalogContractAdapterTest {
         assertThat(semanticOnly.releaseToolBindings()).isEmpty();
         assertThat(semanticOnly.declaredTools()).isEmpty();
         assertThat(semanticOnly.customerOutputFields()).isEmpty();
+        assertThat(semanticOnly.inputSchemas()).isEmpty();
         assertThat(semanticOnly.semanticCatalog()).isEqualTo(actual.semanticCatalog());
         assertThat(semanticValidator.validate(fixture("loan-review-safety-contract.json"),
                 semanticOnly.semanticCatalog()).status()).isEqualTo(ValidationStatus.VALID);
@@ -687,6 +701,7 @@ class ReleaseToolCatalogContractAdapterTest {
         assertThat(copy.declaredTools()).containsExactlyElementsOf(actual.declaredTools()).hasSize(6);
         assertThat(copy.releaseToolBindings()).containsExactlyElementsOf(actual.releaseToolBindings()).hasSize(5);
         assertThat(copy.customerOutputFields()).isEmpty();
+        assertThat(copy.inputSchemas()).isEmpty();
         assertThat(semanticValidator.validate(fixture("loan-review-safety-contract.json"),
                 copy.semanticCatalog()).status()).isEqualTo(ValidationStatus.VALID);
         assertThatThrownBy(() -> copy.declaredTools().add(new CatalogTool("EXTRA_TOOL", "READ", false)))
@@ -707,10 +722,70 @@ class ReleaseToolCatalogContractAdapterTest {
         metadata.set(0, new CatalogOutputField("accountNumber", Sensitivity.NORMAL, OutputValueType.INTEGER));
         metadata.clear();
 
-        assertThat(copy).isEqualTo(actual);
+        assertThat(copy.releaseId()).isEqualTo(actual.releaseId());
+        assertThat(copy.manifestSchemaVersion()).isEqualTo(actual.manifestSchemaVersion());
+        assertThat(copy.agentArtifactFingerprint()).isEqualTo(actual.agentArtifactFingerprint());
+        assertThat(copy.releaseFingerprint()).isEqualTo(actual.releaseFingerprint());
+        assertThat(copy.serverToolCatalogHash()).isEqualTo(actual.serverToolCatalogHash());
+        assertThat(copy.semanticCatalog()).isEqualTo(actual.semanticCatalog());
+        assertThat(copy.releaseToolBindings()).containsExactlyElementsOf(actual.releaseToolBindings());
+        assertThat(copy.declaredTools()).containsExactlyElementsOf(actual.declaredTools());
         assertThat(copy.customerOutputFields()).containsExactlyElementsOf(expectedCustomerOutputFields());
+        assertThat(copy.inputSchemas()).isEmpty();
         assertThatThrownBy(() -> copy.customerOutputFields().clear())
                 .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void tenthArgumentConstructorAndAccessorIsolateNestedInputSchemas() throws IOException {
+        SourceBoundCatalog actual = load(authoritativeSource(fixture("valid-release-manifest-v1.1.json")));
+        Map<String, JsonNode> expected = expectedInputSchemas();
+        Map<String, JsonNode> supplied = new TreeMap<>(actual.inputSchemas());
+        SourceBoundCatalog copy = new SourceBoundCatalog(
+                actual.releaseId(), actual.manifestSchemaVersion(), actual.agentArtifactFingerprint(),
+                actual.releaseFingerprint(), actual.serverToolCatalogHash(), actual.semanticCatalog(),
+                actual.releaseToolBindings(), actual.declaredTools(), actual.customerOutputFields(), supplied
+        );
+        assertThat(copy).isEqualTo(actual);
+
+        ((ObjectNode) supplied.get("CUSTOMER_DATA_READ").at("/properties/customerIds/items")).put("minLength", 99);
+        ((ArrayNode) supplied.get("LOAN_DECISION_UPDATE").at("/properties/decision/enum")).add(RAW_SENTINEL);
+        supplied.put("EXTRA_TOOL", objectMapper.createObjectNode());
+        supplied.clear();
+
+        assertThat(copy.inputSchemas()).isEqualTo(expected);
+        Map<String, JsonNode> returned = copy.inputSchemas();
+        assertThat(copy.inputSchemas()).isNotSameAs(returned);
+        assertThat(copy.inputSchemas().get("CUSTOMER_DATA_READ"))
+                .isNotSameAs(returned.get("CUSTOMER_DATA_READ"));
+        ((ObjectNode) returned.get("CUSTOMER_DATA_READ").at("/properties/customerIds/items"))
+                .put("description", RAW_SENTINEL);
+        ((ArrayNode) returned.get("CUSTOMER_DATA_READ").path("required")).removeAll();
+        ((ArrayNode) returned.get("LOAN_DECISION_UPDATE").at("/properties/decision/enum")).removeAll();
+        ((ObjectNode) returned.get("DOCUMENT_READER")).removeAll();
+        assertThatThrownBy(returned::clear).isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> copy.inputSchemas().put("EXTRA_TOOL", objectMapper.createObjectNode()))
+                .isInstanceOf(UnsupportedOperationException.class);
+
+        assertThat(copy.inputSchemas()).isEqualTo(expected);
+        assertThat(actual.inputSchemas()).isEqualTo(expected);
+        assertThat(copy).isEqualTo(actual);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "null", "[]", "42", "true", "\"RAW-CATALOG-SENTINEL-DO-NOT-EXPOSE\""})
+    void rejectsMissingOrNonObjectHumanInputSchemaWithoutUsingNormalToolFallback(String value) throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode serverCatalog = copiedServerCatalog(manifest);
+        ObjectNode humanTool = (ObjectNode) serverCatalog.at("/tools/0");
+        if ("missing".equals(value)) {
+            humanTool.remove("inputSchema");
+        } else {
+            humanTool.set("inputSchema", objectMapper.readTree(value));
+        }
+
+        // Recompute the A hash so this exercises the schema carrier, not the existing hash guard.
+        assertSafeFailure(failureFor(sourceWithServerCatalog(manifest, serverCatalog)), INVALID_HIGH_IMPACT_CATALOG);
     }
 
     @ParameterizedTest
@@ -1265,6 +1340,17 @@ class ReleaseToolCatalogContractAdapterTest {
     private ObjectNode customerFields(ObjectNode manifest) {
         return (ObjectNode) tool(manifest.path("tools"), "CUSTOMER_DATA_READ")
                 .at("/outputSchema/properties/rows/items/properties/fields/properties");
+    }
+
+    private static Map<String, JsonNode> expectedInputSchemas() {
+        Map<String, JsonNode> schemas = new TreeMap<>();
+        for (JsonNode tool : LoanReviewToolCatalog.normalTools()) {
+            schemas.put(tool.path("name").stringValue(), tool.path("inputSchema").deepCopy());
+        }
+        for (JsonNode tool : LoanReviewToolCatalog.serverToolCatalog().path("tools")) {
+            schemas.put(tool.path("name").stringValue(), tool.path("inputSchema").deepCopy());
+        }
+        return schemas;
     }
 
     private static List<CatalogOutputField> expectedCustomerOutputFields() {
