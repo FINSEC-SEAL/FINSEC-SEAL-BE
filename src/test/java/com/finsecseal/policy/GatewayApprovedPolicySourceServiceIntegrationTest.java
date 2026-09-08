@@ -19,6 +19,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 import com.finsecseal.agent.AgentDto;
@@ -225,6 +226,59 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
     }
 
     @Test
+    void committedSemanticValidationIsReusedAfterFreshAuthorizedOwnerAndHashReads() throws Exception {
+        Seed seed = seed(TestRunMode.SEAL_REPLAY);
+        AtomicInteger sourceCanonicalizations = observeCacheSourceReads(seed);
+        clearOwnerInvocations(); // A fixture validation/canonicalization is not a source cache miss.
+
+        ApprovedPolicySource first = committedSource(seed);
+        assertCacheReadCounts(seed, 1, 1, sourceCanonicalizations);
+        ObjectNode detachedPolicy = (ObjectNode) first.policy();
+        detachedPolicy.put("purpose", "FORGED");
+        ((ArrayNode) detachedPolicy.path("allowedTools")).removeAll();
+
+        ApprovedPolicySource second = committedSource(seed);
+
+        assertCacheReadCounts(seed, 2, 1, sourceCanonicalizations);
+        assertThat(second).isNotSameAs(first);
+        assertThat(second.identity()).isEqualTo(first.identity());
+        assertThat(second.catalog()).isEqualTo(first.catalog());
+        assertThat(second.policy()).isEqualTo(first.policy()).isNotEqualTo(detachedPolicy);
+        assertThat(second.canonicalPolicy()).isEqualTo(first.canonicalPolicy());
+        assertSource(first, seed, TestRunMode.SEAL_REPLAY);
+        assertSource(second, seed, TestRunMode.SEAL_REPLAY);
+    }
+
+    @Test
+    void actualOuterRollbackDoesNotPublishValidationButTheNextCommitDoes() throws Exception {
+        Seed seed = seed(TestRunMode.SEAL_REPLAY);
+        AtomicInteger sourceCanonicalizations = observeCacheSourceReads(seed);
+        TransactionTemplate outer = new TransactionTemplate(transactions);
+        outer.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        Baseline beforeRollback = baseline(seed.releaseId());
+        clearOwnerInvocations();
+
+        outer.executeWithoutResult(status -> {
+            assertSource(sources.load(seed.runId(), seed.caseRunId(), REVIEWER), seed, TestRunMode.SEAL_REPLAY);
+            assertPhysicalTransaction(physicalTransaction());
+            assertThat(canAcquireReleaseLock(seed.releaseId())).isFalse();
+            assertCacheReadCounts(seed, 1, 1, sourceCanonicalizations);
+            status.setRollbackOnly();
+        });
+
+        assertNoAmbientTransaction();
+        assertThat(canAcquireReleaseLock(seed.releaseId())).isTrue();
+        // A preserves these access audits on rollback; the pending C validation must not be published.
+        assertUnchanged(beforeRollback, seed.releaseId(), 2);
+        ApprovedPolicySource afterRollback = committedSource(seed);
+        assertCacheReadCounts(seed, 2, 2, sourceCanonicalizations);
+        ApprovedPolicySource afterCommit = committedSource(seed);
+        assertCacheReadCounts(seed, 3, 2, sourceCanonicalizations);
+        assertThat(afterCommit).isNotSameAs(afterRollback);
+        assertThat(afterCommit.policy()).isEqualTo(afterRollback.policy());
+    }
+
+    @Test
     void baselineIsRejectedBeforeApprovalCaseAndCatalogReads() throws Exception {
         Seed seed = seed(TestRunMode.BASELINE);
         Baseline before = baseline(seed.releaseId());
@@ -266,6 +320,8 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
     @Test
     void actualOwnerRejectsForeignWorkspaceBeforeCaseAndCatalogDisclosure(CapturedOutput output) throws Exception {
         Seed seed = seed(TestRunMode.SEAL_REPLAY);
+        clearOwnerInvocations();
+        committedSource(seed); // A committed positive cache entry cannot replace current authorization.
         ReviewerContext foreign = new ReviewerContext(UUID.randomUUID(), ACTOR, REVIEWER.role(), SESSION,
                 true, true, false);
         Baseline before = baseline(seed.releaseId());
@@ -280,6 +336,7 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
         verify(contracts).approved(seed.releaseId(), seed.approved().id(), foreign);
         assertNoCaseOrCatalogRead();
         assertUnchanged(before, seed.releaseId(), 0);
+        assertNoAmbientTransaction();
         assertThat(canAcquireReleaseLock(seed.releaseId())).isTrue();
         assertThat(output.getAll()).doesNotContain(SESSION, PROMPT, STORED, RAW_ERROR);
     }
@@ -287,6 +344,8 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
     @Test
     void olderStoredApprovalCannotAuthorizeTheRunAfterANewerApproval() throws Exception {
         Seed seed = seed(TestRunMode.SEAL_REPLAY);
+        clearOwnerInvocations();
+        committedSource(seed); // Warm v1 before the existing owner-controlled replacement fixture.
         Version validated = nextValidated(seed);
         Version newer = contracts.approve(validated.id(), etag(validated), "Reviewed replacement", REVIEWER);
         assertThat(contracts.find(seed.approved().id(), REVIEWER).state()).isEqualTo("APPROVED");
@@ -300,8 +359,10 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
                     assertSafeException(failure);
                 });
 
+        verify(contracts).approved(seed.releaseId(), seed.approved().id(), REVIEWER);
         assertNoCaseOrCatalogRead();
         assertUnchanged(before, seed.releaseId(), 0);
+        assertNoAmbientTransaction();
         assertThat(canAcquireReleaseLock(seed.releaseId())).isTrue();
     }
 
@@ -523,6 +584,7 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
         ((ObjectNode) manifest.path("systemPrompt")).put("text", PROMPT);
         UUID releaseId = releases.create(agent.id(), manifest, ACTOR).id();
         releases.analyze(releaseId, ACTOR);
+        // Existing test setup seam, not evidence of a public lifecycle transition.
         jdbc.update("update agent_releases set lifecycle_state='REMEDIATION',effective_status='REMEDIATION' where id=?", releaseId);
         String preApproval = releases.find(releaseId).releaseFingerprint();
         Version candidate = contracts.create(releaseId, policy(1), REVIEWER);
@@ -557,6 +619,7 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
     }
 
     private Version nextValidated(Seed seed) throws Exception {
+        // Preserve the existing REMEDIATION fixture seam; A's active-Run guard below remains real.
         jdbc.update("update agent_releases set lifecycle_state='REMEDIATION',effective_status='REMEDIATION' where id=?", seed.releaseId());
         Version candidate = contracts.create(seed.releaseId(), policy(2), REVIEWER);
         assertThatThrownBy(() -> contracts.validate(candidate.id(), etag(candidate), REVIEWER))
@@ -817,6 +880,44 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
         assertThat(mapper.readTree(source.canonicalPolicy().canonicalJson())).isEqualTo(source.policy());
     }
 
+    private ApprovedPolicySource committedSource(Seed seed) {
+        Baseline before = baseline(seed.releaseId());
+        ApprovedPolicySource source = sources.load(seed.runId(), seed.caseRunId(), REVIEWER);
+        assertSource(source, seed, TestRunMode.SEAL_REPLAY);
+        assertUnchanged(before, seed.releaseId(), 2);
+        assertNoAmbientTransaction();
+        assertThat(canAcquireReleaseLock(seed.releaseId())).isTrue();
+        return source;
+    }
+
+    private AtomicInteger observeCacheSourceReads(Seed seed) {
+        var sourceCanonicalizations = new AtomicInteger();
+        doAnswer(invocation -> {
+            assertPhysicalTransaction(physicalTransaction());
+            return invocation.callRealMethod();
+        }).when(runs).find(seed.runId());
+        doAnswer(invocation -> {
+            assertPhysicalTransaction(physicalTransaction());
+            return invocation.callRealMethod();
+        }).when(contracts).approved(seed.releaseId(), seed.approved().id(), REVIEWER);
+        finalCanonicalization(() -> {
+            assertPhysicalTransaction(physicalTransaction());
+            assertThat(canAcquireReleaseLock(seed.releaseId())).isFalse();
+            sourceCanonicalizations.incrementAndGet();
+        });
+        return sourceCanonicalizations;
+    }
+
+    private void assertCacheReadCounts(Seed seed, int loads, int semanticValidations,
+            AtomicInteger sourceCanonicalizations) {
+        verify(runs, times(loads)).find(seed.runId());
+        verify(contracts, times(loads)).approved(seed.releaseId(), seed.approved().id(), REVIEWER);
+        verify(cases, times(loads)).findCase(seed.caseRunId());
+        verify(catalogs, times(loads)).load(seed.releaseId(), ACTOR);
+        verify(validator, times(semanticValidations)).validate(any(), any());
+        assertThat(sourceCanonicalizations.get()).isEqualTo(loads);
+    }
+
     private void finalCanonicalization(AssemblyHook hook) {
         AtomicBoolean catalogReturned = new AtomicBoolean();
         doAnswer(invocation -> {
@@ -825,7 +926,7 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
             return result;
         }).when(catalogs).load(any(), any());
         doAnswer(invocation -> {
-            // A also canonicalizes while checking stored integrity; pause only C's final assembly.
+            // A also canonicalizes stored integrity; identify only C's cold or hit policy hash check.
             if (catalogReturned.compareAndSet(true, false)) hook.run();
             return invocation.callRealMethod();
         }).when(canonicalizer).canonicalizeAndHash(any());

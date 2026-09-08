@@ -11,6 +11,7 @@ import com.finsecseal.contract.SafetyContractCanonicalizer.CanonicalPolicy;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.ReviewerContext;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.VersionIdentity;
 import com.finsecseal.contract.SafetyContractSemanticValidator;
+import com.finsecseal.contract.SafetyContractSemanticValidator.ContractValidationCatalog;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ValidationResult;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ValidationStatus;
 import com.finsecseal.evidence.TestRunDto.Projection;
@@ -23,23 +24,42 @@ import com.finsecseal.platform.contract.ContractPersistenceService.Version;
 import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
 import com.finsecseal.policy.PolicyToolTrustFacts.ToolTrustPolicy;
 import com.finsecseal.policy.PolicyToolTrustFacts.TrustLevel;
+import com.finsecseal.release.DigestService;
 import java.math.BigInteger;
 import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import tools.jackson.databind.JsonNode;
 
 /** Reads current approved policy sources. A snapshot is neither preflight PASS nor execution authority. */
 @Service
 public class GatewayApprovedPolicySourceService {
+    private static final int DEFAULT_CACHE_CAPACITY = 128;
+    private static final int MAX_CACHE_METADATA_ITEMS = 1024;
+    private static final int MAX_CACHE_METADATA_CHARACTERS = 32768;
+    private static final long CACHE_TTL_NANOS = TimeUnit.MINUTES.toNanos(5);
+    private final Object cacheLock = new Object();
+    private final Map<ValidationKey, ValidationEntry> validationCache = new LinkedHashMap<>();
+    private final DigestService digests = new DigestService();
+    private final LongSupplier nanoClock;
+    private final int entryCapacity;
+    private final int pendingCapacity;
+    private long invalidationEpoch;
+    private int pendingFills;
     private final TestRunProjectionService runs;
     private final ContractPersistenceService contracts;
     private final TestRunPersistenceService cases;
@@ -47,10 +67,26 @@ public class GatewayApprovedPolicySourceService {
     private final SafetyContractSemanticValidator validator;
     private final SafetyContractCanonicalizer canonicalizer;
 
+    @Autowired
     public GatewayApprovedPolicySourceService(TestRunProjectionService runs,
             ContractPersistenceService contracts, TestRunPersistenceService cases,
             ReleaseToolCatalogContractAdapter catalogs, SafetyContractSemanticValidator validator,
             SafetyContractCanonicalizer canonicalizer) {
+        this(runs, contracts, cases, catalogs, validator, canonicalizer, System::nanoTime,
+                DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_CAPACITY);
+    }
+
+    GatewayApprovedPolicySourceService(TestRunProjectionService runs,
+            ContractPersistenceService contracts, TestRunPersistenceService cases,
+            ReleaseToolCatalogContractAdapter catalogs, SafetyContractSemanticValidator validator,
+            SafetyContractCanonicalizer canonicalizer, LongSupplier nanoClock,
+            int entryCapacity, int pendingCapacity) {
+        if (entryCapacity <= 0 || pendingCapacity <= 0) {
+            throw new IllegalArgumentException("Cache capacities must be positive");
+        }
+        this.nanoClock = Objects.requireNonNull(nanoClock);
+        this.entryCapacity = entryCapacity;
+        this.pendingCapacity = pendingCapacity;
         this.runs = Objects.requireNonNull(runs);
         this.contracts = Objects.requireNonNull(contracts);
         this.cases = Objects.requireNonNull(cases);
@@ -70,6 +106,9 @@ public class GatewayApprovedPolicySourceService {
         if (runId == null || testCaseRunId == null || reviewer == null) {
             throw failure(FailureCode.INVALID_REQUEST);
         }
+        // Capture before owner I/O: invalidation during a read must also cancel its later fill.
+        long epoch;
+        synchronized (cacheLock) { epoch = invalidationEpoch; }
         try {
             Projection run = runs.find(runId);
             requireRun(run, runId);
@@ -93,16 +132,25 @@ public class GatewayApprovedPolicySourceService {
                 throw failure(FailureCode.CATALOG_BINDING_INVALID);
             }
             List<ReleaseToolBinding> bindings = requireToolBindings(catalog);
-            ValidationResult validation = validator.validate(policy, catalog.semanticCatalog());
-            if (validation == null || validation.status() == ValidationStatus.INVALID) {
-                throw failure(FailureCode.POLICY_INVALID);
+            ValidationKey key = validationKey(version, catalog, policy);
+            ValidationResult validation = cachedValidation(key);
+            boolean hit = validation != null;
+            if (!hit) {
+                // Preserve the cold path's semantic error and canonicalizer invocation order.
+                validation = validator.validate(policy, catalog.semanticCatalog());
+                if (validation == null || validation.status() == ValidationStatus.INVALID) {
+                    throw failure(FailureCode.POLICY_INVALID);
+                }
             }
+            // A tentative hit never substitutes for verifying the current copied policy bytes.
             CanonicalPolicy canonical = canonicalizer.canonicalizeAndHash(policy);
             if (canonical == null || !version.policyHash().equals(canonical.policyHash())) {
                 throw failure(FailureCode.POLICY_INTEGRITY_FAILURE);
             }
-            return new ApprovedPolicySource(run, caseRun, version, policy, catalog, validation, canonical,
-                    bindings, toolTrustPolicy(policy));
+            ApprovedPolicySource source = new ApprovedPolicySource(run, caseRun, version, policy, catalog,
+                    validation, canonical, bindings, toolTrustPolicy(policy));
+            if (!hit) publishAfterCommit(key, validation, epoch);
+            return source;
         } catch (PolicySourceException | BusinessException exception) {
             // Preserve A's established authorization/not-found/integrity error contract.
             throw exception;
@@ -111,6 +159,121 @@ public class GatewayApprovedPolicySourceService {
             throw failure(FailureCode.SOURCE_UNAVAILABLE);
         }
     }
+
+    /** Local eviction only; the caller must supply committed owner notifications separately. */
+    public void invalidateRelease(UUID releaseId) {
+        if (releaseId == null) throw failure(FailureCode.INVALID_REQUEST);
+        synchronized (cacheLock) {
+            invalidationEpoch++;
+            validationCache.keySet().removeIf(key -> releaseId.equals(key.releaseId()));
+        }
+    }
+
+    private ValidationKey validationKey(Version version, SourceBoundCatalog catalog, JsonNode policy) {
+        try {
+            ValidationKey key = new ValidationKey(version.workspaceId(), version.releaseId(), version.id(),
+                    version.policyHash(), version.resourceHash(), catalog.agentArtifactFingerprint(),
+                    catalog.releaseFingerprint(), catalog.manifestSchemaVersion(), catalog.serverToolCatalogHash(),
+                    digests.sha256(policy.toString()), catalog.semanticCatalog());
+            return cacheMetadataFits(key, null) ? key : null;
+        } catch (RuntimeException exception) {
+            // Serialization/admission is optional. Do not replace the original source validation path.
+            return null;
+        }
+    }
+
+    private ValidationResult cachedValidation(ValidationKey key) {
+        if (key == null) return null;
+        synchronized (cacheLock) {
+            long now = nanoClock.getAsLong();
+            ValidationEntry entry = validationCache.get(key);
+            if (entry == null) return null;
+            if (now - entry.writtenAt() >= CACHE_TTL_NANOS) {
+                validationCache.remove(key);
+                return null;
+            }
+            return entry.validation();
+        }
+    }
+
+    private void publishAfterCommit(ValidationKey key, ValidationResult validation, long epoch) {
+        if (key == null || !cacheMetadataFits(key, validation)
+                || !TransactionSynchronizationManager.isSynchronizationActive()) return;
+        synchronized (cacheLock) {
+            if (epoch != invalidationEpoch || pendingFills >= pendingCapacity) return;
+            pendingFills++;
+        }
+        // Capture only bounded immutable validation metadata, never the policy/source/reviewer.
+        TransactionSynchronization publication = new TransactionSynchronization() {
+            private boolean completed;
+
+            @Override
+            public void afterCommit() {
+                synchronized (cacheLock) {
+                    if (completed || epoch != invalidationEpoch) return;
+                    long now = nanoClock.getAsLong();
+                    validationCache.remove(key);
+                    validationCache.put(key, new ValidationEntry(validation, now));
+                    while (validationCache.size() > entryCapacity) {
+                        validationCache.remove(validationCache.keySet().iterator().next());
+                    }
+                }
+            }
+
+            @Override
+            public void afterCompletion(int status) {
+                synchronized (cacheLock) {
+                    if (!completed) {
+                        completed = true;
+                        pendingFills--;
+                    }
+                }
+            }
+        };
+        try {
+            TransactionSynchronizationManager.registerSynchronization(publication);
+        } catch (RuntimeException exception) {
+            publication.afterCompletion(TransactionSynchronization.STATUS_UNKNOWN);
+        }
+    }
+
+    private static boolean cacheMetadataFits(ValidationKey key, ValidationResult validation) {
+        MetadataBudget budget = new MetadataBudget();
+        if (!budget.add(key.policyHash()) || !budget.add(key.resourceHash())
+                || !budget.add(key.agentArtifactFingerprint()) || !budget.add(key.releaseFingerprint())
+                || !budget.add(key.manifestSchemaVersion()) || !budget.add(key.serverToolCatalogHash())
+                || !budget.add(key.rawPolicyDigest())) return false;
+        for (var tool : key.semanticCatalog().enabledReleaseTools()) {
+            if (!budget.add(tool.toolName())) return false;
+            for (String field : tool.outputFields()) if (!budget.add(field)) return false;
+        }
+        for (String name : key.semanticCatalog().highImpactToolNames()) if (!budget.add(name)) return false;
+        if (validation != null) {
+            for (var issue : validation.issues()) {
+                if (!budget.add(issue.jsonPointer()) || !budget.add(issue.code())
+                        || !budget.add(issue.message())) return false;
+            }
+        }
+        return true;
+    }
+
+    private static final class MetadataBudget {
+        private int items;
+        private long characters;
+
+        private boolean add(String value) {
+            if (value == null || ++items > MAX_CACHE_METADATA_ITEMS) return false;
+            characters += value.length();
+            return characters <= MAX_CACHE_METADATA_CHARACTERS;
+        }
+    }
+
+    private record ValidationKey(UUID workspaceId, UUID releaseId, UUID versionId, String policyHash,
+            String resourceHash, String agentArtifactFingerprint, String releaseFingerprint,
+            String manifestSchemaVersion, String serverToolCatalogHash, String rawPolicyDigest,
+            ContractValidationCatalog semanticCatalog) {}
+
+    private record ValidationEntry(ValidationResult validation, long writtenAt) {}
 
     private static List<ReleaseToolBinding> requireToolBindings(SourceBoundCatalog catalog) {
         List<ReleaseToolBinding> bindings = catalog.releaseToolBindings();

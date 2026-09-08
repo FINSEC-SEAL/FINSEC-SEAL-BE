@@ -4,12 +4,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -29,6 +33,10 @@ import com.finsecseal.contract.SafetyContractSemanticValidator;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ContractValidationCatalog;
 import com.finsecseal.contract.SafetyContractSemanticValidator.EnabledTool;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ValidationStatus;
+import com.finsecseal.contract.SafetyContractSemanticValidator.ValidationResult;
+import com.finsecseal.contract.SafetyContractSemanticValidator.Issue;
+import com.finsecseal.contract.SafetyContractSemanticValidator.IssueSeverity;
+import com.finsecseal.policy.GatewayApprovedPolicySourceService.ApprovedPolicySource;
 import com.finsecseal.evidence.TestRunDto.Projection;
 import com.finsecseal.evidence.TestRunPersistenceDto.CaseRun;
 import com.finsecseal.evidence.TestRunPersistenceService;
@@ -48,6 +56,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -57,6 +69,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
+import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
@@ -133,7 +146,10 @@ class GatewayApprovedPolicySourceServiceTest {
     }
 
     @AfterEach
-    void cleanup() { TransactionSynchronizationManager.clear(); }
+    void cleanup() {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) finishSynchronization(false);
+        TransactionSynchronizationManager.clear();
+    }
 
     @ParameterizedTest
     @EnumSource(value = TestRunMode.class, names = {"SEAL_REPLAY", "HELD_OUT", "REGRESSION"})
@@ -482,6 +498,546 @@ class GatewayApprovedPolicySourceServiceTest {
         verify(contracts).approved(RELEASE, VERSION, untrusted);
         verifyNoMoreInteractions(contracts);
         verifyNoInteractions(cases, catalogs);
+    }
+
+    @Test
+    void committedValidationIsReusedButCurrentOwnersHashAndNewSnapshotsAreAlwaysRead() {
+        cacheService(128, 128);
+        var first = committedLoad();
+        when(runs.find(RUN)).thenReturn(change(run, Projection.class, "status", TestRunStatus.COMPLETED));
+        when(cases.findCase(CASE_RUN)).thenReturn(change(caseRun, CaseRun.class, "status", TestCaseRunStatus.PASSED));
+        List<ReleaseToolBinding> changedBindings = new ArrayList<>(fixtureBindings());
+        changedBindings.set(0, fixtureBinding("CASE_CONTEXT_READ", "b", "c"));
+        var freshCatalog = catalogWithBindings(changedBindings);
+        when(catalogs.load(RELEASE, REVIEWER.actorId())).thenReturn(freshCatalog);
+        var second = committedLoad();
+
+        verify(validator).validate(any(), any());
+        verify(canonicalizer, times(2)).canonicalizeAndHash(any());
+        verify(runs, times(2)).find(RUN);
+        verify(contracts, times(2)).approved(RELEASE, VERSION, REVIEWER);
+        verify(cases, times(2)).findCase(CASE_RUN);
+        verify(catalogs, times(2)).load(RELEASE, REVIEWER.actorId());
+        assertThat(second).isNotSameAs(first);
+        assertThat(first.runStatus()).isEqualTo(TestRunStatus.RUNNING);
+        assertThat(second.runStatus()).isEqualTo(TestRunStatus.COMPLETED);
+        assertThat(second.caseStatus()).isEqualTo(TestCaseRunStatus.PASSED);
+        assertThat(second.catalog()).isSameAs(freshCatalog);
+        assertThat(second.releaseToolBindings()).containsExactlyElementsOf(changedBindings);
+        ((ObjectNode) first.policy()).put("private", CANARY);
+        assertThat(second.policy().has("private")).isFalse();
+        assertThatThrownBy(() -> second.validation().issues().clear()).isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void exactEqualCopiedSemanticCatalogCanReuseValidation() {
+        cacheService(128, 128);
+        committedLoad();
+        var copy = new ContractValidationCatalog(new ArrayList<>(catalog.semanticCatalog().enabledReleaseTools()),
+                new ArrayList<>(catalog.semanticCatalog().highImpactToolNames()));
+        when(catalogs.load(RELEASE, REVIEWER.actorId())).thenReturn(catalogWithSemantic(copy));
+        committedLoad();
+        verify(validator).validate(any(), any());
+        verify(canonicalizer, times(2)).canonicalizeAndHash(any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"workspace", "release", "version", "resourceHash", "artifact", "releaseFingerprint",
+            "manifestVersion", "serverCatalogHash", "semanticCatalog", "rawPolicyDigest"})
+    void everyIndependentReusableIdentityComponentSeparatesValidation(String changed) {
+        cacheService(128, 128);
+        committedLoad();
+        ReviewerContext reviewer = REVIEWER;
+        Version nextVersion = version;
+        Projection nextRun = run;
+        SourceBoundCatalog nextCatalog = catalog;
+        switch (changed) {
+            case "workspace" -> {
+                reviewer = new ReviewerContext(OTHER, REVIEWER.actorId(), REVIEWER.role(), CANARY, true, true, false);
+                nextVersion = change(version, Version.class, "workspaceId", OTHER);
+            }
+            case "release" -> {
+                nextVersion = change(version, Version.class, "releaseId", OTHER);
+                nextRun = change(run, Projection.class, "releaseId", OTHER);
+                nextCatalog = change(catalog, SourceBoundCatalog.class, "releaseId", OTHER);
+            }
+            case "version" -> {
+                nextVersion = change(version, Version.class, "id", OTHER);
+                nextRun = change(run, Projection.class, "contractVersionId", OTHER);
+            }
+            case "resourceHash" -> nextVersion = change(version, Version.class, "resourceHash", ARTIFACT);
+            case "artifact" -> {
+                nextRun = change(run, Projection.class, "agentArtifactFingerprint", HASH);
+                nextCatalog = change(catalog, SourceBoundCatalog.class, "agentArtifactFingerprint", HASH);
+            }
+            case "releaseFingerprint" -> {
+                nextRun = change(run, Projection.class, "releaseFingerprint", HASH);
+                nextCatalog = change(catalog, SourceBoundCatalog.class, "releaseFingerprint", HASH);
+            }
+            case "manifestVersion" -> {
+                // Synthetic adapter-result key test only: the real constructor accepts only 1.1.
+                nextCatalog = spy(catalog);
+                doReturn("future-schema-key").when(nextCatalog).manifestSchemaVersion();
+            }
+            case "serverCatalogHash" -> nextCatalog = change(catalog, SourceBoundCatalog.class, "serverToolCatalogHash", ARTIFACT);
+            case "semanticCatalog" -> nextCatalog = catalogWithDocumentFields(List.of("lookupKey"));
+            case "rawPolicyDigest" -> {
+                var entries = new ArrayList<>(version.policy().properties());
+                Collections.reverse(entries);
+                ObjectNode reordered = json.createObjectNode();
+                entries.forEach(entry -> reordered.set(entry.getKey(), entry.getValue()));
+                nextVersion = change(version, Version.class, "policy", reordered);
+            }
+            default -> throw new AssertionError(changed);
+        }
+        when(runs.find(RUN)).thenReturn(nextRun);
+        when(contracts.approved(nextRun.releaseId(), nextRun.contractVersionId(), reviewer))
+                .thenReturn(new ApprovedContract(nextVersion, nextRun.agentArtifactFingerprint(), nextRun.releaseFingerprint()));
+        when(catalogs.load(nextRun.releaseId(), reviewer.actorId())).thenReturn(nextCatalog);
+        beginSynchronization();
+        service.load(RUN, CASE_RUN, reviewer);
+        finishSynchronization(true);
+        verify(validator, times(2)).validate(any(), any());
+        verify(canonicalizer, times(2)).canonicalizeAndHash(any());
+    }
+
+    @Test
+    void changedClaimedPolicyHashDoesNotHitOrFillDespiteIdenticalCurrentPolicy() {
+        cacheService(128, 128);
+        committedLoad();
+        approved(change(version, Version.class, "policyHash", ARTIFACT));
+        for (int attempt = 0; attempt < 2; attempt++) {
+            beginSynchronization();
+            safeLoad(FailureCode.POLICY_INTEGRITY_FAILURE);
+            assertThat(TransactionSynchronizationManager.getSynchronizations()).isEmpty();
+            finishSynchronization(true);
+        }
+        verify(validator, times(3)).validate(any(), any());
+        verify(canonicalizer, times(3)).canonicalizeAndHash(any());
+    }
+
+    @Test
+    void canonicallyEqualUnicodePolicyCannotReuseDifferentRawFieldSemantics() {
+        // Defensive mocked owner DTO, not a claim that A approves unnormalized stored policy.
+        catalog = catalogWithDocumentFields(List.of("lookupKey"));
+        when(catalogs.load(RELEASE, REVIEWER.actorId())).thenReturn(catalog);
+        ObjectNode valid = (ObjectNode) version.policy().deepCopy();
+        ObjectNode fields = ((ObjectNode) valid.path("fieldPolicy")).putObject("DOCUMENT_READER");
+        fields.putArray("allowed").add("lookupKey");
+        fields.put("denyUnknown", true);
+        String actualHash = canonicalizer.canonicalizeAndHash(valid).policyHash();
+        version = change(change(version, Version.class, "policy", valid), Version.class, "policyHash", actualHash);
+        approved(version);
+        ObjectNode different = valid.deepCopy();
+        ((ObjectNode) different.at("/fieldPolicy/DOCUMENT_READER")).putArray("allowed").add("lookup\u212Aey");
+        assertThat(canonicalizer.canonicalizeAndHash(different).policyHash()).isEqualTo(actualHash);
+        assertThat(validator.validate(different, catalog.semanticCatalog()).issues())
+                .anyMatch(issue -> issue.code().equals("FIELD_NOT_IN_TOOL_OUTPUT"));
+        cacheService(128, 128);
+        committedLoad();
+        approved(change(version, Version.class, "policy", different));
+        clearInvocations(canonicalizer);
+        beginSynchronization();
+        safeLoad(FailureCode.POLICY_INVALID);
+        assertThat(TransactionSynchronizationManager.getSynchronizations()).isEmpty();
+        finishSynchronization(true);
+        verify(validator, times(2)).validate(any(), any());
+        verifyNoInteractions(canonicalizer);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"malformed", "validStaleHash", "nullCanonical", "throwCanonical", "authorization", "case", "catalog"})
+    void warmedCacheNeverOverridesCurrentFailures(String kind, CapturedOutput output) {
+        cacheService(128, 128);
+        committedLoad();
+        clearInvocations(runs, contracts, cases, catalogs, validator, canonicalizer);
+        FailureCode expected = FailureCode.POLICY_INTEGRITY_FAILURE;
+        switch (kind) {
+            case "malformed" -> {
+                ObjectNode policy = (ObjectNode) version.policy().deepCopy();
+                policy.put("unexpected", CANARY);
+                approved(change(version, Version.class, "policy", policy));
+                expected = FailureCode.POLICY_INVALID;
+            }
+            case "validStaleHash" -> {
+                ObjectNode policy = (ObjectNode) version.policy().deepCopy();
+                policy.put("version", 2);
+                approved(change(change(version, Version.class, "version", 2), Version.class, "policy", policy));
+            }
+            case "nullCanonical" -> doReturn(null).when(canonicalizer).canonicalizeAndHash(any());
+            case "throwCanonical" -> {
+                doThrow(new IllegalStateException(CANARY)).when(canonicalizer).canonicalizeAndHash(any());
+                expected = FailureCode.SOURCE_UNAVAILABLE;
+            }
+            case "authorization" -> {
+                var denied = new BusinessException(ErrorCode.OPERATOR_AUTH_REQUIRED, "Trusted reviewer required");
+                when(contracts.approved(RELEASE, VERSION, REVIEWER)).thenThrow(denied);
+                assertThatThrownBy(() -> service.load(RUN, CASE_RUN, REVIEWER)).isSameAs(denied);
+                verifyNoInteractions(cases, catalogs, validator, canonicalizer);
+                return;
+            }
+            case "case" -> {
+                when(cases.findCase(CASE_RUN)).thenReturn(change(caseRun, CaseRun.class, "testRunId", OTHER));
+                expected = FailureCode.CASE_RUN_BINDING_INVALID;
+            }
+            case "catalog" -> {
+                when(catalogs.load(RELEASE, REVIEWER.actorId())).thenReturn(change(catalog, SourceBoundCatalog.class, "releaseFingerprint", HASH));
+                expected = FailureCode.CATALOG_BINDING_INVALID;
+            }
+            default -> throw new AssertionError(kind);
+        }
+        beginSynchronization();
+        safeLoad(expected);
+        assertThat(TransactionSynchronizationManager.getSynchronizations()).isEmpty();
+        finishSynchronization(true);
+        if (kind.equals("malformed")) verifyNoInteractions(canonicalizer);
+        if (List.of("case", "catalog").contains(kind)) verifyNoInteractions(validator, canonicalizer);
+        if (List.of("nullCanonical", "throwCanonical").contains(kind)) verifyNoInteractions(validator);
+        assertThat(output.getAll()).doesNotContain(CANARY);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"null", "invalid", "throw"})
+    void unsuccessfulColdValidationIsNeverPublished(String kind) {
+        cacheService(128, 128);
+        switch (kind) {
+            case "null" -> doReturn(null).when(validator).validate(any(), any());
+            case "invalid" -> doReturn(ValidationResult.fromIssues(List.of(
+                    new Issue("/", "INVALID", IssueSeverity.ERROR, "Rejected")))).when(validator).validate(any(), any());
+            case "throw" -> doThrow(new IllegalStateException(CANARY)).when(validator).validate(any(), any());
+            default -> throw new AssertionError(kind);
+        }
+        for (int i = 0; i < 2; i++) {
+            beginSynchronization();
+            safeLoad(kind.equals("throw") ? FailureCode.SOURCE_UNAVAILABLE : FailureCode.POLICY_INVALID);
+            assertThat(TransactionSynchronizationManager.getSynchronizations()).isEmpty();
+            finishSynchronization(true);
+        }
+        verify(validator, times(2)).validate(any(), any());
+        verifyNoInteractions(canonicalizer);
+    }
+
+    @Test
+    void warningOnlyImmutableValidationRemainsAcceptedAndReusable() {
+        cacheService(128, 128);
+        // Exercise the validator's immutable WARN result contract, not a new policy warning rule.
+        List<Issue> issues = new ArrayList<>(List.of(new Issue("/", "REVIEW", IssueSeverity.WARNING, "Review")));
+        var warning = ValidationResult.fromIssues(issues);
+        doReturn(warning).when(validator).validate(any(), any());
+        var first = committedLoad();
+        issues.clear();
+        var second = committedLoad();
+        assertThat(first.validation().status()).isEqualTo(ValidationStatus.WARN);
+        assertThat(second.validation().issues()).hasSize(1);
+        assertThatThrownBy(() -> second.validation().issues().clear()).isInstanceOf(UnsupportedOperationException.class);
+        verify(validator).validate(any(), any());
+    }
+
+    @Test
+    void ttlStartsAtCommitExpiresExactlyAtFiveMinutesAndHitsDoNotRenewIt() {
+        AtomicLong clock = cacheService(128, 128);
+        beginSynchronization();
+        service.load(RUN, CASE_RUN, REVIEWER);
+        clock.set(TimeUnit.MINUTES.toNanos(20));
+        finishSynchronization(true);
+        clock.addAndGet(TimeUnit.MINUTES.toNanos(5) - 1);
+        committedLoad();
+        verify(validator).validate(any(), any());
+        clock.incrementAndGet();
+        committedLoad();
+        verify(validator, times(2)).validate(any(), any());
+        clock.addAndGet(TimeUnit.MINUTES.toNanos(5) - 1);
+        committedLoad();
+        verify(validator, times(2)).validate(any(), any());
+    }
+
+    @Test
+    void pendingResultsAreNotVisibleBeforeCommitAndRollbackNeverPublishes() {
+        cacheService(128, 128);
+        beginSynchronization();
+        service.load(RUN, CASE_RUN, REVIEWER);
+        service.load(RUN, CASE_RUN, REVIEWER);
+        verify(validator, times(2)).validate(any(), any());
+        assertThat(TransactionSynchronizationManager.getSynchronizations()).hasSize(2);
+        finishSynchronization(false);
+        committedLoad();
+        committedLoad();
+        verify(validator, times(3)).validate(any(), any());
+    }
+
+    @Test
+    void absentSynchronizationPreservesSixArgumentSuccessButDoesNotCache() {
+        clearInvocations(canonicalizer);
+        service.load(RUN, CASE_RUN, REVIEWER);
+        service.load(RUN, CASE_RUN, REVIEWER);
+        verify(validator, times(2)).validate(any(), any());
+        verify(canonicalizer, times(2)).canonicalizeAndHash(any());
+        assertThat(TransactionSynchronizationManager.isSynchronizationActive()).isFalse();
+    }
+
+    @Test
+    void entryCapacityEvictsOldestWriteWithoutPromotingHits() {
+        cacheService(2, 2);
+        committedLoad();
+        approved(change(version, Version.class, "resourceHash", ARTIFACT));
+        committedLoad();
+        approved(version);
+        committedLoad();
+        approved(change(version, Version.class, "resourceHash", FINGERPRINT));
+        committedLoad();
+        approved(version);
+        committedLoad();
+        verify(validator, times(4)).validate(any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void pendingCapacityIsBoundedAndCompletionRestoresAdmission(boolean commit) {
+        cacheService(128, 1);
+        beginSynchronization();
+        service.load(RUN, CASE_RUN, REVIEWER);
+        approved(change(version, Version.class, "resourceHash", ARTIFACT));
+        service.load(RUN, CASE_RUN, REVIEWER);
+        assertThat(TransactionSynchronizationManager.getSynchronizations()).hasSize(1);
+        finishSynchronization(commit);
+        committedLoad();
+        committedLoad();
+        verify(validator, times(3)).validate(any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"catalogCount", "catalogCharacters", "resultCount", "resultCharacters",
+            "combinedCount", "combinedCharacters"})
+    void oversizeMetadataOnlySkipsAdmissionWithoutRejectingSource(String kind) {
+        cacheService(128, 128);
+        if (kind.startsWith("catalog")) {
+            List<String> fields = kind.equals("catalogCount")
+                    ? java.util.stream.IntStream.range(0, 1024).mapToObj(i -> "unused" + i).toList()
+                    : List.of("unused".repeat(6000));
+            when(catalogs.load(RELEASE, REVIEWER.actorId())).thenReturn(catalogWithDocumentFields(fields));
+        } else {
+            if (kind.startsWith("combined")) {
+                List<String> fields = kind.equals("combinedCount")
+                        ? java.util.stream.IntStream.range(0, 600).mapToObj(i -> "unused" + i).toList()
+                        : List.of("x".repeat(17000));
+                when(catalogs.load(RELEASE, REVIEWER.actorId())).thenReturn(catalogWithDocumentFields(fields));
+            }
+            List<Issue> issues = kind.equals("resultCount") || kind.equals("combinedCount")
+                    ? java.util.stream.IntStream.range(0, kind.equals("combinedCount") ? 150 : 400)
+                            .mapToObj(i -> new Issue("/" + i, "REVIEW", IssueSeverity.WARNING, "Review")).toList()
+                    : List.of(new Issue("/", "REVIEW", IssueSeverity.WARNING,
+                            "x".repeat(kind.equals("combinedCharacters") ? 17000 : 32768)));
+            doReturn(ValidationResult.fromIssues(issues)).when(validator).validate(any(), any());
+        }
+        for (int i = 0; i < 2; i++) {
+            beginSynchronization();
+            assertThat(service.load(RUN, CASE_RUN, REVIEWER)).isNotNull();
+            assertThat(TransactionSynchronizationManager.getSynchronizations()).isEmpty();
+            finishSynchronization(true);
+        }
+        verify(validator, times(2)).validate(any(), any());
+        verify(canonicalizer, times(2)).canonicalizeAndHash(any());
+    }
+
+    @Test
+    void rawSerializationFailureSkipsCacheAndPreservesRealValidationAndCanonicalization() {
+        ObjectNode policy = spy((ObjectNode) version.policy().deepCopy());
+        doAnswer(invocation -> {
+            ObjectNode copied = spy((ObjectNode) version.policy().deepCopy());
+            doThrow(new IllegalStateException(CANARY)).when(copied).toString();
+            return copied;
+        }).when(policy).deepCopy();
+        // Only the optional raw-digest serialization fails; actual engine methods remain real.
+        Version supplied = new Version(version.id(), version.workspaceId(), version.releaseId(), version.contractKey(),
+                version.version(), version.state(), policy, version.policyHash(), version.resourceHash(),
+                version.basePolicyHash(), version.validation(), version.review());
+        approved(supplied);
+        cacheService(128, 128);
+        for (int i = 0; i < 2; i++) {
+            beginSynchronization();
+            assertThat(service.load(RUN, CASE_RUN, REVIEWER).policyHash()).isEqualTo(version.policyHash());
+            assertThat(TransactionSynchronizationManager.getSynchronizations()).isEmpty();
+            finishSynchronization(true);
+        }
+        verify(validator, times(2)).validate(any(), any());
+        verify(canonicalizer, times(2)).canonicalizeAndHash(any());
+    }
+
+    @Test
+    void failedSynchronizationRegistrationReleasesReservationAndDoesNotRejectSource() {
+        cacheService(128, 1);
+        beginSynchronization();
+        try (var tx = mockStatic(TransactionSynchronizationManager.class, CALLS_REAL_METHODS)) {
+            tx.when(() -> TransactionSynchronizationManager.registerSynchronization(any()))
+                    .thenThrow(new IllegalStateException(CANARY));
+            assertThat(service.load(RUN, CASE_RUN, REVIEWER)).isNotNull();
+            assertThat(TransactionSynchronizationManager.getSynchronizations()).isEmpty();
+        }
+        finishSynchronization(true);
+        committedLoad();
+        committedLoad();
+        verify(validator, times(2)).validate(any(), any());
+    }
+
+    @Test
+    void sourceProjectionFailureCannotReserveOrPublishPreviouslyValidatedResult() {
+        ObjectNode malformed = (ObjectNode) version.policy().deepCopy();
+        ((ObjectNode) malformed.path("toolTrust")).putArray("allowedTrustLevels").add("UNKNOWN_LEVEL");
+        String actualHash = canonicalizer.canonicalizeAndHash(malformed).policyHash();
+        approved(change(change(version, Version.class, "policy", malformed), Version.class, "policyHash", actualHash));
+        cacheService(128, 1);
+        // Faulty validator output exercises the later source-construction guard, not valid policy.
+        doReturn(ValidationResult.fromIssues(List.of())).when(validator).validate(any(), any());
+        beginSynchronization();
+        safeLoad(FailureCode.POLICY_INVALID);
+        assertThat(TransactionSynchronizationManager.getSynchronizations()).isEmpty();
+        finishSynchronization(true);
+        approved(version);
+        committedLoad();
+        committedLoad();
+        verify(validator, times(2)).validate(any(), any());
+    }
+
+    @Test
+    void publicConstructorBoundsPendingCallbacksAt128() {
+        clearInvocations(validator, canonicalizer);
+        beginSynchronization();
+        for (int i = 0; i < 129; i++) service.load(RUN, CASE_RUN, REVIEWER);
+        assertThat(TransactionSynchronizationManager.getSynchronizations()).hasSize(128);
+        finishSynchronization(false);
+        committedLoad();
+        committedLoad();
+        verify(validator, times(130)).validate(any(), any());
+    }
+
+    @Test
+    void releaseEvictionRemovesOnlyItsCommittedEntries() {
+        cacheService(128, 128);
+        committedLoad();
+        bindOtherRelease();
+        committedLoad();
+        service.invalidateRelease(RELEASE);
+        committedLoad();
+        verify(validator, times(2)).validate(any(), any());
+        when(runs.find(RUN)).thenReturn(run);
+        committedLoad();
+        verify(validator, times(3)).validate(any(), any());
+    }
+
+    @Test
+    void invalidationWhileFillWaitsForCommitPreventsRepopulation() {
+        cacheService(128, 128);
+        beginSynchronization();
+        service.load(RUN, CASE_RUN, REVIEWER);
+        service.invalidateRelease(RELEASE);
+        finishSynchronization(true);
+        committedLoad();
+        committedLoad();
+        verify(validator, times(2)).validate(any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"owner", "validator"})
+    void invalidationDoesNotWaitForOwnerOrValidatorAndCancelsEarlierRead(String blocked) throws Exception {
+        cacheService(128, 128);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        if (blocked.equals("owner")) {
+            when(runs.find(RUN)).thenAnswer(invocation -> {
+                entered.countDown();
+                assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+                return run;
+            });
+        } else {
+            doAnswer(invocation -> {
+                entered.countDown();
+                assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+                return invocation.callRealMethod();
+            }).when(validator).validate(any(), any());
+        }
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var load = executor.submit(() -> {
+                TransactionSynchronizationManager.setActualTransactionActive(true);
+                TransactionSynchronizationManager.setCurrentTransactionReadOnly(false);
+                TransactionSynchronizationManager.setCurrentTransactionIsolationLevel(Connection.TRANSACTION_REPEATABLE_READ);
+                try { return committedLoad(); }
+                finally { TransactionSynchronizationManager.clear(); }
+            });
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                executor.submit(() -> service.invalidateRelease(RELEASE)).get(5, TimeUnit.SECONDS);
+            } finally {
+                release.countDown();
+            }
+            assertThat(load.get(5, TimeUnit.SECONDS)).isNotNull();
+        }
+        committedLoad();
+        committedLoad();
+        verify(validator, times(2)).validate(any(), any());
+    }
+
+    @Test
+    void invalidReleaseRequestUsesExistingSafeErrorWithoutOwnerCalls() {
+        safe(() -> service.invalidateRelease(null), FailureCode.INVALID_REQUEST);
+        verifyNoInteractions(runs, contracts, cases, catalogs, validator);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, -1})
+    void cacheCapacitySeamRejectsInvalidBounds(int invalid) {
+        assertThatThrownBy(() -> new GatewayApprovedPolicySourceService(runs, contracts, cases, catalogs,
+                validator, canonicalizer, System::nanoTime, invalid, 128)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new GatewayApprovedPolicySourceService(runs, contracts, cases, catalogs,
+                validator, canonicalizer, System::nanoTime, 128, invalid)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    private AtomicLong cacheService(int entries, int pending) {
+        AtomicLong clock = new AtomicLong();
+        service = new GatewayApprovedPolicySourceService(runs, contracts, cases, catalogs,
+                validator, canonicalizer, clock::get, entries, pending);
+        clearInvocations(validator, canonicalizer);
+        return clock;
+    }
+
+    /** Explicit callback fixture only; the PG suite proves actual Spring commit/rollback behavior. */
+    private void beginSynchronization() { TransactionSynchronizationManager.initSynchronization(); }
+
+    private void finishSynchronization(boolean committed) {
+        var callbacks = TransactionSynchronizationManager.getSynchronizations();
+        try {
+            if (committed) callbacks.forEach(TransactionSynchronization::afterCommit);
+        } finally {
+            callbacks.forEach(callback -> callback.afterCompletion(committed
+                    ? TransactionSynchronization.STATUS_COMMITTED : TransactionSynchronization.STATUS_ROLLED_BACK));
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+    }
+
+    private ApprovedPolicySource committedLoad() {
+        beginSynchronization();
+        var source = service.load(RUN, CASE_RUN, REVIEWER);
+        finishSynchronization(true);
+        return source;
+    }
+
+    private SourceBoundCatalog catalogWithSemantic(ContractValidationCatalog semantic) {
+        return new SourceBoundCatalog(catalog.releaseId(), catalog.manifestSchemaVersion(), catalog.agentArtifactFingerprint(),
+                catalog.releaseFingerprint(), catalog.serverToolCatalogHash(), semantic, fixtureBindings());
+    }
+
+    private SourceBoundCatalog catalogWithDocumentFields(List<String> fields) {
+        List<EnabledTool> tools = catalog.semanticCatalog().enabledReleaseTools().stream()
+                .map(tool -> tool.toolName().equals("DOCUMENT_READER") ? new EnabledTool(tool.toolName(), fields) : tool)
+                .toList();
+        return catalogWithSemantic(new ContractValidationCatalog(tools, catalog.semanticCatalog().highImpactToolNames()));
+    }
+
+    private void bindOtherRelease() {
+        Projection otherRun = change(run, Projection.class, "releaseId", OTHER);
+        Version otherVersion = change(version, Version.class, "releaseId", OTHER);
+        when(runs.find(RUN)).thenReturn(otherRun);
+        when(contracts.approved(OTHER, VERSION, REVIEWER)).thenReturn(new ApprovedContract(otherVersion, ARTIFACT, FINGERPRINT));
+        when(catalogs.load(OTHER, REVIEWER.actorId())).thenReturn(change(catalog, SourceBoundCatalog.class, "releaseId", OTHER));
     }
 
     private void approved(Version value) {
