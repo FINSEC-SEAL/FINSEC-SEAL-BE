@@ -2,6 +2,7 @@ package com.finsecseal.contract;
 
 import com.finsecseal.contract.SafetyContractSemanticValidator.ContractValidationCatalog;
 import com.finsecseal.contract.SafetyContractSemanticValidator.EnabledTool;
+import com.finsecseal.policy.PolicyToolAuthorizationFacts.CatalogTool;
 import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
@@ -22,7 +23,7 @@ import tools.jackson.databind.node.ObjectNode;
 
 /**
  * Role C boundary that converts Role A's verified Manifest 1.1 Tool catalog into
- * immutable semantic-validation input and expected Tool Trust bindings.
+ * immutable semantic-validation input, expected Tool Trust bindings and declarations.
  *
  * <p>A successful conversion proves only source integrity and catalog shape. It
  * does not approve a Safety Contract, pass a Release, authorize deployment, or
@@ -116,7 +117,8 @@ public final class ReleaseToolCatalogContractAdapter {
                 source.releaseFingerprint(),
                 source.serverToolCatalogHash(),
                 new ContractValidationCatalog(enabledTools, highImpactTools),
-                extractReleaseToolBindings(toolsSnapshot)
+                extractReleaseToolBindings(toolsSnapshot),
+                extractDeclaredTools(toolsSnapshot, serverCatalogSnapshot.path("tools"))
         );
     }
 
@@ -286,6 +288,36 @@ public final class ReleaseToolCatalogContractAdapter {
         return List.copyOf(bindings);
     }
 
+    private List<CatalogTool> extractDeclaredTools(JsonNode enabled, JsonNode highImpact) {
+        List<CatalogTool> declarations = new ArrayList<>();
+        appendDeclaredTools(declarations, enabled, FailureCode.INVALID_ENABLED_TOOL_CATALOG);
+        appendDeclaredTools(declarations, highImpact, FailureCode.INVALID_HIGH_IMPACT_CATALOG);
+        declarations.sort(Comparator.comparing(CatalogTool::name));
+        return List.copyOf(declarations);
+    }
+
+    private void appendDeclaredTools(List<CatalogTool> declarations, JsonNode tools,
+            FailureCode code) {
+        for (JsonNode tool : tools) {
+            JsonNode operation = tool.path("operation");
+            JsonNode sideEffect = tool.path("sideEffectType");
+            if (!operation.isString() || !sideEffect.isString()) {
+                throw failure(code);
+            }
+            switch (operation.stringValue()) {
+                case "READ", "SEARCH", "CREATE", "WRITE", "UPDATE", "POST" -> { }
+                default -> throw failure(code);
+            }
+            boolean external = switch (sideEffect.stringValue()) {
+                case "NONE", "INTERNAL_WRITE", "HIGH_IMPACT_WRITE" -> false;
+                case "MOCK_EXTERNAL_WRITE" -> true;
+                default -> throw failure(code);
+            };
+            declarations.add(new CatalogTool(tool.path("name").stringValue(),
+                    operation.stringValue(), external));
+        }
+    }
+
     private void rejectRoleOverlap(
             List<EnabledTool> enabledTools,
             List<String> highImpactTools
@@ -345,7 +377,8 @@ public final class ReleaseToolCatalogContractAdapter {
             String releaseFingerprint,
             String serverToolCatalogHash,
             ContractValidationCatalog semanticCatalog,
-            List<ReleaseToolBinding> releaseToolBindings
+            List<ReleaseToolBinding> releaseToolBindings,
+            List<CatalogTool> declaredTools
     ) {
 
         /** Compatibility for semantic-only callers; empty bindings cannot supply Gateway trust. */
@@ -353,7 +386,16 @@ public final class ReleaseToolCatalogContractAdapter {
                 String agentArtifactFingerprint, String releaseFingerprint,
                 String serverToolCatalogHash, ContractValidationCatalog semanticCatalog) {
             this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
-                    serverToolCatalogHash, semanticCatalog, List.of());
+                    serverToolCatalogHash, semanticCatalog, List.of(), List.of());
+        }
+
+        /** Compatibility for trust consumers; absent declarations cannot supply other stages. */
+        public SourceBoundCatalog(UUID releaseId, String manifestSchemaVersion,
+                String agentArtifactFingerprint, String releaseFingerprint,
+                String serverToolCatalogHash, ContractValidationCatalog semanticCatalog,
+                List<ReleaseToolBinding> releaseToolBindings) {
+            this(releaseId, manifestSchemaVersion, agentArtifactFingerprint, releaseFingerprint,
+                    serverToolCatalogHash, semanticCatalog, releaseToolBindings, List.of());
         }
 
         public SourceBoundCatalog {
@@ -375,6 +417,7 @@ public final class ReleaseToolCatalogContractAdapter {
             );
             Objects.requireNonNull(semanticCatalog, "semanticCatalog must not be null");
             releaseToolBindings = List.copyOf(releaseToolBindings);
+            declaredTools = List.copyOf(declaredTools);
         }
     }
 
