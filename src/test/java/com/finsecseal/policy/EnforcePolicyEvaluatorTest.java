@@ -11,7 +11,9 @@ import com.finsecseal.policy.PolicyEvaluationDecision.DecisionType;
 import com.finsecseal.policy.PolicyEvaluationDecision.StageOutcome;
 import com.finsecseal.policy.EnforcePolicyEvaluator.PolicyEvaluationTimeoutException;
 import com.finsecseal.policy.PolicyEvaluationSequence.PolicyEvaluationException;
+import com.finsecseal.policy.PolicyEvaluationSequence.PolicyStageEvaluator;
 import com.finsecseal.policy.PolicyEvaluationSequence.PreflightEvaluator;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -20,6 +22,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -42,6 +45,9 @@ class EnforcePolicyEvaluatorTest {
     private static final List<String> DOCUMENTS = List.of("DOC-1001", "DOC-1002");
     private static final List<String> FIELDS = List.of("incomeBand", "employmentStatus");
     private static final String RELEASE_HASH = digest('c');
+    private static final List<PolicyEvaluationStage> LAZY_EXPECTED_ORDER = List.of(
+            PREFLIGHT, TOOL, OPERATION, BUSINESS_CONTEXT, OBJECT_SCOPE, FIELD_SCOPE,
+            CARDINALITY, EGRESS, PolicyEvaluationStage.WORKFLOW, HUMAN_BOUNDARY, TOOL_TRUST);
 
     private PolicyToolAuthorizationEvaluator authorization;
     private PolicyBusinessContextEvaluator business;
@@ -304,6 +310,192 @@ class EnforcePolicyEvaluatorTest {
         assertThat(evaluator.evaluate(preflight, new Fixture().build()).decisionType()).isEqualTo(DecisionType.ALLOW);
         nanos.set(5_000_000_000L);
         assertThat(evaluator.evaluate(preflight, new Fixture().build()).decisionType()).isEqualTo(DecisionType.ALLOW);
+    }
+
+    @Test
+    void lazyStagesPreserveTheIndependentElevenStageOrder() {
+        List<PolicyEvaluationStage> calls = new ArrayList<>();
+
+        PolicyEvaluationDecision decision = evaluator.evaluateStages(() -> {
+            calls.add(PREFLIGHT);
+            return StageOutcome.pass(PREFLIGHT);
+        }, stage -> {
+            calls.add(stage);
+            return StageOutcome.pass(stage);
+        });
+
+        assertThat(calls).containsExactlyElementsOf(LAZY_EXPECTED_ORDER);
+        assertThat(decision.evaluatedStages()).containsExactlyElementsOf(LAZY_EXPECTED_ORDER);
+        assertThat(decision.decisionType()).isEqualTo(DecisionType.ALLOW);
+        assertThat(decision.reason()).isEmpty();
+        assertThat(decision.successfulSecurityBlock()).isFalse();
+        verifyNoInteractions(allEvaluators());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("lazyEarlierTerminals")
+    void lazyEarlierTerminalNeverConstructsInvalidDownstreamTrustFacts(
+            String name, Fixture fixture, PolicyEvaluationStage terminal, PolicyEvaluationReason reason
+    ) {
+        Supplier<PolicyToolTrustFacts> invalidTrust = () -> new PolicyToolTrustFacts(
+                fixture.authorization.requestedTool(), RELEASE_HASH, RELEASE_HASH, List.of(),
+                List.of(new PolicyToolTrustFacts.ReleaseToolBinding(
+                        "UNRELATED_TOOL", "1.0.0", true, digest('a'), digest('b'))),
+                new PolicyToolTrustFacts.ToolTrustPolicy(true, List.of(TRUSTED_INTERNAL)));
+        // Control: this is an actual invalid constructor, not a mock that merely throws.
+        assertThatThrownBy(invalidTrust::get).isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("releaseBindings must reference registry Tool identities");
+        AtomicInteger downstreamConstructions = new AtomicInteger();
+        List<PolicyEvaluationStage> calls = new ArrayList<>();
+
+        PolicyEvaluationDecision decision = evaluator.evaluateStages(() -> {
+            calls.add(PREFLIGHT);
+            return StageOutcome.pass(PREFLIGHT);
+        }, stage -> {
+            calls.add(stage);
+            return switch (stage) {
+                case TOOL, OPERATION -> authorization.evaluate(stage, fixture.authorization);
+                case BUSINESS_CONTEXT -> business.evaluate(stage, fixture.business);
+                case OBJECT_SCOPE -> object.evaluate(stage, fixture.object);
+                case FIELD_SCOPE -> field.evaluate(stage, fixture.field);
+                case CARDINALITY -> cardinality.evaluate(stage, fixture.cardinality);
+                case EGRESS -> egress.evaluate(stage, fixture.egress);
+                case WORKFLOW -> workflow.evaluate(stage, fixture.workflow);
+                case HUMAN_BOUNDARY -> human.evaluate(stage, fixture.human);
+                case TOOL_TRUST -> {
+                    downstreamConstructions.incrementAndGet();
+                    yield trust.evaluate(stage, invalidTrust.get());
+                }
+                case PREFLIGHT -> throw new AssertionError("preflight must use its own callback");
+            };
+        });
+
+        List<PolicyEvaluationStage> expectedPrefix = LAZY_EXPECTED_ORDER.subList(
+                0, LAZY_EXPECTED_ORDER.indexOf(terminal) + 1);
+        assertThat(decision.decisionType()).isEqualTo(DecisionType.DENY);
+        assertThat(decision.reason()).contains(reason);
+        assertThat(decision.failedStage()).contains(terminal);
+        assertThat(decision.evaluatedStages()).containsExactlyElementsOf(expectedPrefix);
+        assertThat(calls).containsExactlyElementsOf(expectedPrefix);
+        assertThat(downstreamConstructions).hasValue(0);
+        verifyNoInteractions(trust);
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {99_999_999L, 100_000_000L})
+    void lazyFactsConstructionSharesTheCumulativeBudgetAndSuppressesLatePass(long totalNanos) {
+        AtomicInteger constructions = new AtomicInteger();
+        List<PolicyEvaluationStage> calls = new ArrayList<>();
+        Supplier<PolicyObjectScopeFacts> facts = () -> {
+            constructions.incrementAndGet();
+            PolicyObjectScopeFacts result = objectFacts(Optional.of(CASE), Optional.of(APPLICANT),
+                    Optional.of(DOCUMENTS), List.of(APPLICANT));
+            nanos.addAndGet(totalNanos - 50_000_000L);
+            return result;
+        };
+        Supplier<PolicyEvaluationDecision> evaluate = () -> evaluator.evaluateStages(() -> {
+            calls.add(PREFLIGHT);
+            nanos.addAndGet(20_000_000L);
+            return StageOutcome.pass(PREFLIGHT);
+        }, stage -> {
+            calls.add(stage);
+            if (stage == TOOL) nanos.addAndGet(30_000_000L);
+            return stage == OBJECT_SCOPE ? object.evaluate(stage, facts.get()) : StageOutcome.pass(stage);
+        });
+
+        if (totalNanos == 100_000_000L) {
+            assertThatThrownBy(evaluate::get).isInstanceOfSatisfying(
+                    PolicyEvaluationTimeoutException.class, error -> {
+                        assertThat(error.reason()).isEqualTo(POLICY_EVALUATION_TIMEOUT);
+                        assertThat(error.getCause()).isNull();
+                    });
+            assertThat(calls).containsExactly(PREFLIGHT, TOOL, OPERATION, BUSINESS_CONTEXT, OBJECT_SCOPE);
+        } else {
+            PolicyEvaluationDecision decision = evaluate.get();
+            assertThat(decision.decisionType()).isEqualTo(DecisionType.ALLOW);
+            assertThat(decision.evaluatedStages()).containsExactlyElementsOf(LAZY_EXPECTED_ORDER);
+            assertThat(calls).containsExactlyElementsOf(LAZY_EXPECTED_ORDER);
+        }
+        assertThat(constructions).hasValue(1);
+        assertThat(nanos).hasValue(totalNanos);
+    }
+
+    @Test
+    void lazyLateDenialIsUnwrappedTimeoutAndNeverReachesLaterStages() {
+        List<PolicyEvaluationStage> calls = new ArrayList<>();
+
+        assertThatThrownBy(() -> evaluator.evaluateStages(() -> {
+            calls.add(PREFLIGHT);
+            nanos.addAndGet(20_000_000L);
+            return StageOutcome.pass(PREFLIGHT);
+        }, stage -> {
+            calls.add(stage);
+            if (stage != OBJECT_SCOPE) return StageOutcome.pass(stage);
+            PolicyObjectScopeFacts facts = objectFacts(Optional.of(CASE), Optional.of(APPLICANT),
+                    Optional.of(DOCUMENTS), List.of("CUST-OTHER"));
+            StageOutcome denial = object.evaluate(stage, facts);
+            assertThat(denial.reason()).contains(CUSTOMER_SCOPE_VIOLATION);
+            nanos.addAndGet(80_000_000L);
+            return denial;
+        })).isInstanceOfSatisfying(PolicyEvaluationTimeoutException.class, error -> {
+            assertThat(error.reason()).isEqualTo(POLICY_EVALUATION_TIMEOUT);
+            assertThat(error.getMessage()).isEqualTo("POLICY_EVALUATION_TIMEOUT");
+            assertThat(error.getCause()).isNull();
+        });
+
+        assertThat(calls).containsExactly(PREFLIGHT, TOOL, OPERATION, BUSINESS_CONTEXT, OBJECT_SCOPE);
+        assertThat(nanos).hasValue(100_000_000L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"null preflight", "null stages", "null outcome", "wrong stage", "throws"})
+    void lazyMalformedCallbacksFailBeforeAnyLaterStage(String mode) {
+        List<PolicyEvaluationStage> calls = new ArrayList<>();
+        PreflightEvaluator source = "null preflight".equals(mode) ? null : () -> {
+            calls.add(PREFLIGHT);
+            return StageOutcome.pass(PREFLIGHT);
+        };
+        PolicyStageEvaluator stages = "null stages".equals(mode) ? null : stage -> {
+            calls.add(stage);
+            if (stage != OPERATION) return StageOutcome.pass(stage);
+            return switch (mode) {
+                case "null outcome" -> null;
+                case "wrong stage" -> StageOutcome.pass(TOOL_TRUST);
+                case "throws" -> throw new IllegalStateException("fixture construction failed");
+                default -> throw new AssertionError("missing callback should fail before invocation");
+            };
+        };
+
+        if (source == null || stages == null) {
+            assertThatThrownBy(() -> evaluator.evaluateStages(source, stages))
+                    .isInstanceOf(NullPointerException.class);
+            assertThat(calls).isEmpty();
+        } else {
+            assertThatThrownBy(() -> evaluator.evaluateStages(source, stages))
+                    .isInstanceOfSatisfying(PolicyEvaluationException.class, error -> {
+                        assertThat(error.stage()).isEqualTo(OPERATION);
+                        if ("throws".equals(mode)) {
+                            assertThat(error.getCause()).isInstanceOf(IllegalStateException.class);
+                        } else {
+                            assertThat(error.getCause()).isNull();
+                        }
+                    });
+            assertThat(calls).containsExactly(PREFLIGHT, TOOL, OPERATION);
+        }
+        verifyNoInteractions(allEvaluators());
+    }
+
+    private static Stream<Arguments> lazyEarlierTerminals() {
+        Fixture customer = new Fixture();
+        customer.object = objectFacts(Optional.of(CASE), Optional.of(APPLICANT),
+                Optional.of(DOCUMENTS), List.of("CUST-OTHER"));
+        customer.field = fieldFacts(List.of("accountNumber"));
+        return Stream.of(
+                Arguments.of("unknown tool", new Fixture("UNKNOWN_TOOL", false, false, false),
+                        TOOL, TOOL_NOT_ALLOWED),
+                Arguments.of("customer before field and trust", customer, OBJECT_SCOPE, CUSTOMER_SCOPE_VIOLATION),
+                Arguments.of("human boundary", new Fixture("LOAN_DECISION_UPDATE", true, false, true),
+                        HUMAN_BOUNDARY, HUMAN_ONLY_ACTION));
     }
 
     private EnforcePolicyEvaluator evaluatorWithClock(LongSupplier clock) {

@@ -1,6 +1,7 @@
 package com.finsecseal.policy;
 
 import static com.finsecseal.common.domain.Sensitivity.CREDIT;
+import static com.finsecseal.common.domain.Sensitivity.FINANCIAL;
 import static com.finsecseal.common.domain.Sensitivity.NORMAL;
 import static com.finsecseal.policy.EnforcePolicyPostCallDecision.OperationalReason.ADAPTER_CONTRACT_FAILURE;
 import static com.finsecseal.policy.EnforcePolicyPostCallDecision.OperationalReason.RESPONSE_CARDINALITY_VIOLATION;
@@ -20,8 +21,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.finsecseal.policy.EnforcePolicyPostCallDecision.OperationalReason;
 import com.finsecseal.policy.EnforcePolicyPostCallDecision.PostCallCheck;
 import com.finsecseal.policy.EnforcePolicyPostCallFacts.CatalogOutputField;
+import com.finsecseal.release.LoanReviewToolCatalog;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Stream;
@@ -35,7 +40,14 @@ import org.junit.jupiter.params.provider.ValueSource;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ArrayNode;
+import tools.jackson.databind.node.BigIntegerNode;
+import tools.jackson.databind.node.BooleanNode;
+import tools.jackson.databind.node.DecimalNode;
+import tools.jackson.databind.node.DoubleNode;
+import tools.jackson.databind.node.FloatNode;
+import tools.jackson.databind.node.NullNode;
 import tools.jackson.databind.node.ObjectNode;
+import tools.jackson.databind.node.StringNode;
 
 class EnforcePolicyPostCallResponseGuardTest {
 
@@ -190,6 +202,126 @@ class EnforcePolicyPostCallResponseGuardTest {
                 exactClassifications(),
                 null
         )), response);
+    }
+
+    @ParameterizedTest
+    @MethodSource("integerSuccessStatuses")
+    void actualVersionedSchemaAndGuardAcceptMathematicalStatus200WithoutRewritingIt(JsonNode status) {
+        ObjectNode response = response(CURRENT_APPLICANT, "incomeBand", "middle");
+        response.set("status", status);
+        String original = response.toString();
+        JsonNode schema = actualCustomerOutputSchema();
+        String originalSchema = schema.toString();
+
+        assertThat(new CatalogJsonSchemaValidator().matches(schema, response)).isTrue();
+        EnforcePolicyPostCallDecision decision = guard.evaluate(actualSchemaFacts(response, actualClassifications()));
+
+        assertPassed(decision, response);
+        JsonNode deliveredStatus = decision.deliverableOutput().orElseThrow().path("status");
+        assertThat(deliveredStatus.getClass()).isEqualTo(status.getClass());
+        assertThat(deliveredStatus.numberValue()).isEqualTo(status.numberValue());
+        assertThat(response.path("status")).isSameAs(status);
+        assertThat(response.toString()).isEqualTo(original);
+        assertThat(schema.toString()).isEqualTo(originalSchema);
+    }
+
+    private static Stream<JsonNode> integerSuccessStatuses() {
+        return Stream.of(DoubleNode.valueOf(200.0), FloatNode.valueOf(200.0f),
+                DecimalNode.valueOf(new BigDecimal("200.000")),
+                DecimalNode.valueOf(new BigDecimal("2E+2")));
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidSuccessStatuses")
+    void actualVersionedSchemaAndGuardRejectNonExactOrNonNumericStatus(JsonNode status) {
+        ObjectNode response = response(CURRENT_APPLICANT, "incomeBand", "middle");
+        response.set("status", status);
+
+        assertThat(new CatalogJsonSchemaValidator().matches(actualCustomerOutputSchema(), response)).isFalse();
+        assertQuarantined(guard.evaluate(actualSchemaFacts(response, actualClassifications())),
+                OUTPUT_SCHEMA, ADAPTER_CONTRACT_FAILURE, List.of(OUTPUT_SCHEMA));
+        assertThat(response.path("status")).isSameAs(status);
+    }
+
+    private static Stream<JsonNode> invalidSuccessStatuses() {
+        return Stream.of(DoubleNode.valueOf(200.5),
+                DecimalNode.valueOf(new BigDecimal("200.0000000000000000000001")),
+                DoubleNode.valueOf(Double.NaN), FloatNode.valueOf(Float.POSITIVE_INFINITY),
+                StringNode.valueOf("200"), NullNode.getInstance(), BooleanNode.valueOf(true),
+                BigIntegerNode.valueOf(BigInteger.ONE.shiftLeft(64).add(BigInteger.valueOf(200))));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", " ", "\t\n"})
+    void blankCustomerMatchesActualSchemaButIsQuarantinedAtObjectScope(String customerId) {
+        ObjectNode response = response(customerId, "incomeBand", "middle");
+
+        assertThat(new CatalogJsonSchemaValidator().matches(actualCustomerOutputSchema(), response)).isTrue();
+        assertQuarantined(guard.evaluate(actualSchemaFacts(response, actualClassifications())),
+                OBJECT_SCOPE, ADAPTER_CONTRACT_FAILURE, List.of(OUTPUT_SCHEMA, CLASSIFICATION, OBJECT_SCOPE));
+        assertThat(response.at("/rows/0/customerId").asString()).isEqualTo(customerId);
+    }
+
+    @Test
+    void classificationFailureStillPrecedesBlankCustomerScopeFailure() {
+        ObjectNode response = response(" ", "incomeBand", "middle");
+        ObjectNode wrongClassification = actualClassifications().put("incomeBand", "NORMAL");
+        assertThat(new CatalogJsonSchemaValidator().matches(actualCustomerOutputSchema(), response)).isTrue();
+
+        assertQuarantined(guard.evaluate(actualSchemaFacts(response, wrongClassification)),
+                CLASSIFICATION, ADAPTER_CONTRACT_FAILURE, List.of(OUTPUT_SCHEMA, CLASSIFICATION));
+    }
+
+    @ParameterizedTest
+    @MethodSource("integerCatalogValues")
+    void integerCatalogTypeUsesJsonIntegerSemanticsAndPreservesNumericNodes(JsonNode value, boolean matches) {
+        // The existing creditScore fixture is a typed core catalog, not a field in A's actual 1.1 schema.
+        JsonNode integerSchema = OBJECT_MAPPER.createObjectNode().put("type", "integer");
+        assertThat(new CatalogJsonSchemaValidator().matches(integerSchema, value)).isEqualTo(matches);
+        ObjectNode response = response(CURRENT_APPLICANT, "creditScore", 720);
+        ((ObjectNode) response.at("/rows/0/fields")).set("creditScore", value);
+        EnforcePolicyPostCallDecision decision = guard.evaluate(facts(
+                CURRENT_APPLICANT, List.of(CURRENT_APPLICANT), List.of("creditScore"), List.of("creditScore"),
+                catalog(), 1, response, exactClassifications(), null));
+
+        if (matches) {
+            assertPassed(decision, response);
+            JsonNode delivered = decision.deliverableOutput().orElseThrow().at("/rows/0/fields/creditScore");
+            assertThat(delivered.getClass()).isEqualTo(value.getClass());
+            assertThat(delivered.numberValue()).isEqualTo(value.numberValue());
+        } else {
+            assertQuarantined(decision, OUTPUT_SCHEMA, ADAPTER_CONTRACT_FAILURE, List.of(OUTPUT_SCHEMA));
+        }
+        assertThat(response.at("/rows/0/fields/creditScore")).isSameAs(value);
+    }
+
+    private static Stream<Arguments> integerCatalogValues() {
+        return Stream.of(
+                Arguments.of(DecimalNode.valueOf(new BigDecimal("720.000")), true),
+                Arguments.of(DoubleNode.valueOf(720.0), true),
+                Arguments.of(DoubleNode.valueOf(-0.0), true),
+                Arguments.of(BigIntegerNode.valueOf(BigInteger.ONE.shiftLeft(80)), true),
+                Arguments.of(DecimalNode.valueOf(new BigDecimal("720.0000000000000001")), false),
+                Arguments.of(DoubleNode.valueOf(Double.NaN), false),
+                Arguments.of(FloatNode.valueOf(Float.NEGATIVE_INFINITY), false));
+    }
+
+    @Test
+    void sharedClassificationCheckPreservesExactCoverageAndDoesNotMutateInputs() {
+        Map<String, com.finsecseal.common.domain.Sensitivity> expected = Map.of("name", NORMAL, "creditScore", CREDIT);
+        ObjectNode exact = exactClassifications();
+        String original = exact.toString();
+        assertThat(EnforcePolicyPostCallResponseGuard.hasExactClassifications(exact, expected)).isTrue();
+        ObjectNode missing = exact.deepCopy();
+        missing.remove("creditScore");
+        assertThat(EnforcePolicyPostCallResponseGuard.hasExactClassifications(missing, expected)).isFalse();
+        assertThat(EnforcePolicyPostCallResponseGuard.hasExactClassifications(
+                exact.deepCopy().put("extra", "NORMAL"), expected)).isFalse();
+        assertThat(EnforcePolicyPostCallResponseGuard.hasExactClassifications(
+                exact.deepCopy().put("name", "normal"), expected)).isFalse();
+        assertThat(EnforcePolicyPostCallResponseGuard.hasExactClassifications(null, expected)).isFalse();
+        assertThat(exact.toString()).isEqualTo(original);
+        assertThat(expected).containsOnlyKeys("name", "creditScore");
     }
 
     @Test
@@ -749,7 +881,7 @@ class EnforcePolicyPostCallResponseGuardTest {
         ObjectNode missingStatus = OBJECT_MAPPER.createObjectNode();
         missingStatus.set("rows", OBJECT_MAPPER.createArrayNode());
         ObjectNode wrongStatus = validResponse().put("status", 201);
-        ObjectNode floatingStatus = validResponse().put("status", 200.0);
+        ObjectNode fractionalStatus = validResponse().put("status", 200.5);
         ObjectNode textualStatus = validResponse().put("status", "200");
         ObjectNode rowsObject = OBJECT_MAPPER.createObjectNode().put("status", 200);
         rowsObject.set("rows", OBJECT_MAPPER.createObjectNode());
@@ -761,8 +893,6 @@ class EnforcePolicyPostCallResponseGuardTest {
         );
         ObjectNode extraRowField = validResponse();
         ((ObjectNode) extraRowField.at("/rows/0")).put("debug", true);
-        ObjectNode blankCustomer = validResponse();
-        ((ObjectNode) blankCustomer.at("/rows/0")).put("customerId", " ");
         ObjectNode numericCustomer = validResponse();
         ((ObjectNode) numericCustomer.at("/rows/0")).put("customerId", 1001);
         ObjectNode nonObjectFields = validResponse();
@@ -782,13 +912,12 @@ class EnforcePolicyPostCallResponseGuardTest {
                 Arguments.of("extra envelope field", extraEnvelopeField),
                 Arguments.of("missing status", missingStatus),
                 Arguments.of("non-success status", wrongStatus),
-                Arguments.of("floating status", floatingStatus),
+                Arguments.of("fractional status", fractionalStatus),
                 Arguments.of("textual status", textualStatus),
                 Arguments.of("rows is not an array", rowsObject),
                 Arguments.of("row is not an object", scalarRow),
                 Arguments.of("row field missing", missingRowField),
                 Arguments.of("row field extra", extraRowField),
-                Arguments.of("blank customer", blankCustomer),
                 Arguments.of("non-text customer", numericCustomer),
                 Arguments.of("fields is not an object", nonObjectFields),
                 Arguments.of("field is absent from catalog", unknownCatalogField)
@@ -1028,6 +1157,29 @@ class EnforcePolicyPostCallResponseGuardTest {
         ArrayList<String> values = new ArrayList<>();
         values.add(null);
         return values;
+    }
+
+    private static JsonNode actualCustomerOutputSchema() {
+        assertThat(LoanReviewToolCatalog.MANIFEST_VERSION).isEqualTo("1.1");
+        for (JsonNode tool : LoanReviewToolCatalog.normalTools()) {
+            if (CUSTOMER_DATA_READ.equals(tool.path("name").asString())) {
+                return tool.path("outputSchema");
+            }
+        }
+        throw new AssertionError("Actual versioned customer schema is missing");
+    }
+
+    private static ObjectNode actualClassifications() {
+        return OBJECT_MAPPER.createObjectNode().put("incomeBand", "FINANCIAL")
+                .put("employmentStatus", "NORMAL").put("accountNumber", "FINANCIAL");
+    }
+
+    private static EnforcePolicyPostCallFacts actualSchemaFacts(JsonNode response, JsonNode classifications) {
+        return facts(CURRENT_APPLICANT, List.of(CURRENT_APPLICANT), List.of("incomeBand"), List.of("incomeBand"),
+                List.of(new CatalogOutputField("incomeBand", FINANCIAL, STRING),
+                        new CatalogOutputField("employmentStatus", NORMAL, STRING),
+                        new CatalogOutputField("accountNumber", FINANCIAL, STRING)),
+                1, response, classifications, null);
     }
 
     private static List<CatalogOutputField> catalog() {

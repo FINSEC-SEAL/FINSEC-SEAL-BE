@@ -14,6 +14,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockConstruction;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -69,6 +70,7 @@ class CatalogBoundInputSchemaEvaluatorTest {
     private static final String HUMAN = "LOAN_DECISION_UPDATE";
     private static final String PRIVATE = "PRIVATE-INPUT-SENTINEL";
     private static final int BYTE_LIMIT = 32768;
+    private static final int RESPONSE_BYTE_LIMIT = 1024 * 1024;
     private static final UUID RELEASE = UUID.fromString("12345678-1234-4abc-8def-1234567890ab");
 
     private final CatalogBoundInputSchemaEvaluator evaluator = new CatalogBoundInputSchemaEvaluator();
@@ -143,11 +145,36 @@ class CatalogBoundInputSchemaEvaluatorTest {
     }
 
     @Test
-    void schemaDoesNotInventCustomerFieldEnumsOrDuplicatePolicyRules() {
+    void requestInvariantsDoNotInventCustomerScopeFieldEnumsOrNormalization() {
+        ApprovedPolicySource source = actualSource();
         ObjectNode arguments = valid(CUSTOMER);
-        arguments.putArray("customerIds").add(" CUST-1 ").add(" CUST-1 ");
-        arguments.putArray("fields").add("independent-policy-check").add("independent-policy-check");
-        assertPreserved(actualSource(), CUSTOMER, arguments, MATCH);
+        arguments.putArray("customerIds").add(" CUST-1 ").add("CUST-1").add("CUST-2");
+        arguments.putArray("fields").add("independent-policy-check").add("incomeBand").add(" incomeBand ");
+        assertPreserved(source, CUSTOMER, arguments, MATCH);
+        String before = arguments.toString();
+        assertThat(evaluator.evaluateCatalog(source.catalog(), new ToolProposal(CUSTOMER, arguments))).isEqualTo(MATCH);
+        assertThat(arguments.toString()).isEqualTo(before);
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidCustomerRequestSets")
+    void bothEntriesRejectDuplicateAndBlankCustomerRequestValuesBeforePolicy(String field, String value) {
+        ApprovedPolicySource source = actualSource();
+        ObjectNode arguments = valid(CUSTOMER);
+        ArrayNode values = arguments.putArray(field).add(value);
+        if (!value.isBlank()) values.add(value);
+        String before = arguments.toString();
+        Map<String, JsonNode> schemasBefore = source.catalog().inputSchemas();
+        assertPreserved(source, CUSTOMER, arguments, INVALID_REQUEST_SCHEMA);
+        assertThat(evaluator.evaluateCatalog(source.catalog(), new ToolProposal(CUSTOMER, arguments)))
+                .isEqualTo(INVALID_REQUEST_SCHEMA);
+        assertThat(arguments.toString()).isEqualTo(before);
+        assertThat(source.catalog().inputSchemas()).isEqualTo(schemasBefore);
+    }
+
+    static Stream<Arguments> invalidCustomerRequestSets() {
+        return Stream.of(Arguments.of("customerIds", "CUST-1002"), Arguments.of("fields", "incomeBand"),
+                Arguments.of("customerIds", " \t"), Arguments.of("fields", " \t"));
     }
 
     @ParameterizedTest
@@ -378,15 +405,10 @@ class CatalogBoundInputSchemaEvaluatorTest {
             BigInteger coefficient = new BigInteger("9".repeat(precision)).multiply(BigInteger.valueOf(sign));
             ObjectNode arguments = JSON.createObjectNode().set("value",
                     DecimalNode.valueOf(new BigDecimal(coefficient, precision)));
-            if (precision == 32769) {
-                assertRejectedBeforeCopy(arguments);
-            } else {
-                ObjectNode observed = spy(arguments);
-                assertThat(evaluator.evaluate(permissiveSource(), new ToolProposal(CASE, observed)))
-                        .isEqualTo(INVALID_REQUEST_SCHEMA);
-                verify(observed).deepCopy();
-                assertThat(utf8Bytes(arguments)).isGreaterThan(BYTE_LIMIT);
-            }
+            // At 32768 digits the numeric limit passes, but aggregate JSON bytes already exceed
+            // the limit; at 32769 digits the numeric guard rejects first. Neither requires a copy.
+            assertRejectedBeforeCopy(arguments);
+            assertThat(utf8Bytes(arguments)).isGreaterThan(BYTE_LIMIT);
         }
     }
 
@@ -589,6 +611,205 @@ class CatalogBoundInputSchemaEvaluatorTest {
         doThrow(new IllegalStateException(PRIVATE)).when(arguments).deepCopy();
         assertThat(evaluator.evaluate(actualSource(), new ToolProposal(CASE, arguments)))
                 .isEqualTo(INVALID_REQUEST_SCHEMA);
+    }
+
+    @ParameterizedTest(name = "catalog-only {0}")
+    @MethodSource("catalogEntryRequests")
+    void catalogEntryPreservesApprovedEntryOutcomesWithoutReadingTheSourceAgain(
+            String name, ToolProposal proposal, InputOutcome expected
+    ) {
+        SourceBoundCatalog catalog = catalog(actualSchemas());
+        ApprovedPolicySource source = source(catalog);
+        Map<String, JsonNode> beforeSchemas = catalog.inputSchemas();
+        String beforeArguments = proposal == null ? null : proposal.arguments().toString();
+
+        assertThat(evaluator.evaluate(source, proposal)).isEqualTo(expected);
+        assertThat(evaluator.evaluateCatalog(catalog, proposal)).isEqualTo(expected);
+
+        verify(source, times(1)).catalog();
+        assertThat(catalog.inputSchemas()).isEqualTo(beforeSchemas);
+        if (proposal != null) assertThat(proposal.arguments().toString()).isEqualTo(beforeArguments);
+    }
+
+    static Stream<Arguments> catalogEntryRequests() {
+        return Stream.of(
+                Arguments.of("normal", new ToolProposal(CASE, valid(CASE)), MATCH),
+                Arguments.of("human schema without permission", new ToolProposal(HUMAN, valid(HUMAN)), MATCH),
+                Arguments.of("invalid actual schema", new ToolProposal(CASE, json("{\"caseId\":7}")), INVALID_REQUEST_SCHEMA),
+                Arguments.of("unknown tool", new ToolProposal("UNKNOWN_TOOL", json("{}")), TOOL_NOT_IN_CATALOG),
+                Arguments.of("missing proposal", null, INVALID_REQUEST_SCHEMA));
+    }
+
+    @Test
+    void catalogEntryRetainsSourceCoverageAndKnownSchemaFailureCodes() {
+        ToolProposal proposal = new ToolProposal(CASE, valid(CASE));
+        assertFailure(INVALID_POLICY_SOURCE, () -> evaluator.evaluateCatalog(null, proposal));
+        assertFailure(INVALID_POLICY_SOURCE,
+                () -> evaluator.evaluateCatalog(mock(SourceBoundCatalog.class), proposal));
+        Map<String, JsonNode> missing = actualSchemas();
+        missing.remove(HUMAN);
+        assertFailure(INVALID_CATALOG_SCHEMA, () -> evaluator.evaluateCatalog(catalog(missing), proposal));
+        Map<String, JsonNode> malformed = actualSchemas();
+        malformed.put(CASE, json("{\"type\":\"unknown-type\"}"));
+        assertFailure(INVALID_CATALOG_SCHEMA, () -> evaluator.evaluateCatalog(catalog(malformed), proposal));
+    }
+
+    @Test
+    void catalogEntryUsesTheSameSanitizedSchemaEngineFailure() {
+        try (var construction = mockConstruction(CatalogJsonSchemaValidator.class, (engine, context) ->
+                when(engine.matches(any(), any())).thenThrow(new IllegalStateException(PRIVATE)))) {
+            CatalogBoundInputSchemaEvaluator faulted = new CatalogBoundInputSchemaEvaluator();
+            assertFailure(SCHEMA_ENGINE_FAILURE,
+                    () -> faulted.evaluateCatalog(catalog(actualSchemas()), new ToolProposal(CASE, valid(CASE))));
+            assertThat(construction.constructed()).hasSize(1);
+            verify(construction.constructed().getFirst(), times(1)).matches(any(), any());
+        }
+    }
+
+    @Test
+    void argumentSnapshotKeepsItsOriginalObjectByteAndDepthLimits() {
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotArguments(asciiSized(BYTE_LIMIT)))
+                .isEqualTo(asciiSized(BYTE_LIMIT));
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotArguments(asciiSized(BYTE_LIMIT + 1))).isNull();
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotArguments(nested(32))).isEqualTo(nested(32));
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotArguments(nested(33))).isNull();
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotArguments(null)).isNull();
+    }
+
+    @Test
+    void responseSnapshotAcceptsEveryNormalJsonRootWithoutRelaxingArgumentRoots() {
+        for (String raw : List.of("{}", "[]", "\"plain text\"", "7", "1.25", "true", "null")) {
+            JsonNode body = json(raw);
+            JsonNode snapshot = CatalogBoundInputSchemaEvaluator.snapshotResponse(body);
+            assertThat(snapshot).isNotNull().isEqualTo(body);
+            assertThat(body.toString()).isEqualTo(raw);
+            if (!body.isObject()) {
+                assertThat(CatalogBoundInputSchemaEvaluator.snapshotArguments(body)).isNull();
+            }
+        }
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotResponse(null)).isNull();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1048575, 1048576, 1048577})
+    void responseSnapshotHasItsOwnExactUtf8LimitIncludingEscapes(int bytes) {
+        ObjectNode response = JSON.createObjectNode().put("한\"", "한\"\\\n".repeat(200));
+        int padding = bytes - utf8Bytes(response);
+        response.put("한\"", response.path("한\"").asString() + "x".repeat(padding));
+        assertThat(utf8Bytes(response)).isEqualTo(bytes);
+        assertThat(response.toString().length()).isLessThan(bytes);
+
+        JsonNode snapshot = CatalogBoundInputSchemaEvaluator.snapshotResponse(response);
+        if (bytes <= RESPONSE_BYTE_LIMIT) {
+            assertThat(snapshot).isEqualTo(response).isNotSameAs(response);
+            assertThat(utf8Bytes(snapshot)).isEqualTo(bytes);
+        } else {
+            assertThat(snapshot).isNull();
+        }
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotArguments(response)).isNull();
+        assertThat(utf8Bytes(response)).isEqualTo(bytes);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {64, 65})
+    void responseSnapshotCountsTheRootAsDepthOne(int depth) {
+        ObjectNode response = nested(depth);
+        JsonNode snapshot = CatalogBoundInputSchemaEvaluator.snapshotResponse(response);
+        if (depth == 64) {
+            assertThat(snapshot).isEqualTo(response).isNotSameAs(response);
+        } else {
+            assertThat(snapshot).isNull();
+        }
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotArguments(response)).isNull();
+    }
+
+    @Test
+    void argumentAndResponseSnapshotsHaveIndependentNestedOwnership() {
+        ObjectNode original = (ObjectNode) json("{\"items\":[{\"value\":\"original\"}]}");
+        ObjectNode arguments = (ObjectNode) CatalogBoundInputSchemaEvaluator.snapshotArguments(original);
+        ObjectNode response = (ObjectNode) CatalogBoundInputSchemaEvaluator.snapshotResponse(original);
+        assertThat(arguments).isNotSameAs(original);
+        assertThat(response).isNotSameAs(original).isNotSameAs(arguments);
+
+        ((ObjectNode) original.at("/items/0")).put("value", "owner changed");
+        assertThat(arguments.at("/items/0/value").asString()).isEqualTo("original");
+        assertThat(response.at("/items/0/value").asString()).isEqualTo("original");
+        ((ObjectNode) arguments.at("/items/0")).put("value", "arguments changed");
+        assertThat(response.at("/items/0/value").asString()).isEqualTo("original");
+        ((ArrayNode) response.path("items")).add("response changed");
+        assertThat(arguments.path("items").size()).isEqualTo(1);
+        assertThat(original.path("items").size()).isEqualTo(1);
+        assertThat(original.at("/items/0/value").asString()).isEqualTo("owner changed");
+    }
+
+    @Test
+    void bothSnapshotPathsRejectCyclesAndUnsafeValuesBeforeRecursiveWork() {
+        ObjectNode cyclic = JSON.createObjectNode();
+        cyclic.set("cycle", cyclic);
+        assertSnapshotsRejectBeforeCopy(cyclic);
+        for (JsonNode value : List.of(new POJONode(PRIVATE), MissingNode.getInstance(),
+                BinaryNode.valueOf(new byte[]{1}), DoubleNode.valueOf(Double.NaN),
+                DoubleNode.valueOf(Double.POSITIVE_INFINITY))) {
+            assertSnapshotsRejectBeforeCopy(JSON.createObjectNode().set("x", value));
+            assertThat(CatalogBoundInputSchemaEvaluator.snapshotResponse(value)).isNull();
+        }
+    }
+
+    @Test
+    void largerResponseBudgetKeepsTheSameNumericWorkLimit() {
+        DecimalNode boundary = DecimalNode.valueOf(new BigDecimal(BigInteger.ONE, -32767));
+        ObjectNode safe = JSON.createObjectNode().set("x", boundary);
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotArguments(safe)).isEqualTo(safe);
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotResponse(safe)).isEqualTo(safe);
+        assertThat(safe.path("x")).isSameAs(boundary);
+        for (JsonNode value : List.of(
+                DecimalNode.valueOf(new BigDecimal(BigInteger.ONE, -32768)),
+                DecimalNode.valueOf(new BigDecimal("1E+100000000")),
+                DecimalNode.valueOf(new BigDecimal(BigInteger.ONE, Integer.MIN_VALUE)),
+                DecimalNode.valueOf(new BigDecimal(BigInteger.TEN.pow(32768), 32768)),
+                BigIntegerNode.valueOf(BigInteger.ONE.shiftLeft(131072)))) {
+            assertSnapshotsRejectBeforeCopy(JSON.createObjectNode().set("x", value));
+        }
+    }
+
+    @Test
+    void compactExponentsShareAnAggregateWorkBudgetWithoutCountingPunctuationAsNumericWork() {
+        DecimalNode number = DecimalNode.valueOf(new BigDecimal(BigInteger.ONE, -32767));
+        ObjectNode twoNumbers = JSON.createObjectNode();
+        twoNumbers.putArray("values").add(number).add(number);
+        assertRejectedBeforeCopy(twoNumbers);
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotResponse(twoNumbers)).isEqualTo(twoNumbers);
+
+        ObjectNode response = JSON.createObjectNode();
+        ArrayNode values = response.putArray("values");
+        for (int index = 0; index < 32; index++) values.add(number);
+        // 32 * 32768 numeric digits equals 1MiB; the compact JSON punctuation has its own byte budget.
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotResponse(response)).isEqualTo(response);
+        values.add(number);
+        assertSnapshotsRejectBeforeCopy(response);
+    }
+
+    @Test
+    void serializedIntegerDigitsCountAgainstTheByteBudgetBeforeRecursiveCopy() {
+        BigIntegerNode number = BigIntegerNode.valueOf(BigInteger.TEN.pow(32767));
+        ObjectNode arguments = JSON.createObjectNode().set("number", number);
+        // Numeric work is exactly 32768, but the full JSON is larger than the input byte budget.
+        assertRejectedBeforeCopy(arguments);
+
+        ObjectNode response = JSON.createObjectNode();
+        ArrayNode values = response.putArray("values");
+        for (int index = 0; index < 32; index++) values.add(number);
+        // Numeric work equals 1MiB; delimiters and commas make the serialized response too large.
+        assertSnapshotsRejectBeforeCopy(response);
+    }
+
+    private static void assertSnapshotsRejectBeforeCopy(ObjectNode value) {
+        ObjectNode guarded = spy(value);
+        doThrow(new AssertionError("Unsafe snapshot reached recursive copy")).when(guarded).deepCopy();
+        doThrow(new AssertionError("Unsafe snapshot reached serialization")).when(guarded).toString();
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotArguments(guarded)).isNull();
+        assertThat(CatalogBoundInputSchemaEvaluator.snapshotResponse(guarded)).isNull();
+        verify(guarded, never()).deepCopy();
     }
 
     private void assertRejectedBeforeCopy(ObjectNode arguments) {

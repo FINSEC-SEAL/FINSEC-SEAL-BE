@@ -7,12 +7,14 @@ import static com.finsecseal.policy.PolicyEvaluationStage.PREFLIGHT;
 
 import com.finsecseal.policy.PolicyEvaluationDecision.StageOutcome;
 import com.finsecseal.policy.PolicyEvaluationSequence.PolicyEvaluationException;
+import com.finsecseal.policy.PolicyEvaluationSequence.PolicyStageEvaluator;
 import com.finsecseal.policy.PolicyEvaluationSequence.PreflightEvaluator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -90,6 +92,33 @@ public final class EnforcePolicyEvaluator {
     ) {
         Objects.requireNonNull(preflight, "preflight");
         Objects.requireNonNull(facts, "facts");
+        return evaluateTimed(preflight, stage -> switch (stage) {
+            case TOOL, OPERATION -> authorization.evaluate(stage, facts.authorization());
+            case BUSINESS_CONTEXT -> businessContext.evaluate(stage, facts.businessContext());
+            case OBJECT_SCOPE -> objectScope.evaluate(stage, facts.objectScope());
+            case FIELD_SCOPE -> fieldScope.evaluate(stage, facts.fieldScope());
+            case CARDINALITY -> cardinality.evaluate(stage, facts.cardinality());
+            case EGRESS -> egress.evaluate(stage, facts.egress());
+            case WORKFLOW -> workflow.evaluate(stage, facts.workflow());
+            case HUMAN_BOUNDARY -> humanBoundary.evaluate(stage, facts.humanBoundary());
+            case TOOL_TRUST -> toolTrust.evaluate(stage, facts.toolTrust());
+            case PREFLIGHT -> throw new IllegalArgumentException("preflight is not a policy stage");
+        }, () -> consistent(facts));
+    }
+
+    /**
+     * Internal Gateway composition: construct facts only when their stage is reached.
+     * The Gateway must bind all stages to the same verified source and context; this path
+     * has no aggregate facts to cross-check. Callback I/O still requires its own deadline.
+     */
+    PolicyEvaluationDecision evaluateStages(PreflightEvaluator preflight, PolicyStageEvaluator stages) {
+        Objects.requireNonNull(preflight, "preflight");
+        Objects.requireNonNull(stages, "stages");
+        return evaluateTimed(preflight, stages, () -> true);
+    }
+
+    private PolicyEvaluationDecision evaluateTimed(PreflightEvaluator preflight,
+            PolicyStageEvaluator stages, BooleanSupplier consistencyCheck) {
         long started = nanoTime.getAsLong();
         PolicyEvaluationDecision decision;
         try {
@@ -101,21 +130,10 @@ public final class EnforcePolicyEvaluator {
                             || outcome.outcomeType() != PASS) {
                         return outcome;
                     }
-                    return consistent(facts) ? outcome
+                    return consistencyCheck.getAsBoolean() ? outcome
                             : StageOutcome.error(PREFLIGHT, CONTEXT_INTEGRITY_FAILURE);
                 }),
-                stage -> withinBudget(started, () -> switch (stage) {
-                    case TOOL, OPERATION -> authorization.evaluate(stage, facts.authorization());
-                    case BUSINESS_CONTEXT -> businessContext.evaluate(stage, facts.businessContext());
-                    case OBJECT_SCOPE -> objectScope.evaluate(stage, facts.objectScope());
-                    case FIELD_SCOPE -> fieldScope.evaluate(stage, facts.fieldScope());
-                    case CARDINALITY -> cardinality.evaluate(stage, facts.cardinality());
-                    case EGRESS -> egress.evaluate(stage, facts.egress());
-                    case WORKFLOW -> workflow.evaluate(stage, facts.workflow());
-                    case HUMAN_BOUNDARY -> humanBoundary.evaluate(stage, facts.humanBoundary());
-                    case TOOL_TRUST -> toolTrust.evaluate(stage, facts.toolTrust());
-                    case PREFLIGHT -> throw new IllegalArgumentException("preflight is not a policy stage");
-                })
+                stage -> withinBudget(started, () -> stages.evaluate(stage))
             );
         } catch (PolicyEvaluationException exception) {
             if (exception.getCause() instanceof PolicyEvaluationTimeoutException timeout) {

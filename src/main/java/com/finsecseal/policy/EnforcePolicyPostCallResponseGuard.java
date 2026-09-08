@@ -14,7 +14,7 @@ import com.finsecseal.policy.EnforcePolicyPostCallDecision.OperationalReason;
 import com.finsecseal.policy.EnforcePolicyPostCallDecision.PostCallCheck;
 import com.finsecseal.policy.EnforcePolicyPostCallFacts.CatalogOutputField;
 import com.finsecseal.policy.EnforcePolicyPostCallFacts.OutputValueType;
-import java.math.BigInteger;
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -40,7 +40,7 @@ public final class EnforcePolicyPostCallResponseGuard {
             "namespaceId",
             "testCaseRunId"
     );
-    private static final BigInteger SUCCESS_STATUS = BigInteger.valueOf(200);
+    private static final BigDecimal SUCCESS_STATUS = BigDecimal.valueOf(200);
 
     public EnforcePolicyPostCallDecision evaluate(EnforcePolicyPostCallFacts facts) {
         Objects.requireNonNull(facts, "facts must not be null");
@@ -111,9 +111,7 @@ public final class EnforcePolicyPostCallResponseGuard {
         }
 
         JsonNode status = response.get("status");
-        if (status == null
-                || !status.isIntegralNumber()
-                || !SUCCESS_STATUS.equals(status.bigIntegerValue())) {
+        if (!hasIntegerValue(status) || SUCCESS_STATUS.compareTo(status.decimalValue()) != 0) {
             return false;
         }
 
@@ -136,7 +134,6 @@ public final class EnforcePolicyPostCallResponseGuard {
             JsonNode fields = row.get("fields");
             if (customerId == null
                     || !customerId.isString()
-                    || customerId.asString().isBlank()
                     || fields == null
                     || !fields.isObject()) {
                 return false;
@@ -158,11 +155,22 @@ public final class EnforcePolicyPostCallResponseGuard {
         }
         return switch (expectedType) {
             case STRING -> value.isString();
-            case INTEGER -> value.isIntegralNumber();
+            case INTEGER -> hasIntegerValue(value);
         };
     }
 
-    private static boolean hasExactClassifications(
+    /** JSON Schema integer describes a mathematical value, not the Java numeric node type. */
+    private static boolean hasIntegerValue(JsonNode value) {
+        if (value == null || !value.isNumber()) return false;
+        Number number = value.numberValue();
+        if (number instanceof Double floating && !Double.isFinite(floating)) return false;
+        if (number instanceof Float floating && !Float.isFinite(floating)) return false;
+        BigDecimal decimal = value.decimalValue();
+        // Do not expand a compact exponent into a BigInteger or rewrite the returned node.
+        return decimal.scale() <= 0 || decimal.stripTrailingZeros().scale() <= 0;
+    }
+
+    static boolean hasExactClassifications(
             JsonNode classificationMap,
             Map<String, Sensitivity> expected
     ) {
