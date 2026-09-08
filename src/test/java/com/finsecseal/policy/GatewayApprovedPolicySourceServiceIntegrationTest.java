@@ -3,10 +3,13 @@ package com.finsecseal.policy;
 import static com.finsecseal.policy.PolicyEvaluationReason.HUMAN_ONLY_ACTION;
 import static com.finsecseal.policy.PolicyEvaluationReason.OPERATION_NOT_ALLOWED;
 import static com.finsecseal.policy.PolicyEvaluationReason.TOOL_NOT_ALLOWED;
+import static com.finsecseal.policy.PolicyEvaluationStage.BUSINESS_CONTEXT;
 import static com.finsecseal.policy.PolicyEvaluationStage.EGRESS;
 import static com.finsecseal.policy.PolicyEvaluationStage.HUMAN_BOUNDARY;
+import static com.finsecseal.policy.PolicyEvaluationStage.OBJECT_SCOPE;
 import static com.finsecseal.policy.PolicyEvaluationStage.OPERATION;
 import static com.finsecseal.policy.PolicyEvaluationStage.TOOL;
+import static com.finsecseal.policy.PolicyEvaluationStage.WORKFLOW;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
@@ -23,6 +26,7 @@ import com.finsecseal.agent.AgentService;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.ExecutionEventType;
+import com.finsecseal.common.domain.Sensitivity;
 import com.finsecseal.common.domain.TestCaseRunStatus;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.common.domain.TestRunStatus;
@@ -39,6 +43,11 @@ import com.finsecseal.evidence.TestRunPersistenceService;
 import com.finsecseal.evidence.TestRunProjectionService;
 import com.finsecseal.platform.contract.ContractPersistenceService;
 import com.finsecseal.platform.contract.ContractPersistenceService.Version;
+import com.finsecseal.policy.EnforcePolicyPostCallDecision.OperationalReason;
+import com.finsecseal.policy.EnforcePolicyPostCallDecision.Outcome;
+import com.finsecseal.policy.EnforcePolicyPostCallDecision.PostCallCheck;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.CatalogOutputField;
+import com.finsecseal.policy.EnforcePolicyPostCallFacts.OutputValueType;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.ApprovedPolicySource;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.FailureCode;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.PolicySourceException;
@@ -48,6 +57,7 @@ import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
 import com.finsecseal.policy.PolicyToolTrustFacts.ToolTrustPolicy;
 import com.finsecseal.policy.PolicyToolTrustFacts.TrustLevel;
 import com.finsecseal.release.ReleaseService;
+import com.finsecseal.runtime.ToolProposal;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.sql.Connection;
@@ -56,6 +66,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -141,6 +152,7 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
         Seed seed = seed(mode);
         List<ReleaseToolBinding> storedBindings = storedReleaseBindings(seed.releaseId());
         List<CatalogTool> expectedDeclarations = expectedDeclaredTools(seed.releaseId());
+        List<CatalogOutputField> expectedCustomerFields = expectedCustomerOutputFields(seed.releaseId());
         var firstRead = new AtomicReference<PhysicalTransaction>();
         var approvalRead = new AtomicReference<PhysicalTransaction>();
         var catalogRead = new AtomicReference<PhysicalTransaction>();
@@ -186,6 +198,7 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
         Baseline afterSource = baseline(seed.releaseId());
         List<Integer> callsBeforeAssembly = ownerInvocationCounts();
         assertDeclaredToolAssembly(source, expectedDeclarations);
+        assertContextAndCustomerResponseAssembly(source, expectedCustomerFields);
         assertThat(ownerInvocationCounts()).isEqualTo(callsBeforeAssembly);
         assertUnchanged(afterSource, seed.releaseId(), 0);
         String proofFingerprint = seed.approved().validation().at("/sourceBinding/releaseFingerprint").stringValue();
@@ -643,6 +656,83 @@ class GatewayApprovedPolicySourceServiceIntegrationTest {
         assertThat(unknownEgress.requestedCatalogTool()).isEmpty();
         assertThatThrownBy(() -> egressEvaluator.evaluate(EGRESS, unknownEgress))
                 .isInstanceOf(IllegalStateException.class);
+    }
+
+    private List<CatalogOutputField> expectedCustomerOutputFields(UUID releaseId) {
+        JsonNode storedFields = mapper.readTree(jdbc.queryForObject(
+                "select (d.output_schema_json #> '{properties,rows,items,properties,fields,properties}')::text "
+                        + "from release_tools r join tool_definitions d on d.id=r.tool_definition_id "
+                        + "where r.release_id=? and r.enabled=true and d.tool_key='CUSTOMER_DATA_READ'",
+                String.class, releaseId));
+        // C loan-review/1 classifications; field presence and types are checked against actual A storage.
+        List<CatalogOutputField> expected = List.of(
+                new CatalogOutputField("accountNumber", Sensitivity.FINANCIAL, OutputValueType.STRING),
+                new CatalogOutputField("employmentStatus", Sensitivity.NORMAL, OutputValueType.STRING),
+                new CatalogOutputField("incomeBand", Sensitivity.FINANCIAL, OutputValueType.STRING));
+        assertThat(storedFields.isObject()).isTrue();
+        assertThat(storedFields.size()).isEqualTo(expected.size());
+        for (CatalogOutputField field : expected) {
+            assertThat(storedFields.path(field.fieldName()).path("type").stringValue()).isEqualTo("string");
+        }
+        return expected;
+    }
+
+    private void assertContextAndCustomerResponseAssembly(ApprovedPolicySource source,
+            List<CatalogOutputField> expectedCustomerFields) {
+        assertThat(source.catalog().customerOutputFields()).containsExactlyInAnyOrderElementsOf(expectedCustomerFields);
+        // Synthetic server context and adapter observations: no namespace creation or Tool execution occurs.
+        String applicant = "synthetic-current-applicant";
+        String businessCase = "synthetic-business-case";
+        var purpose = Optional.of("LOAN_DOCUMENT_COMPLETENESS_REVIEW");
+        var workflow = assembler.workflow(source, "CUSTOMER_DATA_READ", "DOCUMENT_REVIEW");
+        assertThat(new PolicyWorkflowEvaluator().evaluate(WORKFLOW, workflow)).isEqualTo(StageOutcome.pass(WORKFLOW));
+        var business = assembler.businessContext(source, true, purpose, purpose, purpose,
+                Optional.of(source.runId().toString()), Optional.of(businessCase), Optional.of(applicant),
+                Optional.of("DOCUMENT_REVIEW"), Optional.of(List.of("synthetic-allowed-document")));
+        assertThat(business.contractPurpose()).isEqualTo(purpose);
+        assertThat(new PolicyBusinessContextEvaluator().evaluate(BUSINESS_CONTEXT, business))
+                .isEqualTo(StageOutcome.pass(BUSINESS_CONTEXT));
+        var scope = assembler.objectScope(source, "CUSTOMER_DATA_READ", Optional.empty(), Optional.empty(),
+                Optional.of(List.of(applicant)), Optional.empty(), Optional.of(applicant), Optional.empty(), Optional.empty());
+        assertThat(scope.requestedScopePolicy()).contains(
+                new PolicyObjectScopeFacts.ObjectScopePolicy("CUSTOMER_DATA_READ", false, false, true));
+        assertThat(new PolicyObjectScopeEvaluator().evaluate(OBJECT_SCOPE, scope)).isEqualTo(StageOutcome.pass(OBJECT_SCOPE));
+
+        ObjectNode arguments = mapper.createObjectNode();
+        arguments.putArray("customerIds").add(applicant);
+        arguments.putArray("fields").add("incomeBand").add("employmentStatus");
+        var proposal = new ToolProposal("CUSTOMER_DATA_READ", arguments);
+        ObjectNode response = mapper.createObjectNode().put("status", 200);
+        response.putArray("rows").addObject().put("customerId", applicant).putObject("fields")
+                .put("incomeBand", "SYNTHETIC_BAND").put("employmentStatus", "SYNTHETIC_STATUS");
+        ObjectNode classifications = mapper.createObjectNode().put("accountNumber", "FINANCIAL")
+                .put("employmentStatus", "NORMAL").put("incomeBand", "FINANCIAL");
+        ObjectNode provenance = mapper.createObjectNode().put("namespaceId", source.runId().toString())
+                .put("testCaseRunId", source.testCaseRunId().toString());
+        var facts = assembler.customerDataReadPostCall(source, proposal, applicant, response, classifications, provenance);
+        assertThat(facts.catalogOutputFields()).containsExactlyInAnyOrderElementsOf(expectedCustomerFields);
+        assertThat(facts.approvedProjection()).containsExactlyInAnyOrder("incomeBand", "employmentStatus");
+        assertThat(facts.maxReturnedRecords()).isEqualTo(1);
+        assertThat(facts.expectedNamespaceId()).isEqualTo(source.runId().toString());
+        assertThat(facts.expectedTestCaseRunId()).isEqualTo(source.testCaseRunId());
+        var guard = new EnforcePolicyPostCallResponseGuard();
+        var passed = guard.evaluate(facts);
+        assertThat(passed.outcome()).isEqualTo(Outcome.PASS);
+        assertThat(passed.evaluatedChecks()).containsExactlyElementsOf(PostCallCheck.completeOrder());
+        assertThat(passed.deliverableOutput()).contains(response);
+
+        ObjectNode forbidden = (ObjectNode) response.deepCopy();
+        ((ObjectNode) forbidden.at("/rows/0/fields")).put("accountNumber", "SYNTHETIC_FORBIDDEN_ACCOUNT");
+        var quarantined = guard.evaluate(assembler.customerDataReadPostCall(
+                source, proposal, applicant, forbidden, classifications, provenance));
+        assertThat(quarantined.outcome()).isEqualTo(Outcome.QUARANTINE);
+        assertThat(quarantined.failedCheck()).contains(PostCallCheck.FIELD_PROJECTION);
+        assertThat(quarantined.evaluatedChecks()).containsExactly(PostCallCheck.OUTPUT_SCHEMA,
+                PostCallCheck.CLASSIFICATION, PostCallCheck.OBJECT_SCOPE, PostCallCheck.FIELD_PROJECTION);
+        assertThat(quarantined.reason()).contains(OperationalReason.ADAPTER_CONTRACT_FAILURE);
+        assertThat(quarantined.deliverableOutput()).isEmpty();
+        assertThat(quarantined.operationalFailure()).isTrue();
+        assertThat(quarantined.successfulSecurityBlock()).isFalse();
     }
 
     private List<Integer> ownerInvocationCounts() {
