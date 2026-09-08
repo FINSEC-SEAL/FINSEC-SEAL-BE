@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
@@ -37,6 +38,8 @@ import com.finsecseal.platform.contract.ContractPersistenceService.ApprovedContr
 import com.finsecseal.platform.contract.ContractPersistenceService.Version;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.FailureCode;
 import com.finsecseal.policy.GatewayApprovedPolicySourceService.PolicySourceException;
+import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
+import com.finsecseal.policy.PolicyToolTrustFacts.TrustLevel;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import java.math.BigInteger;
@@ -117,7 +120,8 @@ class GatewayApprovedPolicySourceServiceTest {
                         new EnabledTool("DOCUMENT_READER", List.of()),
                         new EnabledTool("CUSTOMER_DATA_READ", List.of("incomeBand", "employmentStatus")),
                         new EnabledTool("LOAN_POLICY_SEARCH", List.of()),
-                        new EnabledTool("REVIEW_NOTE_WRITE", List.of())), List.of("LOAN_DECISION_UPDATE")));
+                        new EnabledTool("REVIEW_NOTE_WRITE", List.of())), List.of("LOAN_DECISION_UPDATE")),
+                fixtureBindings());
         when(runs.find(RUN)).thenReturn(run);
         approved(version);
         when(cases.findCase(CASE_RUN)).thenReturn(caseRun);
@@ -152,6 +156,12 @@ class GatewayApprovedPolicySourceServiceTest {
         assertThat(result.policyHash()).isEqualTo(version.policyHash());
         assertThat(result.resourceHash()).isEqualTo(HASH);
         assertThat(result.catalog()).isEqualTo(catalog);
+        assertThat(result.releaseToolBindings()).containsExactlyElementsOf(fixtureBindings());
+        assertThat(result.releaseToolBindings()).extracting(ReleaseToolBinding::toolName)
+                .containsExactly("CASE_CONTEXT_READ", "CUSTOMER_DATA_READ", "DOCUMENT_READER",
+                        "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE");
+        assertThat(result.toolTrustPolicy().requireTrustedTool()).isTrue();
+        assertThat(result.toolTrustPolicy().allowedTrustLevels()).containsExactly(TrustLevel.TRUSTED_INTERNAL);
         assertThat(result.validation().status()).isEqualTo(ValidationStatus.VALID);
         assertThat(result.canonicalPolicy().policyHash()).isEqualTo(result.policyHash());
         var order = inOrder(runs, contracts, cases, catalogs);
@@ -166,13 +176,25 @@ class GatewayApprovedPolicySourceServiceTest {
     void snapshotDefensivelyCopiesPolicyAndExcludesPrivateOwnerProjections() {
         var result = service.load(RUN, CASE_RUN, REVIEWER);
         JsonNode expected = result.policy();
+        List<ReleaseToolBinding> expectedBindings = List.copyOf(result.releaseToolBindings());
         ((ObjectNode) version.policy()).put("contractId", CANARY);
+        ((ObjectNode) version.policy().path("toolTrust")).put("requireTrustedTool", false);
+        ((ArrayNode) version.policy().at("/toolTrust/allowedTrustLevels")).add("SANDBOXED");
         ((ObjectNode) result.policy()).put("contractId", CANARY);
         ((ObjectNode) result.policy().path("customerScope")).put("type", CANARY);
+        ((ObjectNode) result.policy().path("toolTrust")).put("requireTrustedTool", false);
+        ((ArrayNode) result.policy().at("/toolTrust/allowedTrustLevels")).removeAll();
         assertThat(result.policy()).isEqualTo(expected);
         assertThat(canonicalizer.canonicalizeAndHash(result.policy())).isEqualTo(result.canonicalPolicy());
         assertThatThrownBy(() -> result.validation().issues().clear()).isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> result.catalog().semanticCatalog().enabledReleaseTools().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThat(result.releaseToolBindings()).containsExactlyElementsOf(expectedBindings);
+        assertThatThrownBy(() -> result.releaseToolBindings().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThat(result.toolTrustPolicy().requireTrustedTool()).isTrue();
+        assertThat(result.toolTrustPolicy().allowedTrustLevels()).containsExactly(TrustLevel.TRUSTED_INTERNAL);
+        assertThatThrownBy(() -> result.toolTrustPolicy().allowedTrustLevels().add(TrustLevel.SANDBOXED))
                 .isInstanceOf(UnsupportedOperationException.class);
         assertThat(result.toString()).doesNotContain(CANARY, "contractId", "private");
         assertThat(result.getClass().getDeclaredFields()).noneMatch(field ->
@@ -278,9 +300,106 @@ class GatewayApprovedPolicySourceServiceTest {
         when(catalogs.load(RELEASE, REVIEWER.actorId())).thenReturn(field.equals("null") ? null
                 : new SourceBoundCatalog(field.equals("release") ? OTHER : RELEASE, "1.1",
                 field.equals("artifact") ? HASH : ARTIFACT, field.equals("fingerprint") ? HASH : FINGERPRINT,
-                HASH, catalog.semanticCatalog()));
+                HASH, catalog.semanticCatalog(), catalog.releaseToolBindings()));
         safeLoad(FailureCode.CATALOG_BINDING_INVALID);
         verifyNoInteractions(validator);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"semanticOnly", "empty", "missing", "extra", "replacement", "duplicate",
+            "sameNameDifferentVersion", "disabled", "paddedVersion"})
+    void incompleteExpectedToolBindingsNeverReachPolicyValidation(String kind) {
+        List<ReleaseToolBinding> bindings = new ArrayList<>(fixtureBindings());
+        ReleaseToolBinding first = bindings.getFirst();
+        switch (kind) {
+            case "semanticOnly", "empty" -> bindings.clear();
+            case "missing" -> bindings.removeFirst();
+            case "extra" -> bindings.add(new ReleaseToolBinding("LOAN_DECISION_UPDATE", "1.1.0", true, HASH, ARTIFACT));
+            case "replacement" -> bindings.set(0, new ReleaseToolBinding("LOAN_DECISION_UPDATE", first.version(),
+                    true, first.schemaDigest(), first.descriptionDigest()));
+            case "duplicate" -> bindings.add(first);
+            case "sameNameDifferentVersion" -> bindings.add(new ReleaseToolBinding(first.toolName(), "2.0.0",
+                    true, first.schemaDigest(), first.descriptionDigest()));
+            case "disabled" -> bindings.set(0, new ReleaseToolBinding(first.toolName(), first.version(),
+                    false, first.schemaDigest(), first.descriptionDigest()));
+            case "paddedVersion" -> bindings.set(0, new ReleaseToolBinding(first.toolName(), " 1.1.0 ",
+                    true, first.schemaDigest(), first.descriptionDigest()));
+            default -> throw new AssertionError(kind);
+        }
+        SourceBoundCatalog invalid = kind.equals("semanticOnly")
+                ? new SourceBoundCatalog(RELEASE, "1.1", ARTIFACT, FINGERPRINT, HASH, catalog.semanticCatalog())
+                : catalogWithBindings(bindings);
+        when(catalogs.load(RELEASE, REVIEWER.actorId())).thenReturn(invalid);
+        clearInvocations(canonicalizer);
+
+        safeLoad(FailureCode.CATALOG_BINDING_INVALID);
+
+        verifyNoInteractions(validator, canonicalizer);
+        verify(runs).find(RUN);
+        verify(contracts).approved(RELEASE, VERSION, REVIEWER);
+        verify(cases).findCase(CASE_RUN);
+        verify(catalogs).load(RELEASE, REVIEWER.actorId());
+        verifyNoMoreInteractions(runs, contracts, cases, catalogs);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"list", "entry"})
+    void nullExpectedBindingsAreRejectedAtTheActualCatalogConstructorBoundary(String kind) {
+        List<ReleaseToolBinding> bindings = new ArrayList<>(fixtureBindings());
+        bindings.add(null);
+
+        assertThatThrownBy(() -> catalogWithBindings(kind.equals("list") ? null : bindings))
+                .isInstanceOf(NullPointerException.class);
+        verifyNoInteractions(runs, contracts, cases, catalogs);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"versionNull", "versionEmpty", "versionBlank", "schemaNull", "schemaMalformed",
+            "descriptionNull", "descriptionMalformed"})
+    void malformedBindingValuesAreRejectedAtTheActualValueConstructorBoundary(String kind) {
+        String versionValue = switch (kind) {
+            case "versionNull" -> null;
+            case "versionEmpty" -> "";
+            case "versionBlank" -> "  ";
+            default -> "1.1.0";
+        };
+        String schema = kind.equals("schemaNull") ? null : kind.equals("schemaMalformed") ? CANARY : HASH;
+        String description = kind.equals("descriptionNull") ? null : kind.equals("descriptionMalformed") ? CANARY : ARTIFACT;
+
+        assertThatThrownBy(() -> new ReleaseToolBinding("CUSTOMER_DATA_READ", versionValue, true, schema, description))
+                .isInstanceOf(IllegalArgumentException.class);
+        verifyNoInteractions(runs, contracts, cases, catalogs);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "null", "wrongType", "missingRequired", "falseRequired", "stringRequired",
+            "missingLevels", "nullLevels", "wrongTypeLevels", "emptyLevels", "unsupportedLevel", "duplicateLevel"})
+    void invalidToolTrustPoliciesUseTheRealValidatorWithoutDefaultProjection(String kind) {
+        ObjectNode policy = (ObjectNode) version.policy().deepCopy();
+        ObjectNode trust = (ObjectNode) policy.path("toolTrust");
+        switch (kind) {
+            case "missing" -> policy.remove("toolTrust");
+            case "null" -> policy.putNull("toolTrust");
+            case "wrongType" -> policy.put("toolTrust", CANARY);
+            case "missingRequired" -> trust.remove("requireTrustedTool");
+            case "falseRequired" -> trust.put("requireTrustedTool", false);
+            case "stringRequired" -> trust.put("requireTrustedTool", "true");
+            case "missingLevels" -> trust.remove("allowedTrustLevels");
+            case "nullLevels" -> trust.putNull("allowedTrustLevels");
+            case "wrongTypeLevels" -> trust.put("allowedTrustLevels", "TRUSTED_INTERNAL");
+            case "emptyLevels" -> trust.putArray("allowedTrustLevels");
+            case "unsupportedLevel" -> ((ArrayNode) trust.path("allowedTrustLevels")).add("SANDBOXED");
+            case "duplicateLevel" -> ((ArrayNode) trust.path("allowedTrustLevels")).add("TRUSTED_INTERNAL");
+            default -> throw new AssertionError(kind);
+        }
+        approved(change(version, Version.class, "policy", policy));
+        clearInvocations(canonicalizer);
+
+        safeLoad(FailureCode.POLICY_INVALID);
+
+        verify(validator).validate(any(), any());
+        verifyNoInteractions(canonicalizer);
+        assertThat(validator.validate(policy, catalog.semanticCatalog()).status()).isEqualTo(ValidationStatus.INVALID);
     }
 
     @ParameterizedTest
@@ -367,6 +486,26 @@ class GatewayApprovedPolicySourceServiceTest {
 
     private void approved(Version value) {
         when(contracts.approved(RELEASE, VERSION, REVIEWER)).thenReturn(new ApprovedContract(value, ARTIFACT, FINGERPRINT));
+    }
+
+    private SourceBoundCatalog catalogWithBindings(List<ReleaseToolBinding> bindings) {
+        return new SourceBoundCatalog(RELEASE, "1.1", ARTIFACT, FINGERPRINT, HASH, catalog.semanticCatalog(), bindings);
+    }
+
+    /** Synthetic unit digests only; the separate PostgreSQL test compares Role A's stored hashes. */
+    private List<ReleaseToolBinding> fixtureBindings() {
+        return List.of(
+                fixtureBinding("CASE_CONTEXT_READ", "1", "6"),
+                fixtureBinding("CUSTOMER_DATA_READ", "2", "7"),
+                fixtureBinding("DOCUMENT_READER", "3", "8"),
+                fixtureBinding("LOAN_POLICY_SEARCH", "4", "9"),
+                fixtureBinding("REVIEW_NOTE_WRITE", "5", "a")
+        );
+    }
+
+    private ReleaseToolBinding fixtureBinding(String name, String schemaHex, String descriptionHex) {
+        return new ReleaseToolBinding(name, "1.1.0", true,
+                "sha256:" + schemaHex.repeat(64), "sha256:" + descriptionHex.repeat(64));
     }
 
     private <T> T change(T value, Class<T> type, String field, Object replacement) {
