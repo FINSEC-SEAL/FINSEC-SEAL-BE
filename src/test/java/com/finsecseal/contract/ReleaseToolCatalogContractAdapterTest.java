@@ -29,6 +29,7 @@ import com.finsecseal.contract.SafetyContractSemanticValidator.EnabledTool;
 import com.finsecseal.contract.SafetyContractSemanticValidator.Issue;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ValidationResult;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ValidationStatus;
+import com.finsecseal.policy.PolicyToolAuthorizationFacts.CatalogTool;
 import com.finsecseal.policy.PolicyToolTrustFacts.ReleaseToolBinding;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
@@ -130,6 +131,16 @@ class ReleaseToolCatalogContractAdapterTest {
             assertThat(binding.schemaDigest()).isEqualTo(roleASchemaHash(sourceTool));
             assertThat(binding.descriptionDigest()).isEqualTo(roleADescriptionHash(sourceTool));
         }
+        assertThat(result.declaredTools()).containsExactly(
+                new CatalogTool("CASE_CONTEXT_READ", "READ", false),
+                new CatalogTool("CUSTOMER_DATA_READ", "READ", false),
+                new CatalogTool("DOCUMENT_READER", "READ", false),
+                new CatalogTool("LOAN_DECISION_UPDATE", "UPDATE", false),
+                new CatalogTool("LOAN_POLICY_SEARCH", "SEARCH", false),
+                new CatalogTool("REVIEW_NOTE_WRITE", "CREATE", false)
+        );
+        assertThat(result.releaseToolBindings()).extracting(ReleaseToolBinding::toolName)
+                .doesNotContain("LOAN_DECISION_UPDATE");
         assertThat(semanticValidator.validate(
                 fixture("loan-review-safety-contract.json"),
                 result.semanticCatalog()
@@ -312,8 +323,13 @@ class ReleaseToolCatalogContractAdapterTest {
         SourceBoundCatalog result = load(source);
         SourceBoundCatalog beforeMutation = result;
         List<ReleaseToolBinding> bindingsBeforeMutation = List.copyOf(result.releaseToolBindings());
+        List<CatalogTool> declarationsBeforeMutation = List.copyOf(result.declaredTools());
         tool(tools, "CUSTOMER_DATA_READ").put("description", RAW_SENTINEL);
         tool(tools, "CUSTOMER_DATA_READ").put("version", "2.0.0");
+        tool(tools, "CUSTOMER_DATA_READ").put("operation", "POST");
+        tool(tools, "CUSTOMER_DATA_READ").put("sideEffectType", "MOCK_EXTERNAL_WRITE");
+        ((ObjectNode) serverCatalog.at("/tools/0")).put("operation", "READ");
+        ((ObjectNode) serverCatalog.at("/tools/0")).put("sideEffectType", "MOCK_EXTERNAL_WRITE");
         ((ObjectNode) tool(tools, "CUSTOMER_DATA_READ").path("inputSchema")).removeAll();
         tools.removeAll();
         serverCatalog.removeAll();
@@ -322,6 +338,10 @@ class ReleaseToolCatalogContractAdapterTest {
         assertThat(result.semanticCatalog().enabledReleaseTools()).hasSize(5);
         assertThat(result.releaseToolBindings()).containsExactlyElementsOf(bindingsBeforeMutation);
         assertThat(result.releaseToolBindings()).hasSize(5);
+        assertThat(result.declaredTools()).containsExactlyElementsOf(declarationsBeforeMutation);
+        assertThat(result.declaredTools()).hasSize(6);
+        assertThatThrownBy(() -> result.declaredTools().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> result.releaseToolBindings().clear())
                 .isInstanceOf(UnsupportedOperationException.class);
         assertThat(result.semanticCatalog().highImpactToolNames())
@@ -377,6 +397,9 @@ class ReleaseToolCatalogContractAdapterTest {
         assertThat(second).isEqualTo(first);
         assertThat(second.semanticCatalog().highImpactToolNames())
                 .containsExactly("ACCOUNT_OVERRIDE", "LOAN_DECISION_UPDATE");
+        assertThat(second.declaredTools()).extracting(CatalogTool::name)
+                .containsExactly("ACCOUNT_OVERRIDE", "CASE_CONTEXT_READ", "CUSTOMER_DATA_READ", "DOCUMENT_READER",
+                        "LOAN_DECISION_UPDATE", "LOAN_POLICY_SEARCH", "REVIEW_NOTE_WRITE");
     }
 
     @Test
@@ -592,6 +615,9 @@ class ReleaseToolCatalogContractAdapterTest {
         supplied.clear();
 
         assertThat(copy.releaseToolBindings()).containsExactlyElementsOf(actual.releaseToolBindings());
+        assertThat(copy.declaredTools()).isEmpty();
+        assertThatThrownBy(() -> copy.declaredTools().add(actual.declaredTools().getFirst()))
+                .isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> copy.releaseToolBindings().add(actual.releaseToolBindings().getFirst()))
                 .isInstanceOf(UnsupportedOperationException.class);
     }
@@ -606,11 +632,90 @@ class ReleaseToolCatalogContractAdapterTest {
         );
 
         assertThat(semanticOnly.releaseToolBindings()).isEmpty();
+        assertThat(semanticOnly.declaredTools()).isEmpty();
         assertThat(semanticOnly.semanticCatalog()).isEqualTo(actual.semanticCatalog());
         assertThat(semanticValidator.validate(fixture("loan-review-safety-contract.json"),
                 semanticOnly.semanticCatalog()).status()).isEqualTo(ValidationStatus.VALID);
         assertThatThrownBy(() -> semanticOnly.releaseToolBindings().add(actual.releaseToolBindings().getFirst()))
                 .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void eightArgumentConstructorSnapshotsDeclarationsWithoutChangingPriorInputs() throws IOException {
+        SourceBoundCatalog actual = load(authoritativeSource(fixture("valid-release-manifest-v1.1.json")));
+        List<CatalogTool> declarations = new ArrayList<>(actual.declaredTools());
+        List<ReleaseToolBinding> bindings = new ArrayList<>(actual.releaseToolBindings());
+        SourceBoundCatalog copy = new SourceBoundCatalog(
+                actual.releaseId(), actual.manifestSchemaVersion(), actual.agentArtifactFingerprint(),
+                actual.releaseFingerprint(), actual.serverToolCatalogHash(), actual.semanticCatalog(),
+                bindings, declarations
+        );
+        declarations.clear();
+        bindings.clear();
+
+        assertThat(copy).isEqualTo(actual);
+        assertThat(copy.declaredTools()).hasSize(6);
+        assertThat(copy.releaseToolBindings()).hasSize(5);
+        assertThatThrownBy(() -> copy.declaredTools().add(new CatalogTool("EXTRA_TOOL", "READ", false)))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @ParameterizedTest
+    @MethodSource("supportedDeclaredOperations")
+    void syntheticCatalogProjectionPreservesEverySupportedOperation(boolean server, String operation)
+            throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode selected = declarationTool(manifest, server);
+        selected.put("operation", operation);
+        ObjectNode original = manifest.deepCopy();
+
+        SourceBoundCatalog result = load(declarationSource(manifest, server));
+
+        assertThat(declaredTool(result, selected.path("name").stringValue()).operation()).isEqualTo(operation);
+        assertThat(manifest).isEqualTo(original);
+        assertThat(result.releaseToolBindings()).hasSize(5)
+                .extracting(ReleaseToolBinding::toolName).doesNotContain("LOAN_DECISION_UPDATE");
+    }
+
+    @ParameterizedTest
+    @MethodSource("supportedDeclaredSideEffects")
+    void syntheticSideEffectMappingDoesNotCreateAnObservedExternalInvocation(
+            boolean server, String sideEffect, boolean external) throws IOException {
+        // A source double exercises mapping only. This does not add an actual approved EXTERNAL_HTTP Tool.
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        ObjectNode selected = declarationTool(manifest, server);
+        selected.put("sideEffectType", sideEffect);
+        ObjectNode original = manifest.deepCopy();
+
+        SourceBoundCatalog result = load(declarationSource(manifest, server));
+
+        CatalogTool declaration = declaredTool(result, selected.path("name").stringValue());
+        assertThat(declaration.externalEgressTool()).isEqualTo(external);
+        assertThat(declaration.operation()).isEqualTo(selected.path("operation").stringValue());
+        assertThat(result.declaredTools()).hasSize(6)
+                .extracting(CatalogTool::name).doesNotContain("EXTERNAL_HTTP");
+        assertThat(manifest).isEqualTo(original);
+    }
+
+    @ParameterizedTest
+    @MethodSource("declaredMetadataLocations")
+    void rejectsMissingDeclaredMetadataInItsOwningCatalog(boolean server, String field) throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        declarationTool(manifest, server).remove(field);
+
+        assertSafeFailure(failureFor(declarationSource(manifest, server)),
+                server ? INVALID_HIGH_IMPACT_CATALOG : INVALID_ENABLED_TOOL_CATALOG);
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidDeclaredMetadata")
+    void rejectsInvalidDeclaredMetadataWithoutNormalizationOrInternalFallback(
+            boolean server, String field, String valueJson) throws IOException {
+        ObjectNode manifest = fixture("valid-release-manifest-v1.1.json");
+        declarationTool(manifest, server).set(field, objectMapper.readTree(valueJson));
+
+        assertSafeFailure(failureFor(declarationSource(manifest, server)),
+                server ? INVALID_HIGH_IMPACT_CATALOG : INVALID_ENABLED_TOOL_CATALOG);
     }
 
     @Test
@@ -1170,6 +1275,24 @@ class ReleaseToolCatalogContractAdapterTest {
                 .orElseThrow();
     }
 
+    private CatalogTool declaredTool(SourceBoundCatalog source, String name) {
+        return source.declaredTools().stream()
+                .filter(value -> value.name().equals(name))
+                .findFirst()
+                .orElseThrow();
+    }
+
+    private ObjectNode declarationTool(ObjectNode manifest, boolean server) {
+        return server ? (ObjectNode) manifest.at("/serverToolCatalog/tools/0")
+                : tool(manifest.path("tools"), "CUSTOMER_DATA_READ");
+    }
+
+    private ToolCatalogResponse declarationSource(ObjectNode manifest, boolean server) {
+        // Rebind the changed server catalog hash so its metadata, rather than a stale hash, is tested.
+        return server ? sourceWithServerCatalog(manifest, manifest.path("serverToolCatalog"))
+                : authoritativeSource(manifest);
+    }
+
     private ArrayNode copiedTools(ObjectNode manifest) {
         return (ArrayNode) manifest.path("tools").deepCopy();
     }
@@ -1263,6 +1386,35 @@ class ReleaseToolCatalogContractAdapterTest {
                 .flatMap(field -> Stream.of("null", "false", "42", "[]", "\"schema\"")
                         .map(json -> Arguments.of(field, json)));
         return Stream.concat(strings, schemas);
+    }
+
+    private static Stream<Arguments> supportedDeclaredOperations() {
+        return Stream.of(false, true).flatMap(server ->
+                Stream.of("READ", "SEARCH", "CREATE", "WRITE", "UPDATE", "POST")
+                        .map(operation -> Arguments.of(server, operation)));
+    }
+
+    private static Stream<Arguments> supportedDeclaredSideEffects() {
+        return Stream.of(false, true).flatMap(server ->
+                Stream.of("NONE", "INTERNAL_WRITE", "HIGH_IMPACT_WRITE", "MOCK_EXTERNAL_WRITE")
+                        .map(effect -> Arguments.of(server, effect, effect.equals("MOCK_EXTERNAL_WRITE"))));
+    }
+
+    private static Stream<Arguments> declaredMetadataLocations() {
+        return Stream.of(false, true).flatMap(server -> Stream.of("operation", "sideEffectType")
+                .map(field -> Arguments.of(server, field)));
+    }
+
+    private static Stream<Arguments> invalidDeclaredMetadata() {
+        return declaredMetadataLocations().flatMap(location -> {
+            boolean server = (boolean) location.get()[0];
+            String field = (String) location.get()[1];
+            String valid = field.equals("operation") ? "READ" : "NONE";
+            String lowercase = field.equals("operation") ? "read" : "none";
+            return Stream.of("null", "false", "42", "[]", "{}", "\"\"", "\" \"", "\"" + RAW_SENTINEL + "\"",
+                            "\"" + lowercase + "\"", "\" " + valid + "\"", "\"" + valid + " \"")
+                    .map(value -> Arguments.of(server, field, value));
+        });
     }
 
     private record FieldValue(String name, JsonNode value) {
