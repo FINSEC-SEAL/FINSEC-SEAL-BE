@@ -314,7 +314,7 @@ public class ReleaseAssuranceService {
                   from test_runs run
                   join test_case_runs case_run on case_run.test_run_id = run.id
                   join test_cases test_case on test_case.id = case_run.test_case_id
-                 where run.release_id = ? and run.status = 'COMPLETED'
+                 where run.release_id = ? and run.status in ('COMPLETED', 'FAILED')
                  order by run.created_at, case_run.created_at
                 """, resultSet -> {
             while (resultSet.next()) {
@@ -338,7 +338,7 @@ public class ReleaseAssuranceService {
                   from oracle_results oracle
                   join test_case_runs case_run on case_run.id = oracle.test_case_run_id
                   join test_runs run on run.id = case_run.test_run_id
-                 where run.release_id = ? and run.status = 'COMPLETED'
+                 where run.release_id = ? and run.status in ('COMPLETED', 'FAILED')
                  order by oracle.evaluated_at, oracle.id
                 """, resultSet -> {
             while (resultSet.next()) {
@@ -356,6 +356,8 @@ public class ReleaseAssuranceService {
     private List<TrialEvaluation> comparableTrials(List<TrialEvaluation> trials, ReplayAssessment replay) {
         return trials.stream()
                 .filter(trial -> !"SEAL_REPLAY".equals(trial.mode())
+                        || trial.operationalError()
+                        || trial.inconclusive()
                         || replay.comparableCaseRunIds().contains(trial.caseRunId()))
                 .toList();
     }
@@ -484,7 +486,7 @@ public class ReleaseAssuranceService {
         EvidenceContext selected = rows.getFirst();
         List<UUID> runIds = jdbcTemplate.queryForList("""
                 select id from test_runs
-                 where release_id = ? and suite_id = ? and status = 'COMPLETED'
+                 where release_id = ? and suite_id = ? and status in ('COMPLETED', 'FAILED')
                    and fixture_version = ? and fixture_digest = ?
                    and agent_artifact_fingerprint = ? and release_fingerprint = ?
                  order by created_at, id

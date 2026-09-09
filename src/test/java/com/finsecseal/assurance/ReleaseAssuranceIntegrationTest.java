@@ -102,6 +102,31 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     @Test
+    void includesFailedRunErrorsWithoutInflatingAttackRates() throws Exception {
+        Seed seed = seedCriticalRelease();
+        UUID failedRunId = seedFailedRun(seed.releaseId());
+
+        var metrics = assuranceService.metrics(seed.releaseId()).metrics();
+
+        assertThat(metrics.operationalErrorRate().numerator()).isEqualTo(1);
+        assertThat(metrics.operationalErrorRate().denominator()).isEqualTo(2);
+        assertThat(metrics.operationalErrorRate().sourceRunIds()).contains(failedRunId);
+        assertThat(metrics.attackSuccessRate().numerator()).isEqualTo(1);
+        assertThat(metrics.attackSuccessRate().denominator()).isEqualTo(1);
+        assertThat(metrics.attackSuccessRate().sourceRunIds()).doesNotContain(failedRunId);
+
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var operationalMetric = proposal.inputSnapshot().path("metrics").valueStream()
+                .filter(metric -> "OperationalErrorRate".equals(metric.path("metric").asString()))
+                .findFirst()
+                .orElseThrow();
+
+        assertThat(operationalMetric.path("numerator").asInt()).isEqualTo(1);
+        assertThat(operationalMetric.path("denominator").asInt()).isEqualTo(2);
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+    }
+
+    @Test
     void rejectsLatestDecisionQueryBeforeConfirmation() throws Exception {
         Seed seed = seedCriticalRelease();
 
@@ -321,6 +346,68 @@ class ReleaseAssuranceIntegrationTest {
                  where id = ?
                 """, release.id());
         return new Seed(release.id());
+    }
+
+    private UUID seedFailedRun(UUID releaseId) {
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ? and mode = 'BASELINE'",
+                UUID.class,
+                releaseId
+        );
+        UUID testCaseId = jdbcTemplate.queryForObject(
+                "select test_case_id from test_case_runs where test_run_id = ?",
+                UUID.class,
+                baselineRunId
+        );
+        UUID failedRunId = UUID.randomUUID();
+        UUID failedCaseRunId = UUID.randomUUID();
+        UUID traceId = UUID.randomUUID();
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+
+        jdbcTemplate.update("""
+                insert into test_runs
+                    (id, release_id, suite_id, mode, status, agent_artifact_fingerprint,
+                     release_fingerprint, config_json, fixture_version, fixture_digest,
+                     model_config_hash, total_cases, completed_cases, operational_error_count,
+                     started_at, completed_at, summary_json, created_at, updated_at)
+                select ?, release_id, suite_id, mode, 'QUEUED', agent_artifact_fingerprint,
+                       release_fingerprint, config_json, fixture_version, fixture_digest,
+                       model_config_hash, 1, 0, 0, null, null, '{}'::jsonb, ?, ?
+                  from test_runs where id = ?
+                """, failedRunId, Timestamp.from(now), Timestamp.from(now), baselineRunId);
+        jdbcTemplate.update("""
+                insert into test_case_runs
+                    (id, test_run_id, test_case_id, trial_index, status, security_outcome,
+                     variant_hash, started_at, completed_at, result_json, created_at, updated_at)
+                values (?, ?, ?, 1, 'PENDING', null, ?, null, null, '{}'::jsonb, ?, ?)
+                """, failedCaseRunId, failedRunId, testCaseId, HASH_A,
+                Timestamp.from(now), Timestamp.from(now));
+        jdbcTemplate.update("insert into run_event_counters (run_id, last_sequence) values (?, 0)", failedRunId);
+        eventService.append(failedRunId, new ExecutionEventDto.AppendRequest(
+                null, traceId, ExecutionEventType.RUN_STARTED,
+                null, null, null, null, "RUN_STARTED", objectMapper.createObjectNode()
+        ), "runtime-b");
+        jdbcTemplate.update("update test_runs set status = 'PREPARING', updated_at = ? where id = ?",
+                Timestamp.from(now), failedRunId);
+        jdbcTemplate.update("update test_runs set status = 'RUNNING', started_at = ?, updated_at = ? where id = ?",
+                Timestamp.from(now), Timestamp.from(now), failedRunId);
+        jdbcTemplate.update("""
+                update test_case_runs
+                   set status = 'ERROR', started_at = ?, completed_at = ?, error_code = 'RUNTIME_EXECUTION_ERROR',
+                       result_json = '{"message":"synthetic runtime failure"}'::jsonb, updated_at = ?
+                 where id = ?
+                """, Timestamp.from(now), Timestamp.from(now), Timestamp.from(now), failedCaseRunId);
+        eventService.append(failedRunId, new ExecutionEventDto.AppendRequest(
+                failedCaseRunId, traceId, ExecutionEventType.RUN_FAILED,
+                null, null, null, null, "RUNTIME_EXECUTION_ERROR", objectMapper.createObjectNode()
+        ), "runtime-b");
+        jdbcTemplate.update("""
+                update test_runs
+                   set status = 'FAILED', completed_cases = 1, operational_error_count = 1,
+                       completed_at = ?, summary_json = '{"operationalErrorCount":1}'::jsonb, updated_at = ?
+                 where id = ?
+                """, Timestamp.from(now), Timestamp.from(now), failedRunId);
+        return failedRunId;
     }
 
     private record Seed(UUID releaseId) {
