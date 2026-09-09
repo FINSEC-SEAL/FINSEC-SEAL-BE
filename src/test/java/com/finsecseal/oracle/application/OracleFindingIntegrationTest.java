@@ -3,6 +3,7 @@ package com.finsecseal.oracle.application;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.finsecseal.assurance.ReplayComparisonService;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.ExecutionEventType;
@@ -72,6 +73,9 @@ class OracleFindingIntegrationTest {
 
     @Autowired
     FindingService findingService;
+
+    @Autowired
+    ReplayComparisonService replayComparisonService;
 
     @Test
     void recordsAttackSuccessFindingAndCausalEvents() {
@@ -349,6 +353,64 @@ class OracleFindingIntegrationTest {
         )).isInstanceOfSatisfying(BusinessException.class, exception ->
                 assertThat(exception.errorCode()).isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE));
         assertThat(findingService.find(assessment.finding().id()).status()).isEqualTo("OPEN");
+    }
+
+    @Test
+    void comparesCompletedBaselineAndReplayEvidence() {
+        Seed baseline = seedRunningAttack("comparison-detail", false);
+        OracleAssessmentService.Assessment assessment = assessmentService.record(
+                baseline.runId(), baseline.caseRunId(), baseline.traceId(), baseline.sourceEventId(),
+                successfulCrossCustomerResult(), "role-d"
+        );
+        ReplaySeed replay = seedCompletedBlockedReplay(baseline, assessment.finding().id(), true);
+
+        var detail = replayComparisonService.find(replay.runId());
+
+        assertThat(detail.replayRunId()).isEqualTo(replay.runId());
+        assertThat(detail.findingId()).isEqualTo(assessment.finding().id());
+        assertThat(detail.category()).isEqualTo("FA-02");
+        assertThat(detail.comparable()).isTrue();
+        assertThat(detail.mismatchReasons()).isEmpty();
+        assertThat(detail.baseline().apiResponses()).singleElement().satisfies(event -> {
+            assertThat(event.eventType()).isEqualTo(ExecutionEventType.TOOL_RESPONSE);
+            assertThat(event.value().path("status").asInt()).isEqualTo(200);
+        });
+        assertThat(detail.replay().policyDecisions()).singleElement().satisfies(event -> {
+            assertThat(event.eventType()).isEqualTo(ExecutionEventType.POLICY_EVALUATED);
+            assertThat(event.value().path("allowed").asBoolean()).isFalse();
+        });
+        assertThat(detail.baseline().oracleResults()).singleElement()
+                .satisfies(oracle -> assertThat(oracle.outcome()).isEqualTo(OracleOutcome.ATTACK_SUCCESS));
+        assertThat(detail.replay().oracleResults()).singleElement()
+                .satisfies(oracle -> assertThat(oracle.outcome()).isEqualTo(OracleOutcome.ATTACK_BLOCKED));
+        assertThat(detail.difference().policyDecisionChanged()).isTrue();
+        assertThat(detail.difference().apiResponseChanged()).isTrue();
+        assertThat(detail.difference().stateEffectChanged()).isFalse();
+        assertThat(detail.difference().oracleOutcomeChanged()).isTrue();
+        assertThat(detail.difference().attackMitigated()).isTrue();
+    }
+
+    @Test
+    void reportsStoredReplayComparabilityMismatch() {
+        Seed baseline = seedRunningAttack("comparison-mismatch", false);
+        OracleAssessmentService.Assessment assessment = assessmentService.record(
+                baseline.runId(), baseline.caseRunId(), baseline.traceId(), baseline.sourceEventId(),
+                successfulCrossCustomerResult(), "role-d"
+        );
+        ReplaySeed replay = seedCompletedBlockedReplay(baseline, assessment.finding().id(), false);
+
+        var detail = replayComparisonService.find(replay.runId());
+
+        assertThat(detail.comparable()).isFalse();
+        assertThat(detail.mismatchReasons()).containsExactly("SYNTHETIC_MISMATCH");
+        assertThat(detail.difference().attackMitigated()).isTrue();
+    }
+
+    @Test
+    void rejectsUnknownReplayRun() {
+        assertThatThrownBy(() -> replayComparisonService.find(UUID.randomUUID()))
+                .isInstanceOfSatisfying(BusinessException.class, exception ->
+                        assertThat(exception.errorCode()).isEqualTo(ErrorCode.RESOURCE_NOT_FOUND));
     }
 
     @Test
