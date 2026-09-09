@@ -66,6 +66,12 @@ class ReleaseAssuranceIntegrationTest {
         );
 
         assertThat(decision.decision()).isEqualTo(DecisionValue.BLOCKED);
+        var latestDecision = assuranceService.latestDecision(seed.releaseId());
+        assertThat(latestDecision.decision()).isEqualTo(decision);
+        assertThat(latestDecision.inputSnapshot().path("decision").path("value").asString())
+                .isEqualTo("BLOCKED");
+        assertThat(latestDecision.invalidated()).isFalse();
+        assertThat(latestDecision.invalidation().isEmpty()).isTrue();
         assertThat(attestationService.findOrCreate(seed.releaseId(), "governance-reviewer").document()
                 .at("/decision/value").asString()).isEqualTo("BLOCKED");
         assertThat(jdbcTemplate.queryForObject("""
@@ -93,6 +99,42 @@ class ReleaseAssuranceIntegrationTest {
                 "reviewer"
         )).isInstanceOfSatisfying(BusinessException.class,
                 exception -> assertThat(exception.errorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR));
+    }
+
+    @Test
+    void rejectsLatestDecisionQueryBeforeConfirmation() throws Exception {
+        Seed seed = seedCriticalRelease();
+
+        assertThatThrownBy(() -> assuranceService.latestDecision(seed.releaseId()))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        exception -> assertThat(exception.errorCode()).isEqualTo(ErrorCode.RESOURCE_NOT_FOUND));
+    }
+
+    @Test
+    void exposesDecisionInvalidationReasons() throws Exception {
+        Seed seed = seedCriticalRelease();
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var decision = assuranceService.confirm(
+                seed.releaseId(), proposal.inputDigest(),
+                new ReleaseAssuranceDto.ConfirmRequest(DecisionValue.BLOCKED, "Critical exposure confirmed"),
+                "governance-reviewer"
+        );
+        UUID invalidationId = UUID.randomUUID();
+
+        jdbcTemplate.update("""
+                insert into decision_invalidations
+                    (id, release_decision_id, reasons_json, invalidated_by, invalidated_at)
+                values (?, ?, '{"codes":["RELEASE_CHANGED"]}'::jsonb, 'release-manager', now())
+                """, invalidationId, decision.id());
+
+        var latestDecision = assuranceService.latestDecision(seed.releaseId());
+
+        assertThat(latestDecision.invalidated()).isTrue();
+        assertThat(latestDecision.invalidation().path("reasons").path("codes").get(0).asString())
+                .isEqualTo("RELEASE_CHANGED");
+        assertThat(latestDecision.invalidation().path("invalidatedBy").asString())
+                .isEqualTo("release-manager");
+        assertThat(latestDecision.invalidation().path("invalidatedAt").asText()).isNotBlank();
     }
 
     @Test

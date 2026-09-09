@@ -87,6 +87,60 @@ public class ReleaseAssuranceService {
         );
     }
 
+    public ReleaseAssuranceDto.DecisionDetail latestDecision(UUID releaseId) {
+        requireRelease(releaseId, false);
+        List<ReleaseAssuranceDto.DecisionDetail> rows = jdbcTemplate.query("""
+                select decision.id, decision.release_id, decision.decision,
+                       decision.gate_policy_version, decision.input_snapshot_json::text,
+                       decision.input_digest, decision.proposed_at, decision.confirmed_by,
+                       decision.confirmed_at, invalidation.id invalidation_id,
+                       invalidation.reasons_json::text invalidation_reasons_json,
+                       invalidation.invalidated_by, invalidation.invalidated_at
+                  from release_decisions decision
+                  left join decision_invalidations invalidation
+                    on invalidation.release_decision_id = decision.id
+                 where decision.release_id = ?
+                 order by decision.confirmed_at desc, decision.created_at desc, decision.id desc
+                 limit 1
+                """, (resultSet, rowNumber) -> {
+            UUID invalidationId = resultSet.getObject("invalidation_id", UUID.class);
+            ObjectNode invalidation = objectMapper.createObjectNode();
+            if (invalidationId != null) {
+                invalidation.set(
+                        "reasons",
+                        parseJson(resultSet.getString("invalidation_reasons_json"))
+                );
+                invalidation.put("invalidatedBy", resultSet.getString("invalidated_by"));
+                invalidation.put(
+                        "invalidatedAt",
+                        resultSet.getTimestamp("invalidated_at").toInstant().toString()
+                );
+            }
+            return new ReleaseAssuranceDto.DecisionDetail(
+                    new ReleaseAssuranceDto.DecisionView(
+                            resultSet.getObject("id", UUID.class),
+                            resultSet.getObject("release_id", UUID.class),
+                            DecisionValue.valueOf(resultSet.getString("decision")),
+                            resultSet.getString("gate_policy_version"),
+                            resultSet.getString("input_digest"),
+                            resultSet.getTimestamp("proposed_at").toInstant(),
+                            resultSet.getString("confirmed_by"),
+                            resultSet.getTimestamp("confirmed_at").toInstant()
+                    ),
+                    parseJson(resultSet.getString("input_snapshot_json")),
+                    invalidationId != null,
+                    invalidation
+            );
+        }, releaseId);
+        if (rows.isEmpty()) {
+            throw new BusinessException(
+                    ErrorCode.RESOURCE_NOT_FOUND,
+                    "Confirmed ReleaseDecision not found"
+            );
+        }
+        return rows.getFirst();
+    }
+
     @Transactional
     public ReleaseAssuranceDto.DecisionProposal evaluate(UUID releaseId, String actorId) {
         ReleaseRow release = requireRelease(releaseId, true);

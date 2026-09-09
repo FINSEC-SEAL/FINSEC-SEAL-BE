@@ -34,6 +34,11 @@ public class ReleaseAssuranceController {
         return ApiResponse.success(service.evaluate(releaseId, actorId), TraceIdFilter.currentTraceId());
     }
 
+    @GetMapping("/decision")
+    ApiResponse<ReleaseAssuranceDto.DecisionDetail> latestDecision(@PathVariable UUID releaseId) {
+        return ApiResponse.success(service.latestDecision(releaseId), TraceIdFilter.currentTraceId());
+    }
+
     @PostMapping("/decision:confirm")
     ApiResponse<ReleaseAssuranceDto.DecisionView> confirm(
             @PathVariable UUID releaseId,

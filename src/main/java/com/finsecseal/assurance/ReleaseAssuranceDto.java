@@ -61,4 +61,12 @@ public final class ReleaseAssuranceDto {
             Instant confirmedAt
     ) {
     }
+
+    public record DecisionDetail(
+            DecisionView decision,
+            JsonNode inputSnapshot,
+            boolean invalidated,
+            JsonNode invalidation
+    ) {
+    }
 }
