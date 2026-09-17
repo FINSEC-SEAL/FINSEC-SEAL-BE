@@ -17,6 +17,8 @@ import static org.mockito.Mockito.when;
 import com.finsecseal.agent.AgentEntity;
 import com.finsecseal.agent.AgentService;
 import com.finsecseal.audit.AuditService;
+import com.finsecseal.common.api.BusinessException;
+import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.ExecutionEventType;
 import com.finsecseal.common.domain.ReleaseLifecycleState;
 import com.finsecseal.common.domain.TestCaseRunStatus;
@@ -592,6 +594,76 @@ class LoanReviewPolicyGatewayTest {
         assertNoExecutionOrEvents();
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"missing-contract", "missing-approval", "rejected-approval"})
+    void actualUnapprovedSourceRetainsItsReasonWithoutEvaluatingOrExecuting(String problem) {
+        if (problem.equals("missing-contract")) {
+            when(runs.find(RUN)).thenReturn(projection(mode, FINGERPRINT, null));
+        } else if (problem.equals("missing-approval")) {
+            when(contracts.approved(RELEASE, VERSION, REVIEWER)).thenReturn(null);
+        } else {
+            Version original = contracts.approved(RELEASE, VERSION, REVIEWER).version();
+            when(contracts.approved(RELEASE, VERSION, REVIEWER)).thenReturn(new ApprovedContract(
+                    versionWithStateAndHash(original, "REJECTED", original.policyHash()), ARTIFACT, FINGERPRINT));
+        }
+        assertSourceFailure(catchThrowable(() -> gateway().invoke(context, invocation, ACTOR)),
+                PolicyEvaluationReason.CONTRACT_NOT_APPROVED);
+        verify(approved).load(RUN, CASE_RUN, REVIEWER);
+        verifyNoInteractions(observations);
+        if (problem.equals("missing-contract")) verifyNoInteractions(contracts);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"fingerprint", "policy-hash"})
+    void otherActualSourceFailuresDoNotInferAnApprovalOrFingerprintReason(String problem) {
+        Version original = contracts.approved(RELEASE, VERSION, REVIEWER).version();
+        ApprovedContract inconsistent = problem.equals("fingerprint")
+                ? new ApprovedContract(original, ARTIFACT, ARTIFACT)
+                : new ApprovedContract(versionWithStateAndHash(original, "APPROVED", HASH), ARTIFACT, FINGERPRINT);
+        when(contracts.approved(RELEASE, VERSION, REVIEWER)).thenReturn(inconsistent);
+        assertSourceFailure(catchThrowable(() -> gateway().invoke(context, invocation, ACTOR)), null);
+        verify(approved).load(RUN, CASE_RUN, REVIEWER);
+        verifyNoInteractions(observations);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void ownerErrorTextDoesNotBecomeAnApprovalReason(boolean businessException) {
+        String raw = "CONTRACT_NOT_APPROVED " + PRIVATE;
+        RuntimeException ownerError = businessException
+                ? new BusinessException(ErrorCode.RELEASE_CHANGED, raw) : new IllegalStateException(raw);
+        when(contracts.approved(RELEASE, VERSION, REVIEWER)).thenThrow(ownerError);
+        assertSourceFailure(catchThrowable(() -> gateway().invoke(context, invocation, ACTOR)), null);
+        verifyNoInteractions(observations);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"reviewer", "observation"})
+    void sameTypedFailureOutsideApprovedLoadDoesNotBecomeAnApprovalReason(String origin) {
+        // Obtain the real C failure without reflection or manufacturing a new exception contract.
+        when(runs.find(RUN)).thenReturn(projection(mode, FINGERPRINT, null));
+        var sourceTransaction = new TransactionTemplate(transactions);
+        sourceTransaction.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        Throwable failure = catchThrowable(() -> sourceTransaction.execute(
+                status -> approved.load(RUN, CASE_RUN, REVIEWER)));
+        assertThat(failure).isInstanceOf(GatewayApprovedPolicySourceService.PolicySourceException.class);
+        var sourceFailure = (GatewayApprovedPolicySourceService.PolicySourceException) failure;
+        assertThat(sourceFailure.code())
+                .isEqualTo(GatewayApprovedPolicySourceService.FailureCode.CONTRACT_NOT_APPROVED);
+        when(runs.find(RUN)).thenAnswer(call -> projection(mode, FINGERPRINT));
+        clearInvocations(approved, runs, contracts, observations);
+        if (origin.equals("reviewer")) reviewers = () -> { throw sourceFailure; };
+        else doAnswer(call -> { throw sourceFailure; }).when(observations).resolve(any(), any());
+
+        assertSourceFailure(catchThrowable(() -> gateway().invoke(context, invocation, ACTOR)), null);
+        if (origin.equals("reviewer")) {
+            verifyNoInteractions(approved, runs, contracts, observations);
+        } else {
+            verify(approved).load(RUN, CASE_RUN, REVIEWER);
+            verify(observations).resolve(any(), any());
+        }
+    }
+
     @Test
     void legacyProposalAndMissingReviewerDoNotCreateAnInvocationOrReadOwners() {
         safe(catchThrowable(() -> gateway().invoke(context, invocation.proposal(), ACTOR)), FailureCode.INVALID_INVOCATION);
@@ -976,9 +1048,19 @@ class LoanReviewPolicyGatewayTest {
     }
 
     private Projection projection(TestRunMode selected, String fingerprint) {
-        return new Projection(RUN, RELEASE, UUID.randomUUID(), selected == TestRunMode.BASELINE ? null : VERSION,
+        return projection(selected, fingerprint, selected == TestRunMode.BASELINE ? null : VERSION);
+    }
+
+    private Projection projection(TestRunMode selected, String fingerprint, UUID contractVersionId) {
+        return new Projection(RUN, RELEASE, UUID.randomUUID(), contractVersionId,
                 selected, TestRunStatus.RUNNING, ARTIFACT, fingerprint, "fixture/1", HASH, 1, 0, 0, 0,
                 null, null, json.createObjectNode().put("private", PRIVATE), null, null, null);
+    }
+
+    private Version versionWithStateAndHash(Version original, String state, String policyHash) {
+        return new Version(original.id(), original.workspaceId(), original.releaseId(), original.contractKey(),
+                original.version(), state, original.policy(), policyHash, original.resourceHash(),
+                original.basePolicyHash(), original.validation(), original.review());
     }
 
     private ObjectNode customerArguments() {
@@ -1031,6 +1113,21 @@ class LoanReviewPolicyGatewayTest {
     private ObjectNode resource(String path) throws Exception { try (var stream = getClass().getResourceAsStream(path)) { return (ObjectNode) json.readTree(stream); } }
     private void assertNoAdapter() { assertThat(executions).isZero(); verify(adapter, never()).execute(any(), any()); }
     private void assertNoExecutionOrEvents() { assertNoAdapter(); assertThat(committed).isEmpty(); verifyNoInteractions(mutations); }
+    private void assertSourceFailure(Throwable error, PolicyEvaluationReason reason) {
+        safe(error, FailureCode.POLICY_EVALUATION_FAILED);
+        GatewayException failure = (GatewayException) error;
+        assertThat(failure.reason()).isEqualTo(Optional.ofNullable(reason));
+        assertThat(failure.postCallCheck()).isEmpty();
+        assertThat(failure.successfulSecurityBlock()).isFalse();
+        assertNoExecutionOrEvents();
+        assertThat(pending).isEmpty();
+        verify(events, never()).append(any(), any(), any());
+        verify(observations, never()).registry(any(), any());
+        verify(observations, never()).begin(any(), any());
+        verify(observations, never()).complete(any(), any(), any());
+        assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
+        assertThat(TransactionSynchronizationManager.isSynchronizationActive()).isFalse();
+    }
     private void safe(Throwable error, FailureCode code) {
         assertThat(error).isInstanceOf(GatewayException.class);
         assertThat(((GatewayException) error).code()).isEqualTo(code);

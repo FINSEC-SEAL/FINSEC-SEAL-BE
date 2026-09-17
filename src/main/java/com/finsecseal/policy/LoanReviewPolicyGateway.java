@@ -196,7 +196,15 @@ public final class LoanReviewPolicyGateway implements PolicyGateway {
             baselineFixtureVersion = source.fixtureVersion(); baselineFixtureDigest = source.fixtureDigest();
             inputs = facts.baselineInputs(source, template);
         } else {
-            approvedSource = approved.load(context.runId(), context.caseRunId(), reviewer);
+            try {
+                approvedSource = approved.load(context.runId(), context.caseRunId(), reviewer);
+            } catch (GatewayApprovedPolicySourceService.PolicySourceException exception) {
+                if (exception.code() == GatewayApprovedPolicySourceService.FailureCode.CONTRACT_NOT_APPROVED) {
+                    throw new GatewayException(FailureCode.POLICY_EVALUATION_FAILED,
+                            Optional.of(PolicyEvaluationReason.CONTRACT_NOT_APPROVED));
+                }
+                throw exception;
+            }
             require(approvedSource != null && context.runId().equals(approvedSource.runId())
                     && context.caseRunId().equals(approvedSource.testCaseRunId())
                     && approvedSource.runMode() == context.mode() && approvedSource.runStatus() == TestRunStatus.RUNNING

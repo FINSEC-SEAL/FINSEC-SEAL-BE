@@ -7,6 +7,7 @@ import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -20,7 +21,9 @@ import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.common.domain.TestRunStatus;
 import com.finsecseal.contract.LoanReviewFinancialTemplate;
 import com.finsecseal.contract.ReleaseToolCatalogContractAdapter;
+import com.finsecseal.contract.SafetyContractCanonicalizer;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.ReviewerContext;
+import com.finsecseal.contract.SafetyContractSemanticValidator;
 import com.finsecseal.evidence.ExecutionEventDto.AppendRequest;
 import com.finsecseal.evidence.ExecutionEventDto.Event;
 import com.finsecseal.evidence.ExecutionEventService;
@@ -128,9 +131,9 @@ class LoanReviewPolicyGatewayIntegrationTest {
     static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:17.11-alpine");
     @Autowired AgentService agents;
     @Autowired ReleaseService releases;
-    @Autowired ContractPersistenceService contracts;
-    @Autowired TestRunPersistenceService cases;
-    @Autowired TestRunProjectionService runs;
+    @MockitoSpyBean ContractPersistenceService contracts;
+    @MockitoSpyBean TestRunPersistenceService cases;
+    @MockitoSpyBean TestRunProjectionService runs;
     @Autowired GatewayApprovedPolicySourceService approved;
     @Autowired GatewayBaselinePolicySourceService baseline;
     @Autowired GatewayPolicyFactsAssembler facts;
@@ -146,8 +149,10 @@ class LoanReviewPolicyGatewayIntegrationTest {
     @Autowired PlatformTransactionManager transactions;
     @MockitoSpyBean ExecutionEventService events;
     @MockitoSpyBean ReleaseToolCatalogContractAdapter catalogs;
+    @MockitoSpyBean SafetyContractSemanticValidator validator;
+    @MockitoSpyBean SafetyContractCanonicalizer canonicalizer;
     private boolean failAfterPolicyAppend;
-    private int catalogCalls, policyAppends;
+    private int catalogCalls, policyAppends, sourceCanonicalizations;
 
     @AfterEach
     void resourcesAndRawErrorsAreNotRetained(CapturedOutput output) {
@@ -298,6 +303,84 @@ class LoanReviewPolicyGatewayIntegrationTest {
         assertGolden(seed);
     }
 
+    @ParameterizedTest @EnumSource(value = TestRunStatus.class, names = {"RUNNING", "COMPLETED"})
+    void cachedPolicyStillRejectsActualTerminalCaseAndRunBeforeAnyFurtherExecution(TestRunStatus runStatus) throws Exception {
+        Seed seed = seed(TestRunMode.SEAL_REPLAY);
+        var observations = new PgObservations(seed, ClassificationMode.EXPLICIT_SYNTHETIC_POSITIVE);
+        var adapter = new ObservedCustomer(observations);
+        var gateway = gateway(observations, adapter);
+        ToolInvocation invocation = propose(seed, customerProposal());
+        UUID contractId = runs.find(seed.runId()).contractVersionId();
+        Snapshot before = snapshot();
+
+        var first = gateway.invoke(seed.context(), invocation, ACTOR);
+        assertThat(first.policyDecision().allowed()).isTrue();
+        assertThat(adapter.calls).isEqualTo(1);
+        assertThat(observations.resolves).isEqualTo(1);
+        assertThat(observations.registryCalls).isEqualTo(1);
+        assertThat(observations.begins).isEqualTo(1);
+        assertThat(observations.completes).isEqualTo(1);
+        verify(validator).validate(any(), any());
+        assertThat(sourceCanonicalizations).isEqualTo(1);
+        assertThat(catalogCalls).isEqualTo(1);
+        assertThat(policyAppends).isEqualTo(1);
+        assertThat(snapshot()).isEqualTo(before);
+        assertAccessAudits(seed);
+
+        // Sequential current-state recheck after a committed, explicitly synthetic positive fixture.
+        assertThat(cases.updateCaseStatus(seed.runId(), seed.caseRunId(), new TestRunPersistenceDto.CaseRunStatusRequest(
+                TestCaseRunStatus.PASSED, null, null, null, null, null, null), ACTOR).status())
+                .isEqualTo(TestCaseRunStatus.PASSED);
+        if (runStatus == TestRunStatus.COMPLETED) {
+            events.append(seed.runId(), new AppendRequest(null, seed.context().traceId(), ExecutionEventType.RUN_COMPLETED,
+                    null, null, null, null, "GATEWAY_PG_FIXTURE", json.createObjectNode()), ACTOR);
+            cases.updateStatus(seed.runId(), new TestRunPersistenceDto.StatusRequest(TestRunStatus.COMPLETED, 1, 0, null), ACTOR);
+        }
+        assertThat(runs.find(seed.runId()).status()).isEqualTo(runStatus);
+        Evidence afterTerminalSetup = evidence(seed);
+        Snapshot stateAfterTerminalSetup = snapshot();
+        clearInvocations(runs, contracts, cases, catalogs, validator, canonicalizer, events, mutations);
+
+        // Reuse the original call; no new TOOL_PROPOSED is appended on the terminal Case or Run.
+        GatewayException error = safe(catchThrowable(() -> gateway.invoke(seed.context(), invocation, ACTOR)),
+                FailureCode.SOURCE_BINDING_INVALID);
+        assertThat(error.reason()).isEmpty();
+        assertThat(error.postCallCheck()).isEmpty();
+        assertThat(error.successfulSecurityBlock()).isFalse();
+        verify(runs).find(seed.runId());
+        verify(contracts).approved(seed.releaseId(), contractId, REVIEWER);
+        verify(cases).findCase(seed.caseRunId());
+        verify(catalogs).load(seed.releaseId(), ACTOR);
+        verify(validator, never()).validate(any(), any());
+        assertThat(sourceCanonicalizations).isEqualTo(2);
+        assertThat(catalogCalls).isEqualTo(2);
+        assertThat(policyAppends).isEqualTo(1);
+        assertThat(adapter.calls).isEqualTo(1);
+        assertThat(observations.resolves).isEqualTo(1);
+        assertThat(observations.registryCalls).isEqualTo(1);
+        assertThat(observations.begins).isEqualTo(1);
+        assertThat(observations.completes).isEqualTo(1);
+        verify(events, never()).append(any(), any(), any());
+        verify(mutations, never()).execute(any(), any(), any(), any());
+        Evidence afterRetry = evidence(seed);
+        assertThat(afterRetry.events()).isEqualTo(afterTerminalSetup.events());
+        assertThat(afterRetry.counter()).isEqualTo(afterTerminalSetup.counter());
+        assertThat(afterRetry.receipts()).isEqualTo(afterTerminalSetup.receipts());
+        assertThat(snapshot()).isEqualTo(stateAfterTerminalSetup).isEqualTo(before);
+        if (runStatus == TestRunStatus.COMPLETED) {
+            assertEvents(seed, ExecutionEventType.RUN_STARTED, ExecutionEventType.TOOL_PROPOSED,
+                    ExecutionEventType.POLICY_EVALUATED, ExecutionEventType.TOOL_REQUEST,
+                    ExecutionEventType.TOOL_RESPONSE, ExecutionEventType.RUN_COMPLETED);
+        } else {
+            assertEvents(seed, ExecutionEventType.RUN_STARTED, ExecutionEventType.TOOL_PROPOSED,
+                    ExecutionEventType.POLICY_EVALUATED, ExecutionEventType.TOOL_REQUEST, ExecutionEventType.TOOL_RESPONSE);
+        }
+        assertThat(canLockRelease(seed.releaseId())).isTrue();
+        assertNoTransaction();
+        assertGolden(seed);
+        assertAccessAudits(seed, 2);
+    }
+
     @Test
     void actualBProxyRollsBackPrivateMutationAndReceiptWhileCommittedPolicyRemains() throws Exception {
         Seed seed = seed(TestRunMode.SEAL_REPLAY);
@@ -410,6 +493,38 @@ class LoanReviewPolicyGatewayIntegrationTest {
         assertThat(canLockRelease(seed.releaseId())).isTrue();
         assertGolden(seed);
         assertAccessAudits(seed); // A separately preserves attempted source-access audit on rollback.
+        verify(validator).validate(any(), any());
+        assertThat(sourceCanonicalizations).isEqualTo(1);
+        assertThat(catalogCalls).isEqualTo(1);
+        assertNoTransaction();
+
+        failAfterPolicyAppend = false;
+        observations.useActualWorkflow = true;
+        var retry = gateway(observations, adapter).invoke(seed.context(), invocation, ACTOR);
+        assertThat(retry.policyDecision().allowed()).isFalse();
+        assertThat(retry.policyDecision().reasonCode()).isEqualTo("INVALID_WORKFLOW_STAGE");
+        // The rolled-back evaluation did not publish semantic validation into the source cache.
+        verify(validator, times(2)).validate(any(), any());
+        verify(catalogs, times(2)).load(seed.releaseId(), ACTOR);
+        assertThat(sourceCanonicalizations).isEqualTo(2);
+        assertThat(catalogCalls).isEqualTo(2);
+        assertThat(policyAppends).isEqualTo(2);
+        assertThat(independentCount(seed.runId(), "POLICY_EVALUATED")).isEqualTo(1);
+        assertThat(observations.resolves).isEqualTo(2);
+        assertThat(observations.registryCalls).isEqualTo(1); // Only the first evaluation reached registry lookup.
+        assertThat(adapter.calls).isZero();
+        assertThat(observations.begins).isZero();
+        assertThat(observations.completes).isZero();
+        verify(mutations, never()).execute(any(), any(), any(), any());
+        assertThat(independentCount(seed.runId(), "TOOL_REQUEST")).isZero();
+        assertThat(independentCount(seed.runId(), "TOOL_RESPONSE")).isZero();
+        assertThat(snapshot()).isEqualTo(before);
+        assertThat(receipts(seed)).isEqualTo("[]");
+        assertEvents(seed, ExecutionEventType.RUN_STARTED, ExecutionEventType.TOOL_PROPOSED, ExecutionEventType.POLICY_EVALUATED);
+        assertThat(canLockRelease(seed.releaseId())).isTrue();
+        assertNoTransaction();
+        assertGolden(seed);
+        assertAccessAudits(seed, 2);
     }
 
     @Test
@@ -469,16 +584,27 @@ class LoanReviewPolicyGatewayIntegrationTest {
         Seed foreign = register(TestRunMode.BASELINE);
         Seed main = register(mode);
         main = new Seed(main.releaseId(), main.runId(), main.caseRunId(), main.context(), main.accessBefore(), foreign.runId());
-        failAfterPolicyAppend = false; catalogCalls = 0; policyAppends = 0;
+        failAfterPolicyAppend = false; catalogCalls = 0; policyAppends = 0; sourceCanonicalizations = 0;
         Seed seed = main;
-        clearInvocations(events, catalogs, mutations);
+        clearInvocations(events, catalogs, mutations, runs, contracts, cases, validator, canonicalizer);
+        var catalogReturned = new AtomicBoolean();
         doAnswer(call -> {
             assertPhysicalRepeatableRead();
             Object result = call.callRealMethod();
             catalogCalls++;
             assertThat(canLockRelease(seed.releaseId())).isFalse();
+            catalogReturned.set(true);
             return result;
         }).when(catalogs).load(seed.releaseId(), ACTOR);
+        doAnswer(call -> {
+            // A also canonicalizes stored integrity; count only C's check after the catalog returns.
+            if (catalogReturned.compareAndSet(true, false)) {
+                assertPhysicalRepeatableRead();
+                assertThat(canLockRelease(seed.releaseId())).isFalse();
+                sourceCanonicalizations++;
+            }
+            return call.callRealMethod();
+        }).when(canonicalizer).canonicalizeAndHash(any());
         doAnswer(call -> {
             AppendRequest request = call.getArgument(1);
             if (request.eventType() != ExecutionEventType.POLICY_EVALUATED) return call.callRealMethod();
@@ -871,16 +997,21 @@ class LoanReviewPolicyGatewayIntegrationTest {
         return Integer.parseInt(independent("select count(*)::text from audit_records where resource_id=? and actor_id=? and action='SYSTEM_PROMPT_DECRYPTED_INTERNAL'", release, ACTOR));
     }
     private void assertAccessAudits(Seed seed) {
-        assertThat(accessCount(seed.releaseId())).isEqualTo(seed.accessBefore() + (seed.context().mode() == TestRunMode.BASELINE ? 1 : 2));
+        assertAccessAudits(seed, 1);
+    }
+    private void assertAccessAudits(Seed seed, int sourceReads) {
+        boolean isBaseline = seed.context().mode() == TestRunMode.BASELINE;
+        assertThat(accessCount(seed.releaseId())).isEqualTo(seed.accessBefore() + sourceReads * (isBaseline ? 1 : 2));
         List<JsonNode> added = jdbc.query("select metadata_json::text from audit_records where resource_id=? and actor_id=? "
                         + "and action='SYSTEM_PROMPT_DECRYPTED_INTERNAL' order by created_at,id offset ?",
                 (row, index) -> json.readTree(row.getString(1)), seed.releaseId(), ACTOR, seed.accessBefore());
-        if (seed.context().mode() == TestRunMode.BASELINE) {
-            assertThat(added).extracting(row -> row.path("purpose").stringValue()).containsExactly("TOOL_CATALOG_INTEGRITY_CHECK");
-        } else {
-            assertThat(added).extracting(row -> row.path("purpose").stringValue())
-                    .containsExactlyInAnyOrder("FINGERPRINT_INTEGRITY_CHECK", "TOOL_CATALOG_INTEGRITY_CHECK");
+        List<String> expectedPurposes = new ArrayList<>();
+        for (int read = 0; read < sourceReads; read++) {
+            if (!isBaseline) expectedPurposes.add("FINGERPRINT_INTEGRITY_CHECK");
+            expectedPurposes.add("TOOL_CATALOG_INTEGRITY_CHECK");
         }
+        assertThat(added).extracting(row -> row.path("purpose").stringValue())
+                .containsExactlyInAnyOrderElementsOf(expectedPurposes);
         assertThat(added).allSatisfy(row -> {
             assertThat(row.path("plaintextReturned").booleanValue()).isFalse();
             assertThat(row.toString()).doesNotContain(PRIVATE);
