@@ -439,6 +439,206 @@ class CatalogBoundOutputSchemaEvaluatorTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"const", "enum"})
+    void formatNamedOutputDataStillRequiresExactLiteralMatch(String keyword) {
+        JsonNode literal = json("{\"format\":\"statement\",\"nested\":[{\"format\":\"receipt\"}]}");
+        ObjectNode constraint = JSON.createObjectNode();
+        constraint.set(keyword, keyword.equals("enum") ? JSON.createArrayNode().add(literal) : literal);
+        ObjectNode schema = (ObjectNode) json("""
+                {"$schema":"https://json-schema.org/draft/2020-12/schema",
+                 "$defs":{},"$ref":"#/$defs/choice"}
+                """);
+        ((ObjectNode) schema.path("$defs")).set("choice", constraint);
+        assertSyntheticSchemaPreserved(schema, literal, MATCH);
+        assertSyntheticSchemaPreserved(schema, json("{\"format\":\"other\"}"), ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"default", "examples", "x-business-data", "additionalItems"})
+    void outputAnnotationsDoNotReplaceTypeRequiredOrAdditionalPropertyChecks(String keyword) {
+        ObjectNode schema = (ObjectNode) json("""
+                {"type":"object","properties":{"value":{"type":"string"}},
+                 "required":["value"],"additionalProperties":false}
+                """);
+        JsonNode data = json("{\"format\":\"statement\",\"nested\":[{\"format\":\"receipt\"}]}");
+        schema.set(keyword, keyword.equals("examples") ? JSON.createArrayNode().add(data) : data);
+        ((ObjectNode) schema.at("/properties/value")).set("default", data.deepCopy());
+        ((ObjectNode) schema.at("/properties/value")).set("additionalItems", data.deepCopy());
+        assertSyntheticSchemaPreserved(schema, json("{\"value\":\"private-output-marker\"}"), MATCH);
+        for (String invalid : new String[]{"{}", "{\"value\":7}", "{\"value\":\"ok\",\"extra\":true}"}) {
+            assertSyntheticSchemaPreserved(schema, json(invalid), ADAPTER_CONTRACT_FAILURE);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "{\"format\":\"unknown-finsec-format\"}",
+            "{\"$defs\":{\"unused\":%s}}", "{\"definitions\":{\"unused\":%s}}",
+            "{\"properties\":{\"absent\":%s}}", "{\"patternProperties\":{\"^absent$\":%s}}",
+            "{\"dependentSchemas\":{\"absent\":%s}}", "{\"dependencies\":{\"absent\":%s}}",
+            "{\"allOf\":[%s]}", "{\"anyOf\":[true,%s]}", "{\"oneOf\":[true,%s]}",
+            "{\"prefixItems\":[%s]}", "{\"items\":%s}", "{\"contains\":%s}",
+            "{\"additionalProperties\":%s}", "{\"propertyNames\":%s}",
+            "{\"unevaluatedProperties\":%s}", "{\"unevaluatedItems\":%s}",
+            "{\"not\":%s}", "{\"if\":%s}", "{\"then\":%s}", "{\"else\":%s}",
+            "{\"contentSchema\":%s}", "{\"if\":false,\"then\":%s}", "{\"if\":true,\"else\":%s}"
+    })
+    void unsupportedFormatsInUnusedSchemaLocationsStillQuarantineOutput(String template) {
+        assertSyntheticSchemaPreserved(json(template.formatted("{\"format\":\"unknown-finsec-format\"}")),
+                json("{\"value\":\"private-output-marker\"}"), ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"$ref", "$dynamicRef"})
+    void referencedAnnotationFormatsCannotAuthorizeAnOutput(String keyword) {
+        ObjectNode schema = (ObjectNode) json("""
+                {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object",
+                 "default":{"target":{"format":"unknown-finsec-format"}}}
+                """);
+        JsonNode output = json("{\"value\":\"private-output-marker\"}");
+        assertSyntheticSchemaPreserved(schema, output, MATCH);
+        schema.put(keyword, "#/default/target");
+        assertSyntheticSchemaPreserved(schema, output, ADAPTER_CONTRACT_FAILURE);
+        schema.remove(keyword);
+        schema.set("additionalItems", json("{\"format\":\"unknown-finsec-format\"}"));
+        assertSyntheticSchemaPreserved(schema, output, MATCH);
+        schema.put(keyword, "#/additionalItems");
+        assertSyntheticSchemaPreserved(schema, output, ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"contentSchema", "then", "else"})
+    void resolvedSchemaAnnotationsAndInactiveBranchesUseTheSameFormatGuard(String keyword) {
+        JsonNode value = JSON.createObjectNode().put("value", "private-output-marker");
+        ObjectNode target = JSON.createObjectNode().set(keyword, json("""
+                {"properties":{"value":{"format":"unknown-finsec-format"}}}
+                """));
+        assertSyntheticSchemaPreserved(target, value, ADAPTER_CONTRACT_FAILURE);
+        ObjectNode schema = (ObjectNode) json("""
+                {"type":"object","required":["value"],"additionalProperties":false,
+                 "properties":{"value":{"type":"string"}},"default":{}}
+                """);
+        ((ObjectNode) schema.path("default")).set("target", target);
+        assertSyntheticSchemaPreserved(schema, value, MATCH);
+        assertSyntheticSchemaPreserved(schema, json("{}"), ADAPTER_CONTRACT_FAILURE);
+        for (String reference : new String[]{"$ref", "$dynamicRef"}) {
+            schema.put(reference, "#/default/target");
+            assertSyntheticSchemaPreserved(schema, value, ADAPTER_CONTRACT_FAILURE);
+            schema.remove(reference);
+        }
+        // Supported constraints stay inactive; annotation data is still not a schema.
+        target.set(keyword, json("""
+                {"type":"string","format":"date-time","default":{"format":"statement"}}
+                """));
+        schema.put("$ref", "#/default/target");
+        assertSyntheticSchemaPreserved(schema, value, MATCH);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"then", "else"})
+    void referencedActiveBranchesStillApplySupportedFormats(String keyword) {
+        ObjectNode target = JSON.createObjectNode().put("if", keyword.equals("then"));
+        target.set(keyword, json("""
+                {"properties":{"value":{"format":"date-time"}},"default":{"format":"statement"}}
+                """));
+        ObjectNode schema = (ObjectNode) json("{\"$ref\":\"#/default/target\",\"default\":{}}");
+        ((ObjectNode) schema.path("default")).set("target", target);
+        assertSyntheticSchemaPreserved(schema, json("{\"value\":\"2026-09-09T00:00:00Z\"}"), MATCH);
+        assertSyntheticSchemaPreserved(schema, JSON.createObjectNode().put("value", "private-output-marker"), ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @Test
+    void longReferenceChainFormatFailuresRetainOutputQuarantineClassification() {
+        ObjectNode schema = (ObjectNode) json("{\"$ref\":\"#/x-chain/0\"}");
+        ArrayNode chain = schema.putArray("x-chain");
+        for (int index = 0; index < 45; index++) {
+            chain.addObject().put("$ref", "#/x-chain/" + (index + 1));
+        }
+        chain.addObject().put("format", "unknown-finsec-format");
+        assertSyntheticSchemaPreserved(schema, json("\"private-output-marker\""), ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{\"if\":false,\"then\":{\"$ref\":\"#/default/target\"}}",
+            "{\"if\":true,\"else\":{\"$ref\":\"#/default/target\"}}"})
+    void unselectedConditionalReferencesStillQuarantineUnsupportedFormats(String text) {
+        ObjectNode schema = (ObjectNode) json(text);
+        schema.set("default", json("{\"target\":{\"format\":\"unknown-finsec-format\"}}"));
+        assertSyntheticSchemaPreserved(schema, json("\"private-output-marker\""), ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "{\"$ref\":\"#/x~1data\",\"x/data\":{\"format\":\"date-time\"}}",
+            "{\"$ref\":\"#stamp\",\"$defs\":{\"stamp\":{\"$anchor\":\"stamp\",\"format\":\"date-time\"}}}",
+            "{\"$dynamicRef\":\"#stamp\",\"$defs\":{\"stamp\":{\"$dynamicAnchor\":\"stamp\",\"format\":\"date-time\"}}}"
+    })
+    void referenceResolutionStillEnforcesSupportedOutputFormats(String text) {
+        ObjectNode schema = (ObjectNode) json(text);
+        schema.set("default", json("{\"format\":\"statement\"}"));
+        assertSyntheticSchemaPreserved(schema, json("\"2026-09-09T00:00:00Z\""), MATCH);
+        assertSyntheticSchemaPreserved(schema, json("\"private-output-marker\""), ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @Test
+    void sharedAndRecursiveOutputReferencesRetainSchemaSemantics() {
+        JsonNode schema = json("""
+                {"$ref":"#/$defs/node","default":{"format":"statement"},
+                 "$defs":{"node":{"type":"object","additionalProperties":false,
+                 "properties":{"left":{"$ref":"#/$defs/node"},"right":{"$ref":"#/$defs/node"}}}}}
+                """);
+        assertSyntheticSchemaPreserved(schema, json("{\"left\":{},\"right\":{\"left\":{}}}"), MATCH);
+        assertSyntheticSchemaPreserved(schema, json("{\"left\":7}"), ADAPTER_CONTRACT_FAILURE);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"date-time", "unknown-finsec-format"})
+    void embeddedOutputResourcePreservesDialectAndLocalReferenceScope(String format) {
+        ObjectNode schema = (ObjectNode) json("""
+                {"$ref":"#/$defs/inner","default":{"format":"statement"},
+                 "$defs":{"inner":{"$id":"urn:finsec:embedded-format",
+                 "$schema":"https://json-schema.org/draft/2020-12/schema",
+                 "type":"object","properties":{"value":{"$ref":"#/x-target"}},"x-target":{}}}}
+                """);
+        ((ObjectNode) schema.at("/$defs/inner/x-target")).put("format", format);
+        if (format.equals("unknown-finsec-format")) {
+            assertSyntheticSchemaPreserved(schema, json("{\"value\":\"private-output-marker\"}"),
+                    ADAPTER_CONTRACT_FAILURE);
+        } else {
+            assertSyntheticSchemaPreserved(schema, json("{\"value\":\"2026-09-09T00:00:00Z\"}"), MATCH);
+            assertSyntheticSchemaPreserved(schema, json("{\"value\":\"private-output-marker\"}"),
+                    ADAPTER_CONTRACT_FAILURE);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "{\"default\":{\"$ref\":\"https://invalid.example/schema\"}}",
+            "{\"examples\":[{\"$dynamicRef\":\"file:///tmp/private-schema.json\"}]}",
+            "{\"x-data\":{\"$schema\":\"http://json-schema.org/draft-07/schema#\"}}"
+    })
+    void existingOutputReferenceAndDialectRestrictionsStillApplyInsideAnnotations(String schema) {
+        useSchema(json(schema));
+        assertFailure(INVALID_SCHEMA,
+                () -> evaluator.evaluate(RUN, CUSTOMER, json("\"private-output-marker\""), ACTOR));
+    }
+
+    private void assertSyntheticSchemaPreserved(JsonNode schema, JsonNode output,
+                                                CatalogBoundOutputSchemaEvaluator.Outcome expected) {
+        // Synthetic schema capability fixture; not a production catalog or adapter execution claim.
+        String schemaBefore = schema.toString();
+        String outputBefore = output.toString();
+        useSchema(schema);
+        var result = evaluator.evaluate(RUN, CUSTOMER, output, ACTOR);
+        assertThat(result.outcome()).isEqualTo(expected);
+        assertThat(result.source()).isEqualTo(new CatalogBoundOutputSchemaEvaluator.SourceBinding(
+                RUN, RELEASE, CUSTOMER, "1.1", ARTIFACT, RELEASE_HASH, CATALOG_HASH));
+        assertThat(schema.toString()).isEqualTo(schemaBefore);
+        assertThat(output.toString()).isEqualTo(outputBefore);
+        assertThat(result.toString()).doesNotContain("private-output-marker", "unknown-finsec-format");
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"file:///tmp/private-output-schema.json", "classpath:release/loan-review-tool-catalog-1.1.json",
             "https://invalid.example/schema", "relative-schema.json"})
     void rejectsNonlocalReferencesIncludingDynamicAndNestedReferences(String location) {
