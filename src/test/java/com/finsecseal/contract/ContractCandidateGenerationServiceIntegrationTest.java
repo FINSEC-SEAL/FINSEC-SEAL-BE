@@ -21,7 +21,9 @@ import com.finsecseal.contract.SafetyContractCandidateResponseProcessor.Candidat
 import com.finsecseal.contract.SafetyContractGenerationSourceService.GenerationSourceException;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.VersionIdentity;
 import com.finsecseal.contract.SafetyContractSemanticValidator.ValidationStatus;
+import com.finsecseal.contract.fixture.GenerationRouteProbe;
 import com.finsecseal.evidence.RedactionService;
+import com.finsecseal.platform.contract.ContractSpecificationController;
 import com.finsecseal.release.DigestService;
 import com.finsecseal.release.ReleaseDto;
 import com.finsecseal.release.ReleaseService;
@@ -51,6 +53,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.aop.support.AopUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -64,6 +67,9 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.method.HandlerMethod;
+import org.springframework.web.servlet.mvc.method.RequestMappingInfo;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -130,12 +136,66 @@ class ContractCandidateGenerationServiceIntegrationTest {
     void aiEnabledContextActivatesWorkerWithoutTheLegacySynchronousGenerationRoute() {
         assertThat(enabledWorker).isNotNull();
         assertThat(handlerMappings.getHandlerMethods()).isNotEmpty();
-        assertThat(handlerMappings.getHandlerMethods().keySet().stream()
-                .flatMap(mapping -> mapping.getPatternValues().stream()))
-                .noneMatch(pattern -> pattern.contains("contracts:generate"));
+        assertNoCGenerationRoutes();
         assertThat(handlerMappings.getHandlerMethods().values())
                 .noneMatch(handler -> handler.getBeanType().getSimpleName()
                         .equals("ContractCandidateGenerationController"));
+    }
+
+    @Test
+    void generationRouteOwnedByTheExistingAControllerIsAllowed() {
+        withRegisteredProbe(mappedHandler(ContractSpecificationController.class), "contracts:generate",
+                this::assertNoCGenerationRoutes);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"root", "subpackage"})
+    void generationRouteOwnedByCRootOrSubpackageIsRejected(String location) throws Exception {
+        HandlerMethod handler = location.equals("root")
+                ? mappedHandler(StoredSafetyContractReviewController.class) : subpackageProbe();
+        withRegisteredProbe(handler, "contracts:generate", () -> assertThatThrownBy(this::assertNoCGenerationRoutes)
+                .isInstanceOf(AssertionError.class).hasMessageContaining("C-owned generation routes"));
+    }
+
+    @Test
+    void unrelatedCSubpackageRouteRemainsAllowed() throws Exception {
+        withRegisteredProbe(subpackageProbe(), "review", this::assertNoCGenerationRoutes);
+    }
+
+    private void assertNoCGenerationRoutes() {
+        assertThat(handlerMappings.getHandlerMethods().entrySet()).as("C-owned generation routes")
+                .noneMatch(entry -> {
+                    String owner = entry.getValue().getBeanType().getPackageName();
+                    return (owner.equals("com.finsecseal.contract") || owner.startsWith("com.finsecseal.contract."))
+                            && entry.getKey().getPatternValues().stream()
+                                    .anyMatch(pattern -> pattern.contains("contracts:generate"));
+                });
+    }
+
+    private HandlerMethod mappedHandler(Class<?> controller) {
+        return handlerMappings.getHandlerMethods().values().stream()
+                .filter(handler -> handler.getBeanType().equals(controller)).findFirst().orElseThrow();
+    }
+
+    private HandlerMethod subpackageProbe() throws NoSuchMethodException {
+        return new HandlerMethod(new GenerationRouteProbe(), GenerationRouteProbe.class.getMethod("generate"));
+    }
+
+    private void withRegisteredProbe(HandlerMethod handler, String suffix, Runnable assertion) {
+        var before = handlerMappings.getHandlerMethods();
+        String probeId = UUID.randomUUID().toString();
+        var mapping = RequestMappingInfo.paths("/__c_route_ownership_probe__/" + probeId + "/" + suffix)
+                .methods(RequestMethod.POST).mappingName("c-route-ownership-probe-" + probeId)
+                .options(handlerMappings.getBuilderConfiguration()).build();
+        // A unique name also avoids disturbing the existing handler's named-route lookup.
+        handlerMappings.registerMapping(mapping, handler.getBean(), handler.getMethod());
+        try {
+            assertThat(handlerMappings.getHandlerMethods()).containsKey(mapping);
+            assertion.run();
+        } finally {
+            handlerMappings.unregisterMapping(mapping);
+            assertThat(handlerMappings.getHandlerMethods()).isEqualTo(before).doesNotContainKey(mapping);
+        }
     }
 
     @Test
