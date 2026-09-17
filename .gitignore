@@ -64,3 +64,22 @@ htmlcov/
 *.log
 # Local Git worktrees
 .worktrees/
+
+# Local agent work and private submission files
+/AGENTS.md
+/AGENTS.local.md
+/.codex/
+/.codex-parallel/
+/.worktrees/
+/dev_harness/
+/MONITOR_STATUS.json
+/ORCHESTRATION_STATE.json
+/DELIVERY_SUMMARY.md
+/제출서류/
+/제출서류/
+
+# Local Role C dependency tracking
+/docs/C_ROLE_C_DEPENDENCIES.md
+
+# Local Role C handoff documentation
+/docs/C_POLICY_GATEWAY_EXECUTION_HANDOFF.md
