@@ -80,3 +80,6 @@ htmlcov/
 
 # Local Role C dependency tracking
 /docs/C_ROLE_C_DEPENDENCIES.md
+
+# Local Role C handoff documentation
+/docs/C_POLICY_GATEWAY_EXECUTION_HANDOFF.md
