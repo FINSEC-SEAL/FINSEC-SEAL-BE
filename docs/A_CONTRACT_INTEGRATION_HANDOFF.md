@@ -87,6 +87,10 @@ A가 DB에서 출처·base·catalog를 다시 읽고 C의 `SafetyContractPatchPr
 증거 본문을 읽기 전에 workspace·suite·Release와 부모 계보를 확인한다. HELD_OUT·숨김·숨김 원본의 파생·외부 workspace·순환 계보는 제외한다.
 통과한 Oracle evidence도 canonical digest를 검사한다. 불허 출처와 미존재 ID는 모두 404다.
 
+## 생성 비동기 연결 갱신 (2026-09-08)
+
+A의202 접수·예약·worker·결과/메타데이터 저장·상태 조회는 [A→C 비동기 인계](A_TO_C_GENERATION_HANDOFF.md)에 구현 기준을 정리했다. 아래 최초 인계의 미연결 항목보다 새 문서를 우선한다.
+
 ## 별도 팀 연결 범위
 
 `POST /releases/{id}/contracts:generate`와 `POST /findings/{id}/patch-proposals`의 실제 AI 생성·비동기 작업 접수는 B/C 생성 연결 범위다.

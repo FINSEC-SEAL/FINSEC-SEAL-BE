@@ -132,7 +132,7 @@ class ContractCandidateGenerationServiceIntegrationTest {
         assertThat(handlerMappings.getHandlerMethods()).isNotEmpty();
         assertThat(handlerMappings.getHandlerMethods().keySet().stream()
                 .flatMap(mapping -> mapping.getPatternValues().stream()))
-                .noneMatch(pattern -> pattern.contains("contracts:generate"));
+                .anyMatch(pattern -> pattern.equals("/api/v1/releases/{id}/contracts:generate"));
         assertThat(handlerMappings.getHandlerMethods().values())
                 .noneMatch(handler -> handler.getBeanType().getSimpleName()
                         .equals("ContractCandidateGenerationController"));

@@ -161,4 +161,6 @@ Event names: `run.status`, `run.progress`, `case.status`, `trace.event`, `findin
 
 추가 후보 저장·현재 승인본 조회·출처 필터 및 이전 `/platform/contracts` 경로의 호환 여부,
 선택적 patchProposalId의 승인 연결은 [A 계약 API 인수인계](../A_CONTRACT_INTEGRATION_HANDOFF.md)에 명시한다.
-`contracts:generate`와 Finding의 비동기 patch 생성은 B/C의 생성 연결 작업이며 이 저장 API와 별개다.
+2026-09-08 생성 접수·작업 상태 구현은 [A→C 비동기 인계](../A_TO_C_GENERATION_HANDOFF.md)를 따른다.
+위 두 생성 POST는 A가 인증된202 접수를 맡고 C/B 생성 서비스를 호출한다. 작업 상태 조회 확장은
+`GET /api/v1/operations/{id}`이며 수행 상태와 검증 판단을 분리한다. 정확한 DTO·원본 변경·복구 정책은 인계 문서를 기준으로 한다.

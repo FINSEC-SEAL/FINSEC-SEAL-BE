@@ -82,6 +82,17 @@ public class ContractReviewerCredentials {
         return session != null && equal(session.csrfToken(), request.getHeader("X-CSRF-Token"));
     }
 
+    /** Non-secret stamp invalidated by credential/actor/workspace rotation; never persist the key. */
+    public String authorityStamp(ReviewerContext reviewer) {
+        if (!configured() || reviewer == null || !reviewer.authenticated() || !reviewer.csrfVerified()
+                || !workspace.equals(reviewer.workspaceId()) || !actor.equals(reviewer.actorId())
+                || !"AI_SECURITY_REVIEWER".equals(reviewer.role()) || reviewer.sessionId()==null || reviewer.sessionId().isBlank()) {
+            throw new com.finsecseal.common.api.BusinessException(
+                    com.finsecseal.common.api.ErrorCode.OPERATOR_AUTH_REQUIRED,"Trusted reviewer authority required");
+        }
+        return signature("GENERATION_AUTHORITY:"+workspace+":"+actor);
+    }
+
     private ReviewerContext reviewer(String sessionId) {
         return new ReviewerContext(workspace, actor, "AI_SECURITY_REVIEWER", sessionId, true, true, false);
     }
