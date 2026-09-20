@@ -50,6 +50,7 @@ public class ReplayComparisonService {
                        replay_link.same_fixture_digest, replay_link.same_model_config,
                        replay_link.same_variant_hash, replay_link.expected_policy_difference,
                        replay_link.comparison_json::text comparison_json,
+                       baseline_oracle.id baseline_matching_oracle_id,
                        replay_oracle.id replay_matching_oracle_id
                   from replay_links replay_link
                   join findings finding on finding.id = replay_link.finding_id
@@ -57,6 +58,7 @@ public class ReplayComparisonService {
                     on baseline_oracle.id = finding.source_oracle_result_id
                   join test_case_runs baseline_case
                     on baseline_case.id = replay_link.baseline_case_run_id
+                   and baseline_oracle.test_case_run_id = baseline_case.id
                   join test_case_runs replay_case
                     on replay_case.id = replay_link.replay_case_run_id
                   left join oracle_results replay_oracle
@@ -95,7 +97,7 @@ public class ReplayComparisonService {
                 status.mismatchReasons(),
                 baseline,
                 replay,
-                difference(baseline, replay)
+                difference(link, status.comparable(), baseline, replay)
         );
     }
 
@@ -238,18 +240,24 @@ public class ReplayComparisonService {
     }
 
     private ReplayComparisonDto.Difference difference(
+            LinkRow link,
+            boolean comparable,
             ReplayComparisonDto.Side baseline,
             ReplayComparisonDto.Side replay
     ) {
-        boolean baselineSuccess = hasOutcome(baseline, OracleOutcome.ATTACK_SUCCESS);
-        boolean replayBlocked = hasOutcome(replay, OracleOutcome.ATTACK_BLOCKED);
+        boolean baselineSuccess = baseline.oracleResults().stream().anyMatch(oracle ->
+                oracle.id().equals(link.baselineMatchingOracleId())
+                        && oracle.outcome() == OracleOutcome.ATTACK_SUCCESS);
+        boolean replayBlocked = replay.oracleResults().stream().anyMatch(oracle ->
+                oracle.id().equals(link.replayMatchingOracleId())
+                        && oracle.outcome() == OracleOutcome.ATTACK_BLOCKED);
         boolean replaySuccess = hasOutcome(replay, OracleOutcome.ATTACK_SUCCESS);
         return new ReplayComparisonDto.Difference(
                 !eventSignature(baseline.policyDecisions()).equals(eventSignature(replay.policyDecisions())),
                 !eventSignature(baseline.apiResponses()).equals(eventSignature(replay.apiResponses())),
                 !eventSignature(baseline.stateChanges()).equals(eventSignature(replay.stateChanges())),
                 !oracleSignature(baseline).equals(oracleSignature(replay)),
-                baselineSuccess && replayBlocked && !replaySuccess
+                comparable && baselineSuccess && replayBlocked && !replaySuccess
         );
     }
 
@@ -288,6 +296,7 @@ public class ReplayComparisonService {
                 resultSet.getBoolean("same_variant_hash"),
                 resultSet.getBoolean("expected_policy_difference"),
                 resultSet.getString("comparison_json"),
+                resultSet.getObject("baseline_matching_oracle_id", UUID.class),
                 resultSet.getObject("replay_matching_oracle_id", UUID.class)
         );
     }
@@ -328,6 +337,7 @@ public class ReplayComparisonService {
             boolean sameVariantHash,
             boolean expectedPolicyDifference,
             String comparisonJson,
+            UUID baselineMatchingOracleId,
             UUID replayMatchingOracleId
     ) {
     }

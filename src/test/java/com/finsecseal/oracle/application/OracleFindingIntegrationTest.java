@@ -23,11 +23,14 @@ import com.finsecseal.oracle.domain.LoanDecisionSnapshot;
 import com.finsecseal.oracle.domain.OracleOutcome;
 import com.finsecseal.oracle.domain.OracleReasonCode;
 import com.finsecseal.oracle.domain.OracleResult;
+import com.finsecseal.oracle.domain.SensitiveFieldPolicy;
 import com.finsecseal.oracle.evaluator.CrossCustomerOracle;
 import com.finsecseal.oracle.evaluator.HighImpactMutationOracle;
+import com.finsecseal.oracle.evaluator.SensitiveFieldOracle;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -403,7 +406,52 @@ class OracleFindingIntegrationTest {
 
         assertThat(detail.comparable()).isFalse();
         assertThat(detail.mismatchReasons()).containsExactly("SYNTHETIC_MISMATCH");
-        assertThat(detail.difference().attackMitigated()).isTrue();
+        assertThat(detail.difference().attackMitigated()).isFalse();
+    }
+
+    @Test
+    void doesNotUseAnotherOracleBlockToMitigateAnInconclusiveFinding() {
+        Seed baseline = seedRunningAttack("comparison-unrelated-block", false);
+        var assessment = assessmentService.record(
+                baseline.runId(), baseline.caseRunId(), baseline.traceId(), baseline.sourceEventId(),
+                successfulCrossCustomerResult(), "role-d"
+        );
+        OracleResult inconclusive = new CrossCustomerOracle().evaluate(null);
+        OracleResult otherBlocked = new SensitiveFieldOracle(new SensitiveFieldPolicy(Set.of(), Set.of()))
+                .evaluate(new CustomerResponseEvidence(
+                "CUST-1001", false, false, true, true, null, List.of()
+        ));
+        assertThat(inconclusive.outcome()).isEqualTo(OracleOutcome.INCONCLUSIVE);
+        assertThat(otherBlocked.outcome()).isEqualTo(OracleOutcome.ATTACK_BLOCKED);
+        ReplaySeed replay = seedCompletedReplay(
+                baseline, assessment.finding().id(), true, List.of(inconclusive, otherBlocked)
+        );
+
+        var detail = replayComparisonService.find(replay.runId());
+
+        assertThat(detail.comparable()).isTrue();
+        assertThat(detail.replay().oracleResults()).hasSize(2);
+        assertThat(detail.difference().attackMitigated()).isFalse();
+    }
+
+    @Test
+    void rejectsComparisonWithoutTheFindingOracle() {
+        Seed baseline = seedRunningAttack("comparison-missing-oracle", false);
+        var assessment = assessmentService.record(
+                baseline.runId(), baseline.caseRunId(), baseline.traceId(), baseline.sourceEventId(),
+                successfulCrossCustomerResult(), "role-d"
+        );
+        OracleResult otherBlocked = new SensitiveFieldOracle(new SensitiveFieldPolicy(Set.of(), Set.of()))
+                .evaluate(new CustomerResponseEvidence(
+                "CUST-1001", false, false, true, true, null, List.of()
+        ));
+        ReplaySeed replay = seedCompletedReplay(
+                baseline, assessment.finding().id(), true, List.of(otherBlocked)
+        );
+
+        assertThatThrownBy(() -> replayComparisonService.find(replay.runId()))
+                .isInstanceOfSatisfying(BusinessException.class, exception ->
+                        assertThat(exception.errorCode()).isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE));
     }
 
     @Test
@@ -584,6 +632,18 @@ class OracleFindingIntegrationTest {
             UUID findingId,
             boolean comparable
     ) {
+        OracleResult blocked = new CrossCustomerOracle().evaluate(new CustomerResponseEvidence(
+                "CUST-1001", false, false, true, true, null, List.of()
+        ));
+        return seedCompletedReplay(baseline, findingId, comparable, List.of(blocked));
+    }
+
+    private ReplaySeed seedCompletedReplay(
+            Seed baseline,
+            UUID findingId,
+            boolean comparable,
+            List<OracleResult> results
+    ) {
         ReplayContext context = jdbcTemplate.queryForObject("""
                 select run.release_id, run.suite_id, case_run.test_case_id,
                        run.baseline_pair_group_id, run.random_seed
@@ -714,17 +774,16 @@ class OracleFindingIntegrationTest {
                 ),
                 "runtime-b"
         );
-        OracleResult blocked = new CrossCustomerOracle().evaluate(new CustomerResponseEvidence(
-                "CUST-1001", false, false, true, true, null, List.of()
-        ));
-        assessmentService.record(
-                replayRun.runId(),
-                replayCase.id(),
-                traceId,
-                policyEvent.eventId(),
-                blocked,
-                "role-d"
-        );
+        for (OracleResult result : results) {
+            assessmentService.record(
+                    replayRun.runId(),
+                    replayCase.id(),
+                    traceId,
+                    policyEvent.eventId(),
+                    result,
+                    "role-d"
+            );
+        }
         runPersistenceService.updateCaseStatus(
                 replayRun.runId(),
                 replayCase.id(),
