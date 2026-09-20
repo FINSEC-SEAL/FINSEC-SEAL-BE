@@ -83,6 +83,10 @@ public final class ReplayComparisonDto {
     ) {
     }
 
+    /**
+     * attackMitigated requires a comparable pair and a blocked replay of the Finding's
+     * own Oracle/invariant. It is not a Release PASS or a normal-regression verdict.
+     */
     public record Difference(
             boolean policyDecisionChanged,
             boolean apiResponseChanged,
