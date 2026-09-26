@@ -12,7 +12,6 @@ import com.finsecseal.runtime.ai.StatelessAgentStepClient.AgentAction;
 import com.finsecseal.runtime.ai.StatelessAgentStepClient.FinalResponseAction;
 import com.finsecseal.runtime.ai.StatelessAgentStepClient.ToolProposalAction;
 import com.finsecseal.sandbox.SandboxExecutionContext;
-import com.finsecseal.sandbox.tool.CustomerDataReadToolAdapter;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.ObjectProvider;
@@ -23,6 +22,8 @@ import tools.jackson.databind.node.ObjectNode;
 
 @Service
 public class AgentRuntimeService {
+
+    private static final String CUSTOMER_DATA_READ_TOOL_NAME = "CUSTOMER_DATA_READ";
 
     private final ObjectProvider<AgentAiClient> aiClientProvider;
     private final ExecutionEventService eventService;
@@ -206,7 +207,7 @@ public class AgentRuntimeService {
     ) {
         AgentAiClient aiClient = requireClient();
         CustomerFieldDeliveryEvidence.Capture customerCapture = null;
-        if (CustomerDataReadToolAdapter.TOOL_NAME.equals(toolName)) {
+        if (CUSTOMER_DATA_READ_TOOL_NAME.equals(toolName)) {
             if (customerFieldDeliveryEvidence == null || context == null || context.runId() == null
                     || context.caseRunId() == null || context.traceId() == null
                     || sourceEventId == null || sourceSequence <= 0) {
