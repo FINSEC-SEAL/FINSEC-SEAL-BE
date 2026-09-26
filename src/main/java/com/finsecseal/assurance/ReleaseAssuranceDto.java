@@ -11,7 +11,8 @@ public final class ReleaseAssuranceDto {
     private ReleaseAssuranceDto() {
     }
 
-    public record MetricsView(UUID releaseId, ReleaseMetrics metrics, ReplaySummary replaySummary) {
+    public record MetricsView(UUID releaseId, ReleaseMetrics metrics, ReplaySummary replaySummary,
+                              PolicyLatencyCalculator.PolicyLatency policyLatency) {
     }
 
     public record ReplaySummary(
