@@ -205,6 +205,95 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     @Test
+    void completionRateCountsScheduledSlotsAcrossActiveQueuedAndCancelledRuns() throws Exception {
+        Seed seed = seedCriticalRelease();
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+        PlannedRun active = seedPlannedRun(baselineRunId, "HELD_OUT", 3,
+                List.of("ERROR", "CANCELLED"), "RUNNING");
+        PlannedRun queued = seedPlannedRun(baselineRunId, "REGRESSION", 2,
+                List.of(), "QUEUED");
+        PlannedRun cancelled = seedPlannedRun(baselineRunId, "SEAL_REPLAY", 2,
+                List.of("CANCELLED"), "CANCELLED");
+        List<UUID> expectedRunIds = List.of(baselineRunId, active.runId(), queued.runId(),
+                cancelled.runId()).stream().sorted().toList();
+
+        var api = assuranceService.metrics(seed.releaseId());
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var metric = api.completionRate();
+        var apiJson = objectMapper.readTree(objectMapper.writeValueAsString(api));
+        var snapshot = proposal.inputSnapshot().path("completionRate");
+
+        assertThat(metric.status()).isEqualTo(CompletionRateCalculator.Status.AVAILABLE);
+        assertThat(metric.numerator()).isEqualTo(2L); // baseline terminal + active ERROR
+        assertThat(metric.denominator()).isEqualTo(8L); // each Run's immutable plan once
+        assertThat(metric.value()).isEqualTo(0.25);
+        assertThat(metric.cancelledTrials()).isEqualTo(2L);
+        assertThat(metric.unmaterializedTrials()).isEqualTo(4L);
+        assertThat(metric.sourceRunIds()).containsExactlyElementsOf(expectedRunIds);
+        assertThat(api.metrics().attackSuccessRate().sourceRunIds()).containsExactly(baselineRunId);
+        assertThat(jdbcTemplate.queryForObject("""
+                select status from test_case_runs where test_run_id = ? and trial_index = 0
+                """, String.class, active.runId())).isEqualTo("ERROR");
+        assertThat(jdbcTemplate.queryForObject("select status from test_runs where id = ?",
+                String.class, cancelled.runId())).isEqualTo("CANCELLED");
+        assertThat(apiJson.at("/completionRate/numerator").asLong()).isEqualTo(2L);
+        assertThat(apiJson.at("/completionRate/denominator").asLong()).isEqualTo(8L);
+        assertThat(snapshot.at("/numerator").asLong()).isEqualTo(2L);
+        assertThat(snapshot.at("/denominator").asLong()).isEqualTo(8L);
+        assertThat(snapshot.at("/sourceRunIds").valueStream().map(value -> value.asString()).toList())
+                .containsExactlyElementsOf(expectedRunIds.stream().map(UUID::toString).toList());
+    }
+
+    @Test
+    void completionRateDecisionCohortExcludesOtherSuiteAndChangesDigestWithEvidence() throws Exception {
+        Seed seed = seedCriticalRelease();
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+        PlannedRun queued = seedPlannedRun(baselineRunId, "REGRESSION", 2,
+                List.of(), "QUEUED");
+        SensitiveRun otherSuite = seedSensitiveRun(seed.releaseId());
+
+        var apiBefore = assuranceService.metrics(seed.releaseId()).completionRate();
+        var before = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var snapshotBefore = before.inputSnapshot().path("completionRate");
+        assertThat(apiBefore.numerator()).isEqualTo(1L);
+        assertThat(apiBefore.denominator()).isEqualTo(4L);
+        assertThat(apiBefore.sourceRunIds()).contains(otherSuite.runId());
+        assertThat(snapshotBefore.at("/numerator").asLong()).isEqualTo(1L);
+        assertThat(snapshotBefore.at("/denominator").asLong()).isEqualTo(3L);
+        assertThat(snapshotBefore.at("/sourceRunIds").valueStream().map(value -> value.asString()).toList())
+                .containsExactlyElementsOf(List.of(baselineRunId, queued.runId()).stream()
+                        .sorted().map(UUID::toString).toList());
+
+        addPlannedCase(queued, 0, "PASSED");
+        var apiAfter = assuranceService.metrics(seed.releaseId()).completionRate();
+        var after = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var snapshotAfter = after.inputSnapshot().path("completionRate");
+        assertThat(apiAfter.numerator()).isEqualTo(2L);
+        assertThat(apiAfter.denominator()).isEqualTo(4L);
+        assertThat(snapshotAfter.at("/numerator").asLong()).isEqualTo(2L);
+        assertThat(snapshotAfter.at("/denominator").asLong()).isEqualTo(3L);
+        assertThat(after.inputDigest()).isNotEqualTo(before.inputDigest());
+    }
+
+    @Test
+    void completionRateWithoutScheduledRunsIsUnavailableInSerializedApi() throws Exception {
+        UUID releaseId = seedReleaseWithoutRuns();
+
+        var api = assuranceService.metrics(releaseId);
+        var serialized = objectMapper.readTree(objectMapper.writeValueAsString(api));
+
+        assertThat(api.completionRate().status()).isEqualTo(CompletionRateCalculator.Status.N_A);
+        assertThat(api.completionRate().reason()).isEqualTo("NO_SCHEDULED_TRIALS");
+        assertThat(api.completionRate().numerator()).isNull();
+        assertThat(api.completionRate().denominator()).isNull();
+        assertThat(serialized.at("/completionRate/status").asString()).isEqualTo("N_A");
+        assertThat(serialized.at("/completionRate/numerator").isNull()).isTrue();
+        assertThat(serialized.at("/completionRate/sourceRunIds").isEmpty()).isTrue();
+    }
+
+    @Test
     void rejectsStaleProposalDigestAndUpwardOverride() throws Exception {
         Seed seed = seedCriticalRelease();
         var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
@@ -898,6 +987,89 @@ class ReleaseAssuranceIntegrationTest {
         return seedCriticalRelease("HELD_OUT");
     }
 
+    private UUID seedReleaseWithoutRuns() throws Exception {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        AgentDto.Response agent = agentService.create(new AgentDto.CreateRequest(
+                "empty-" + suffix, "Empty Agent", "Release without scheduled runs"
+        ));
+        ObjectNode manifest = (ObjectNode) objectMapper.readTree(
+                getClass().getResourceAsStream("/fixtures/valid-release-manifest.json")
+        );
+        ((ObjectNode) manifest.path("agent")).put("id", "empty-" + suffix);
+        ReleaseDto.Response release = releaseService.create(agent.id(), manifest, "test");
+        releaseService.analyze(release.id(), "test");
+        return release.id();
+    }
+
+    private PlannedRun seedPlannedRun(UUID baselineRunId, String mode, int scheduled,
+                                      List<String> caseStatuses, String runStatus) {
+        UUID runId = UUID.randomUUID();
+        UUID testCaseId = jdbcTemplate.queryForObject(
+                "select test_case_id from test_case_runs where test_run_id = ?",
+                UUID.class, baselineRunId);
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        jdbcTemplate.update("""
+                insert into test_runs
+                    (id, release_id, suite_id, contract_version_id, mode, status,
+                     agent_artifact_fingerprint, release_fingerprint, config_json,
+                     fixture_version, fixture_digest, model_config_hash, total_cases,
+                     completed_cases, operational_error_count, summary_json, created_at, updated_at)
+                select ?, release_id, suite_id, contract_version_id, ?, 'QUEUED',
+                       agent_artifact_fingerprint, release_fingerprint, config_json,
+                       fixture_version, fixture_digest, model_config_hash, ?,
+                       0, 0, '{}'::jsonb, ?, ?
+                  from test_runs where id = ?
+                """, runId, mode, scheduled, Timestamp.from(now), Timestamp.from(now), baselineRunId);
+        PlannedRun run = new PlannedRun(runId, testCaseId);
+        for (int index = 0; index < caseStatuses.size(); index++) {
+            addPlannedCase(run, index, caseStatuses.get(index));
+        }
+        if ("RUNNING".equals(runStatus)) {
+            jdbcTemplate.update("insert into run_event_counters (run_id, last_sequence) values (?, 0)", runId);
+            eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                    null, UUID.randomUUID(), ExecutionEventType.RUN_STARTED,
+                    null, null, null, null, "RUN_STARTED", objectMapper.createObjectNode()
+            ), "test");
+            jdbcTemplate.update("update test_runs set status = 'PREPARING', updated_at = ? where id = ?",
+                    Timestamp.from(now), runId);
+            jdbcTemplate.update("update test_runs set status = 'RUNNING', started_at = ?, updated_at = ? where id = ?",
+                    Timestamp.from(now), Timestamp.from(now), runId);
+        } else if ("CANCELLED".equals(runStatus)) {
+            jdbcTemplate.update("insert into run_event_counters (run_id, last_sequence) values (?, 0)", runId);
+            UUID traceId = UUID.randomUUID();
+            for (ExecutionEventType type : List.of(
+                    ExecutionEventType.RUN_STARTED, ExecutionEventType.RUN_CANCEL_REQUESTED)) {
+                eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                        null, traceId, type, null, null, null, null,
+                        type.name(), objectMapper.createObjectNode()
+                ), "test");
+            }
+            int errors = (int) caseStatuses.stream().filter("ERROR"::equals).count();
+            jdbcTemplate.update("""
+                    update test_runs set status = 'CANCELLED', completed_cases = ?,
+                           operational_error_count = ?, completed_at = ?, updated_at = ? where id = ?
+                    """, caseStatuses.size(), errors, Timestamp.from(now), Timestamp.from(now), runId);
+        }
+        return run;
+    }
+
+    private void addPlannedCase(PlannedRun run, int trialIndex, String status) {
+        UUID caseRunId = UUID.randomUUID();
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        jdbcTemplate.update("""
+                insert into test_case_runs
+                    (id, test_run_id, test_case_id, trial_index, status, variant_hash,
+                     result_json, created_at, updated_at)
+                values (?, ?, ?, ?, 'PENDING', ?, '{}'::jsonb, ?, ?)
+                """, caseRunId, run.runId(), run.testCaseId(), trialIndex, HASH_A,
+                Timestamp.from(now), Timestamp.from(now));
+        if (!"PENDING".equals(status)) {
+            jdbcTemplate.update("""
+                    update test_case_runs set status = ?, completed_at = ?, updated_at = ? where id = ?
+                    """, status, Timestamp.from(now), Timestamp.from(now), caseRunId);
+        }
+    }
+
     private Seed seedCriticalRelease(String mode) throws Exception {
         return seedCriticalRelease(mode, false);
     }
@@ -1384,6 +1556,9 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     private record SensitiveRun(UUID runId, UUID caseRunId, UUID traceId) {
+    }
+
+    private record PlannedRun(UUID runId, UUID testCaseId) {
     }
 
     private record MutationFixture(int transitions, MutationFault fault) {
