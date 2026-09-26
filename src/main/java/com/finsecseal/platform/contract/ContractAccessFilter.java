@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.util.Set;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
+import org.springframework.http.ResponseCookie;
 import org.springframework.stereotype.Component;
 import org.springframework.web.cors.CorsUtils;
 import org.springframework.web.filter.OncePerRequestFilter;
@@ -19,10 +20,13 @@ public class ContractAccessFilter extends OncePerRequestFilter {
     public static final String CONTEXT = ContractAccessFilter.class.getName() + ".reviewer";
     public static final String SESSION = ContractAccessFilter.class.getName() + ".session";
     private final ContractReviewerCredentials credentials;
+    private final ContractReviewerSessionRevocations revocations;
     private final ObjectMapper json;
 
-    public ContractAccessFilter(ContractReviewerCredentials credentials, ObjectMapper json) {
+    public ContractAccessFilter(ContractReviewerCredentials credentials,
+            ContractReviewerSessionRevocations revocations, ObjectMapper json) {
         this.credentials = credentials;
+        this.revocations = revocations;
         this.json = json;
     }
 
@@ -48,12 +52,28 @@ public class ContractAccessFilter extends OncePerRequestFilter {
         var session = credentials.session(request);
         String supplied = request.getHeader("X-Contract-Reviewer-Key");
         boolean mutation = !Set.of("GET", "HEAD", "OPTIONS").contains(request.getMethod());
+        boolean recovery = "GET".equals(request.getMethod())
+                && "/api/v1/reviewer-session".equals(request.getRequestURI());
+        boolean exactLogout = "DELETE".equals(request.getMethod()) && session != null
+                && ("/api/v1/reviewer-session/" + session.reviewer().sessionId()).equals(request.getRequestURI());
+        boolean revoked = revocations.isRevoked(session);
         // A cookie request must prove CSRF; a key header cannot downgrade this requirement.
         if (request.getHeader("Cookie") != null) {
             if (session != null && (supplied == null || credentials.keyValid(supplied))
-                    && (!mutation || credentials.csrfValid(session, request))) reviewer = session.reviewer();
+                    && (!mutation || credentials.csrfValid(session, request))
+                    && (!revoked || exactLogout)) reviewer = session.reviewer();
+            else if (recovery && credentials.keyValid(supplied)) {
+                // Only this exact endpoint can exchange a trusted key for a new session.
+                session = null;
+                reviewer = credentials.keyReviewer();
+            }
         } else if (credentials.keyValid(supplied)) {
             reviewer = credentials.keyReviewer();
+        }
+        if ("DELETE".equals(request.getMethod()) && request.getRequestURI().startsWith("/api/v1/reviewer-session/")) {
+            if (!exactLogout) reviewer = null;
+            else if (reviewer != null) response.addHeader("Set-Cookie", ResponseCookie.from(ContractReviewerCredentials.COOKIE, "")
+                    .httpOnly(true).secure(true).sameSite("Lax").path("/").maxAge(0).build().toString());
         }
         String actorHeader = request.getHeader("X-Actor-Id");
         if (reviewer == null || (actorHeader != null && !actorHeader.equals(reviewer.actorId()))) {
