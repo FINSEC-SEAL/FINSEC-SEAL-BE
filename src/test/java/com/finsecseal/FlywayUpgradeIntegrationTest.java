@@ -36,9 +36,10 @@ class FlywayUpgradeIntegrationTest {
         assertThat(appliedVersionCount()).isEqualTo(9);
 
         Flyway current = flyway(null);
-        assertThat(current.migrate().migrationsExecuted).isEqualTo(5);
-        assertThat(appliedVersionCount()).isEqualTo(14);
+        assertThat(current.migrate().migrationsExecuted).isEqualTo(6);
+        assertThat(appliedVersionCount()).isEqualTo(15);
         assertThat(current.validateWithResult().validationSuccessful).isTrue();
+        assertThat(current.info().current().getVersion()).isEqualTo(MigrationVersion.fromVersion("14.3"));
 
         UUID leaseId = UUID.randomUUID();
         Instant now = Instant.now();

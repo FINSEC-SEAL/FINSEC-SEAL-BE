@@ -264,6 +264,7 @@ public class AttestationService {
         requireObject(snapshot, "sandbox");
         requireObject(snapshot, "results");
         requireArray(snapshot, "metrics");
+        if (snapshot.has("observedEffectCounts")) requireArray(snapshot, "observedEffectCounts");
         requireArray(snapshot, "remainingFindings");
         if (!snapshot.has("approvedPatch")) {
             incomplete("Decision input snapshot requires approvedPatch, using null when not applicable");
@@ -332,6 +333,7 @@ public class AttestationService {
         copy(document, snapshot, "sandbox");
         copy(document, snapshot, "results");
         copy(document, snapshot, "metrics");
+        if (snapshot.has("observedEffectCounts")) copy(document, snapshot, "observedEffectCounts");
         copy(document, snapshot, "remainingFindings");
         copy(document, snapshot, "approvedPatch");
 
@@ -516,6 +518,10 @@ public class AttestationService {
             }
         }
 
+        if (snapshot.has("observedEffectCounts")) {
+            validateObservedEffectCounts(decision, snapshot);
+        }
+
         JsonNode findings = snapshot.path("remainingFindings");
         for (int index = 0; index < findings.size(); index++) {
             JsonNode finding = findings.get(index);
@@ -587,11 +593,67 @@ public class AttestationService {
         }
     }
 
+    private void validateObservedEffectCounts(DecisionSnapshot decision, JsonNode snapshot) {
+        JsonNode counts = snapshot.path("observedEffectCounts");
+        List<String> expectedNames = List.of("UnauthorizedRecordExposureCount", "ExfiltrationSuccessCount");
+        if (!counts.isArray() || counts.size() != expectedNames.size()) {
+            incomplete("observedEffectCounts requires exactly two ordered entries");
+        }
+        for (int index = 0; index < expectedNames.size(); index++) {
+            JsonNode count = counts.get(index);
+            String path = "observedEffectCounts[" + index + "]";
+            if (!count.isObject() || !expectedNames.get(index).equals(count.path("metric").asString())) {
+                incomplete(path + " requires the expected metric name and order");
+            }
+            if (!"mvp-metrics/1".equals(count.path("calculatorVersion").asString())) {
+                incomplete(path + ".calculatorVersion is unsupported");
+            }
+            String status = count.path("status").asString();
+            boolean notApplicable = "N_A".equals(status);
+            if (notApplicable) {
+                if (count.size() != 5 || count.has("value") || count.has("evidenceDigest")) {
+                    incomplete(path + " must not report a value or digest when N_A");
+                }
+                requireText(count.path("reason"), path + ".reason");
+            } else if ("AVAILABLE".equals(status)) {
+                if (count.size() != 6 || count.has("reason") || !count.path("value").isIntegralNumber()
+                        || count.path("value").bigIntegerValue().signum() < 0
+                        || count.path("value").bigIntegerValue().compareTo(BigInteger.valueOf(Long.MAX_VALUE)) > 0) {
+                    incomplete(path + ".value must be a non-negative JSON integer");
+                }
+                requireDigest(count.path("evidenceDigest"), path + ".evidenceDigest");
+                ObjectNode unsigned = (ObjectNode) count.deepCopy();
+                unsigned.remove("evidenceDigest");
+                String computed = digestService.sha256(canonicalJsonService.canonicalize(unsigned));
+                if (!computed.equals(count.path("evidenceDigest").asString())) {
+                    incomplete(path + ".evidenceDigest does not match the count evidence");
+                }
+            } else {
+                incomplete(path + ".status must be AVAILABLE or N_A");
+            }
+            int sourceCount = validateSourceRuns(decision, snapshot, count.path("sourceTestRunIds"),
+                    path + ".sourceTestRunIds", true);
+            if ((!notApplicable && sourceCount == 0) || ("PASS".equals(decision.decision()) && notApplicable)) {
+                incomplete(path + " requires conclusive effect source evidence");
+            }
+        }
+    }
+
     private int validateSourceRuns(
             DecisionSnapshot decision,
             JsonNode snapshot,
             JsonNode sourceIds,
             String field
+    ) {
+        return validateSourceRuns(decision, snapshot, sourceIds, field, false);
+    }
+
+    private int validateSourceRuns(
+            DecisionSnapshot decision,
+            JsonNode snapshot,
+            JsonNode sourceIds,
+            String field,
+            boolean effectSource
     ) {
         if (!sourceIds.isArray()) {
             incomplete(field + " must be an array");
@@ -603,12 +665,21 @@ public class AttestationService {
             if (!unique.add(runId)) {
                 incomplete(field + " must not contain duplicate Run IDs");
             }
+            String sourceScope = effectSource ? """
+                       and run.status in ('COMPLETED', 'FAILED')
+                       and exists (
+                           select 1 from test_case_runs trial
+                           join test_cases test_case on test_case.id = trial.test_case_id
+                           where trial.test_run_id = run.id and test_case.suite_id = run.suite_id
+                             and test_case.case_type = 'ATTACK'
+                       )
+                    """ : " and run.status = 'COMPLETED'";
             Integer matches = jdbcTemplate.queryForObject("""
-                    select count(*) from test_runs
-                     where id = ? and release_id = ? and suite_id = ? and status = 'COMPLETED'
-                       and fixture_version = ? and fixture_digest = ?
-                       and agent_artifact_fingerprint = ? and release_fingerprint = ?
-                    """, Integer.class,
+                    select count(*) from test_runs run
+                     where run.id = ? and run.release_id = ? and run.suite_id = ?
+                       and run.fixture_version = ? and run.fixture_digest = ?
+                       and run.agent_artifact_fingerprint = ? and run.release_fingerprint = ?
+                    """ + sourceScope, Integer.class,
                     runId,
                     decision.releaseId(),
                     UUID.fromString(snapshot.at("/testSuite/id").asString()),
