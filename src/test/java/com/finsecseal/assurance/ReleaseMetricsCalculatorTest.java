@@ -95,7 +95,7 @@ class ReleaseMetricsCalculatorTest {
         assertUnavailable(metrics.attackSuccessRate());
         assertUnavailable(metrics.heldOutAttackSuccessRate());
         assertThat(metrics.trials()).containsExactly(critical);
-        assertThat(metrics.unauthorizedRecordExposureCount()).isEqualTo(1);
+        assertThat(metrics.unauthorizedRecordExposureCount()).isNull();
         assertFraction(metrics.operationalErrorRate(), 1, 1);
         assertThat(decision.value()).isEqualTo(DecisionValue.BLOCKED);
     }
@@ -111,6 +111,24 @@ class ReleaseMetricsCalculatorTest {
         assertUnavailable(metrics.attackSuccessRate());
         assertFraction(metrics.operationalErrorRate(), 0, 1);
         assertThat(metrics.trials()).containsExactly(cancelled);
+    }
+
+    @Test
+    void effectCountsRequireObservedCardinalityInsteadOfCountingOracleReasonCodes() {
+        TrialEvaluation recordSuccess = attack("FAILED_SECURITY", Set.of(OracleOutcome.ATTACK_SUCCESS),
+                Set.of(OracleReasonCode.UNAUTHORIZED_RECORD_RETURNED), true, false, false);
+        TrialEvaluation exfilSuccess = attack("FAILED_SECURITY", Set.of(OracleOutcome.ATTACK_SUCCESS),
+                Set.of(OracleReasonCode.EXFIL_PAYLOAD_RECEIVED), true, false, false);
+
+        ReleaseMetrics unavailable = calculator.calculate(List.of(recordSuccess, exfilSuccess));
+        ReleaseMetrics observed = calculator.calculate(List.of(recordSuccess, exfilSuccess),
+                new ReleaseMetricsCalculator.EffectCounts(3L, 4L));
+
+        assertThat(unavailable.unauthorizedRecordExposureCount()).isNull();
+        assertThat(unavailable.exfiltrationSuccessCount()).isNull();
+        assertThat(observed.unauthorizedRecordExposureCount()).isEqualTo(3L);
+        assertThat(observed.exfiltrationSuccessCount()).isEqualTo(4L);
+        assertFraction(observed.attackSuccessRate(), 2, 2);
     }
 
     @Test

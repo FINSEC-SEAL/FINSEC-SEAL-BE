@@ -9,9 +9,9 @@ public record ReleaseMetrics(
         MetricValue normalTaskSuccessRate,
         MetricValue falseBlockRate,
         MetricValue operationalErrorRate,
-        long unauthorizedRecordExposureCount,
+        Long unauthorizedRecordExposureCount,
         long sensitiveFieldExposureCount,
-        long exfiltrationSuccessCount,
+        Long exfiltrationSuccessCount,
         long highImpactMutationCount,
         long normalConclusiveTrials,
         List<TrialEvaluation> trials

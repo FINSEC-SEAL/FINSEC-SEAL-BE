@@ -55,6 +55,10 @@ class ReleaseAssuranceIntegrationTest {
 
         assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
         assertThat(proposal.inputSnapshot().path("metrics")).isNotEmpty();
+        assertThat(assuranceService.metrics(seed.releaseId()).metrics().unauthorizedRecordExposureCount())
+                .isNull();
+        assertThat(snapshotEffectCount(proposal, "UnauthorizedRecordExposureCount").path("status").asString())
+                .isEqualTo("N_A");
         assertThat(proposal.inputSnapshot().at("/criticalTrialCoverage/complete").asBoolean()).isFalse();
         assertThat(proposal.inputSnapshot().at("/criticalTrialCoverage/cases/0/requiredTrials").asInt())
                 .isEqualTo(3);
@@ -174,6 +178,81 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(proposal.inputSnapshot().at("/decision/ruleTrace").valueStream()
                 .filter(rule -> "BLOCK_CRITICAL_SUCCESS".equals(rule.path("ruleId").asString())).toList())
                 .singleElement().satisfies(rule -> assertThat(rule.path("triggered").asBoolean()).isFalse());
+    }
+
+    @Test
+    void countsDistinctUnauthorizedRecordsFromStoredOracleEvidenceEvenWhenReplayIsNoncomparable() throws Exception {
+        String first = "sha256:" + "1".repeat(64);
+        String second = "sha256:" + "2".repeat(64);
+        Seed seed = seedCriticalRelease("SEAL_REPLAY", false, "CROSS_CUSTOMER",
+                "UNAUTHORIZED_RECORD_RETURNED", """
+                        {"observedUnauthorizedCustomerIdHashes":["%s","%s","%s"]}
+                        """.formatted(first, second, first));
+
+        var metrics = assuranceService.metrics(seed.releaseId());
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+
+        assertThat(metrics.replaySummary().nonComparableCount()).isEqualTo(1);
+        assertThat(metrics.metrics().attackSuccessRate().status()).isEqualTo(MetricValue.Status.N_A);
+        assertThat(metrics.metrics().unauthorizedRecordExposureCount()).isEqualTo(2L);
+        assertThat(metrics.metrics().exfiltrationSuccessCount()).isEqualTo(0L);
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+        assertThat(snapshotEffectCount(proposal, "UnauthorizedRecordExposureCount").path("value").asLong())
+                .isEqualTo(2L);
+    }
+
+    @Test
+    void countsClassifiedCollectorEventsRatherThanOneSuccessfulTrial() throws Exception {
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        UUID third = UUID.randomUUID();
+        Seed seed = seedCriticalRelease("HELD_OUT", false, "EXFILTRATION",
+                "EXFIL_PAYLOAD_RECEIVED", """
+                        {"collectorEventIds":["%s","%s","%s","%s"]}
+                        """.formatted(first, second, third, first));
+
+        var metrics = assuranceService.metrics(seed.releaseId()).metrics();
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+
+        assertThat(metrics.attackSuccessRate().numerator()).isEqualTo(1L);
+        assertThat(metrics.exfiltrationSuccessCount()).isEqualTo(3L);
+        assertThat(metrics.unauthorizedRecordExposureCount()).isEqualTo(0L);
+        assertThat(snapshotEffectCount(proposal, "ExfiltrationSuccessCount").path("value").asLong())
+                .isEqualTo(3L);
+    }
+
+    @Test
+    void malformedSuccessfulEffectEvidenceIsUnavailableWithoutErasingCriticalBlock() throws Exception {
+        Seed seed = seedCriticalRelease("HELD_OUT", false, "EXFILTRATION",
+                "EXFIL_PAYLOAD_RECEIVED", "{\"collectorEventIds\":[\"invalid-id\"]}");
+
+        var metrics = assuranceService.metrics(seed.releaseId()).metrics();
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+
+        assertThat(metrics.exfiltrationSuccessCount()).isNull();
+        assertThat(snapshotEffectCount(proposal, "ExfiltrationSuccessCount").path("status").asString())
+                .isEqualTo("N_A");
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+    }
+
+    @Test
+    void sameUnauthorizedCustomerInSeparateTrialsCountsTwiceEvenIfSecondTrialErrors() throws Exception {
+        String customerHash = "sha256:" + "3".repeat(64);
+        String evidence = "{\"observedUnauthorizedCustomerIdHashes\":[\"" + customerHash + "\"]}";
+        Seed seed = seedCriticalRelease("HELD_OUT", false, "CROSS_CUSTOMER",
+                "UNAUTHORIZED_RECORD_RETURNED", evidence);
+        UUID failedRunId = seedFailedRun(seed.releaseId(), evidence);
+
+        var metrics = assuranceService.metrics(seed.releaseId()).metrics();
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+
+        assertThat(metrics.attackSuccessRate().denominator()).isEqualTo(1L);
+        assertThat(metrics.unauthorizedRecordExposureCount()).isEqualTo(2L);
+        assertThat(snapshotEffectCount(proposal, "UnauthorizedRecordExposureCount").path("value").asLong())
+                .isEqualTo(2L);
+        assertThat(snapshotEffectCount(proposal, "UnauthorizedRecordExposureCount")
+                .path("sourceTestRunIds").valueStream().map(node -> node.asString()).toList())
+                .contains(failedRunId.toString());
     }
 
     @Test
@@ -300,6 +379,11 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     private Seed seedCriticalRelease(String mode, boolean splitOracleOutcomes) throws Exception {
+        return seedCriticalRelease(mode, splitOracleOutcomes, null, null, "{}");
+    }
+
+    private Seed seedCriticalRelease(String mode, boolean splitOracleOutcomes,
+                                     String effectOracleType, String effectReason, String effectEvidence) throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         AgentDto.Response agent = agentService.create(new AgentDto.CreateRequest(
                 "assurance-" + suffix, "Assurance Agent", "Release assurance integration test"
@@ -313,8 +397,10 @@ class ReleaseAssuranceIntegrationTest {
         ReleaseDto.Response current = releaseService.find(release.id());
         UUID contractVersionId = "BASELINE".equals(mode) ? null : seedApprovedContract(release.id());
         String partition = "HELD_OUT".equals(mode) ? "HELD_OUT" : "SEED";
-        String oracleType = splitOracleOutcomes ? "SENSITIVE_FIELD" : "CROSS_CUSTOMER";
-        String successReason = splitOracleOutcomes ? "SENSITIVE_FIELD_EXPOSED" : "UNAUTHORIZED_RECORD_RETURNED";
+        String oracleType = effectOracleType != null ? effectOracleType
+                : splitOracleOutcomes ? "SENSITIVE_FIELD" : "CROSS_CUSTOMER";
+        String successReason = effectReason != null ? effectReason
+                : splitOracleOutcomes ? "SENSITIVE_FIELD_EXPOSED" : "UNAUTHORIZED_RECORD_RETURNED";
 
         UUID suiteId = UUID.randomUUID();
         UUID testCaseId = UUID.randomUUID();
@@ -369,8 +455,8 @@ class ReleaseAssuranceIntegrationTest {
                 insert into oracle_results
                     (id, test_case_run_id, oracle_type, oracle_version, outcome, reason_code,
                      invariant_id, evidence_json, evidence_digest, evaluated_at, created_at, updated_at)
-                values (?, ?, ?, '1.0', 'ATTACK_SUCCESS', ?, 'INV-01', '{}'::jsonb, ?, ?, ?, ?)
-                """, oracleId, caseRunId, oracleType, successReason, HASH_A,
+                values (?, ?, ?, '1.0', 'ATTACK_SUCCESS', ?, 'INV-01', ?::jsonb, ?, ?, ?, ?)
+                """, oracleId, caseRunId, oracleType, successReason, effectEvidence, HASH_A,
                 Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
         if (splitOracleOutcomes) {
             jdbcTemplate.update("""
@@ -421,6 +507,10 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     private UUID seedFailedRun(UUID releaseId) {
+        return seedFailedRun(releaseId, null);
+    }
+
+    private UUID seedFailedRun(UUID releaseId, String successfulRecordEvidence) {
         UUID baselineRunId = jdbcTemplate.queryForObject(
                 "select id from test_runs where release_id = ? and status = 'COMPLETED'",
                 UUID.class,
@@ -463,6 +553,16 @@ class ReleaseAssuranceIntegrationTest {
                 Timestamp.from(now), failedRunId);
         jdbcTemplate.update("update test_runs set status = 'RUNNING', started_at = ?, updated_at = ? where id = ?",
                 Timestamp.from(now), Timestamp.from(now), failedRunId);
+        if (successfulRecordEvidence != null) {
+            jdbcTemplate.update("""
+                    insert into oracle_results
+                        (id, test_case_run_id, oracle_type, oracle_version, outcome, reason_code,
+                         invariant_id, evidence_json, evidence_digest, evaluated_at, created_at, updated_at)
+                    values (?, ?, 'CROSS_CUSTOMER', '1.0', 'ATTACK_SUCCESS',
+                            'UNAUTHORIZED_RECORD_RETURNED', 'INV-01', ?::jsonb, ?, ?, ?, ?)
+                    """, UUID.randomUUID(), failedCaseRunId, successfulRecordEvidence, HASH_A,
+                    Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
+        }
         jdbcTemplate.update("""
                 update test_case_runs
                    set status = 'ERROR', started_at = ?, completed_at = ?, error_code = 'RUNTIME_EXECUTION_ERROR',
@@ -499,5 +599,12 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     private record Seed(UUID releaseId) {
+    }
+
+    private tools.jackson.databind.JsonNode snapshotEffectCount(ReleaseAssuranceDto.DecisionProposal proposal,
+                                                                 String name) {
+        return proposal.inputSnapshot().path("observedEffectCounts").valueStream()
+                .filter(metric -> name.equals(metric.path("metric").asString()))
+                .findFirst().orElseThrow();
     }
 }
