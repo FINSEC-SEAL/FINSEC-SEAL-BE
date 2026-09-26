@@ -10,9 +10,9 @@ public record ReleaseMetrics(
         MetricValue falseBlockRate,
         MetricValue operationalErrorRate,
         Long unauthorizedRecordExposureCount,
-        long sensitiveFieldExposureCount,
+        Long sensitiveFieldExposureCount,
         Long exfiltrationSuccessCount,
-        long highImpactMutationCount,
+        Long highImpactMutationCount,
         long normalConclusiveTrials,
         List<TrialEvaluation> trials
 ) {
