@@ -478,7 +478,7 @@ class SafetyContractValidationPreviewHttpIntegrationTest {
     }
 
     @Test
-    void freshOriginPostHasCorsHeadersWhileExistingSharedReplayOmitsThem() throws Exception {
+    void browserPreviewReplayRetainsCorsAndUntrustedOriginCannotReadCachedResponse() throws Exception {
         var release = release("valid-release-manifest-v1.1.json");
         String path = PREFIX + release.id();
         String body = mapper.writeValueAsString(contract());
@@ -486,17 +486,52 @@ class SafetyContractValidationPreviewHttpIntegrationTest {
         Map<String, String> domain = domainSnapshot();
         var fresh = postRaw(path, body, key, ACTOR, "application/json", Map.of("Origin", allowedOrigin()));
         data(fresh, "VALID");
-        assertThat(fresh.headers().firstValue("Access-Control-Allow-Origin")).contains(allowedOrigin());
+        assertAllowedBrowserCors(fresh);
         assertThat(domainSnapshot()).isEqualTo(domain);
         Map<String, String> middleware = middlewareSnapshot();
+
+        var untrusted = postRaw(path, body, key, ACTOR, "application/json",
+                Map.of("Origin", "https://untrusted.invalid"));
+        assertThat(untrusted.statusCode()).isEqualTo(403);
+        assertThat(untrusted.headers().firstValue("Access-Control-Allow-Origin")).isEmpty();
+        assertThat(untrusted.headers().firstValue("Idempotent-Replayed")).isEmpty();
+        assertThat(untrusted.body()).doesNotContain("previewOnly", "policyHash", "serverToolCatalogHash");
+        assertThat(domainSnapshot()).isEqualTo(domain);
+        assertThat(middlewareSnapshot()).isEqualTo(middleware);
 
         var replay = postRaw(path, body, key, ACTOR, "application/json", Map.of("Origin", allowedOrigin()));
 
         assertThat(replay.statusCode()).isEqualTo(200);
         assertThat(replay.body()).isEqualTo(fresh.body());
         assertThat(replay.headers().firstValue("Idempotent-Replayed")).contains("true");
-        // A's existing filter replays before MVC CORS handling; this is an owner integration limitation.
-        assertThat(replay.headers().firstValue("Access-Control-Allow-Origin")).isEmpty();
+        assertThat(replay.headers().firstValue("X-Trace-Id"))
+                .isEqualTo(fresh.headers().firstValue("X-Trace-Id"));
+        assertAllowedBrowserCors(replay);
+        assertThat(replay.headers().firstValue("Access-Control-Expose-Headers"))
+                .isEqualTo(fresh.headers().firstValue("Access-Control-Expose-Headers"));
+        assertThat(domainSnapshot()).isEqualTo(domain);
+        assertThat(middlewareSnapshot()).isEqualTo(middleware);
+    }
+
+    @Test
+    void browserPreviewEarlyErrorsRetainCorsWithoutDomainOrMiddlewareWrites() throws Exception {
+        var release = release("valid-release-manifest-v1.1.json");
+        String path = PREFIX + release.id();
+        String body = mapper.writeValueAsString(contract());
+        Map<String, String> domain = domainSnapshot();
+        Map<String, String> middleware = middlewareSnapshot();
+
+        var missingActor = postRaw(path, body, key(), null, "application/json",
+                Map.of("Origin", allowedOrigin()));
+        assertGuardProblem(missingActor, 400, "VALIDATION_ERROR");
+        assertAllowedBrowserCors(missingActor);
+        assertThat(domainSnapshot()).isEqualTo(domain);
+        assertThat(middlewareSnapshot()).isEqualTo(middleware);
+
+        var missingKey = postRaw(path, body, null, ACTOR, "application/json",
+                Map.of("Origin", allowedOrigin()));
+        assertGuardProblem(missingKey, 400, "VALIDATION_ERROR");
+        assertAllowedBrowserCors(missingKey);
         assertThat(domainSnapshot()).isEqualTo(domain);
         assertThat(middlewareSnapshot()).isEqualTo(middleware);
     }
@@ -609,6 +644,14 @@ class SafetyContractValidationPreviewHttpIntegrationTest {
 
     private String allowedOrigin() {
         return environment.getRequiredProperty("finsec.cors.allowed-origins").split(",")[0].trim();
+    }
+
+    private void assertAllowedBrowserCors(HttpResponse<?> response) {
+        assertThat(response.headers().allValues("Access-Control-Allow-Origin"))
+                .containsExactly(allowedOrigin());
+        assertThat(response.headers().firstValue("Access-Control-Allow-Credentials")).contains("true");
+        assertThat(response.headers().firstValue("Access-Control-Expose-Headers").orElseThrow())
+                .contains("X-Trace-Id", "Idempotent-Replayed");
     }
 
     private HttpResponse<String> preflight(String path, String origin, Map<String, String> extraHeaders)
