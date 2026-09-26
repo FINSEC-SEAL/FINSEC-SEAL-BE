@@ -116,7 +116,14 @@ public class ContractPersistenceService {
 
     @Transactional
     public Version create(UUID releaseId, JsonNode policy, ReviewerContext reviewer) {
+        return createReserved(releaseId, policy, reviewer, null);
+    }
+
+    @Transactional
+    public Version createReserved(UUID releaseId, JsonNode policy, ReviewerContext reviewer, VersionIdentity reservation) {
         ReleaseState release = lockRelease(releaseId, reviewer);
+        if (reservation == null && db.queryForObject("select count(*) from generation_operations where release_id=? and status in ('QUEUED','RUNNING')",Integer.class,releaseId)>0)
+            fail(ErrorCode.RESOURCE_CONFLICT,"A generation operation has reserved this Release");
         if (release.state().equals("DRAFT")) fail(ErrorCode.INVALID_STATE_TRANSITION,"Analyze the Release before creating a contract");
         var normalized = canonicalizer.canonicalizeAndHash(policy);
         JsonNode body = parse(normalized.canonicalJson());
@@ -131,7 +138,11 @@ public class ContractPersistenceService {
         contractId=db.queryForObject("select id from safety_contracts where release_id=? and contract_key=?",UUID.class,releaseId,key);
         Integer latest=db.queryForObject("select coalesce(max(version),0) from safety_contract_versions where contract_id=?",Integer.class,contractId);
         if (number != latest+1) fail(ErrorCode.RESOURCE_CONFLICT,"Contract version must follow the latest stored version");
-        UUID id=UuidV7.generate();
+        UUID id=reservation==null?UuidV7.generate():reservation.versionId();
+        if (reservation!=null && (!reservation.releaseId().equals(releaseId) || !reservation.workspaceId().equals(release.workspaceId())
+                || !reservation.contractKey().equals(key) || reservation.version()!=number
+                || db.queryForObject("select count(*) from generation_operations where version_id=? and release_id=? and contract_key=? and version=? and status='RUNNING' and lease_expires_at>now()",
+                    Integer.class,id,releaseId,key,number)!=1)) fail(ErrorCode.RESOURCE_CONFLICT,"Generation reservation no longer owns this version");
         Version v=new Version(id,release.workspaceId(),releaseId,key,number,"CANDIDATE",body,normalized.policyHash(),
                 "",release.policyHash(),json.createObjectNode(),json.createObjectNode());
         v=withHash(v);
@@ -224,6 +235,10 @@ public class ContractPersistenceService {
     /** C/B supply a candidate, never an accepted flag; the server reloads all source facts and reruns C. */
     @Transactional
     public StoredPatch storePatch(UUID findingId, UUID baseVersionId, ProposedPatch candidate, ReviewerContext reviewer) {
+        return storePatch(findingId, baseVersionId, candidate, reviewer, null);
+    }
+    @Transactional
+    public StoredPatch storePatch(UUID findingId, UUID baseVersionId, ProposedPatch candidate, ReviewerContext reviewer, VersionIdentity reservation) {
         Version base = find(baseVersionId, reviewer);
         lockRelease(base.releaseId(), reviewer);
         base = find(baseVersionId, reviewer);
@@ -233,7 +248,7 @@ public class ContractPersistenceService {
                 catalogs.load(base.releaseId(), reviewer.actorId()));
         if (decision.status() != Status.PROPOSED) fail(ErrorCode.VALIDATION_ERROR, "C rejected the proposed policy change");
         var accepted = decision.acceptedProposal().orElseThrow();
-        Version result = create(base.releaseId(), parse(accepted.resultPolicy().canonicalJson()), reviewer);
+        Version result = createReserved(base.releaseId(), parse(accepted.resultPolicy().canonicalJson()), reviewer, reservation);
         UUID id = UuidV7.generate();
         var operations = json.createArrayNode();
         for (var operation : accepted.operations()) {
@@ -249,6 +264,15 @@ public class ContractPersistenceService {
                 json.valueToTree(accepted.normalWorkflowImpact()).toString(), json.valueToTree(accepted.rollback()).toString(), proof.toString());
         record(result, reviewer, "CONTRACT_PATCH_STORED", base.resourceHash());
         return new StoredPatch(id, result);
+    }
+
+    @Transactional
+    public ProposalDecision assessPatch(UUID findingId,UUID baseId,ProposedPatch candidate,ReviewerContext reviewer) {
+        Version base=find(baseId,reviewer);
+        lockRelease(base.releaseId(),reviewer);
+        base=find(baseId,reviewer);
+        return patchPolicy.evaluate(patchSources.find(findingId,reviewer).facts(),snapshot(base),candidate,
+                catalogs.load(base.releaseId(),reviewer.actorId()));
     }
 
     private String verifyPatch(UUID proposalId, Version candidate, ReviewerContext reviewer) {
