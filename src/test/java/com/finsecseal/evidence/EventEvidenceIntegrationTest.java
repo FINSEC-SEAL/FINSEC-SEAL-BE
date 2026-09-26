@@ -326,6 +326,55 @@ class EventEvidenceIntegrationTest {
     }
 
     @Test
+    void browserAfterStartsAtSelectedCursorAndReconnectHeaderTakesPrecedence() throws Exception {
+        Seed seed = seedRun();
+        UUID traceId = UUID.randomUUID();
+        eventService.append(seed.runId(), new ExecutionEventDto.AppendRequest(
+                null, traceId, ExecutionEventType.RUN_STARTED, null,
+                null, null, null, null, objectMapper.createObjectNode()
+        ), "runtime-b");
+        eventService.append(seed.runId(), new ExecutionEventDto.AppendRequest(
+                null, traceId, ExecutionEventType.MODEL_REQUEST, null,
+                null, null, null, null, objectMapper.createObjectNode()
+        ), "runtime-b");
+
+        assertThat(firstSseEvent(seed.runId(), "?after=1", null))
+                .contains("id:2\n", "event:trace.event")
+                .doesNotContain("id:1\n");
+        assertThat(firstSseEvent(seed.runId(), "?after=0", "1"))
+                .contains("id:2\n", "event:trace.event")
+                .doesNotContain("id:1\n");
+        assertThat(firstSseEvent(seed.runId(), "", null))
+                .contains("id:1\n", "event:run.status");
+    }
+
+    @Test
+    void rejectsMalformedBrowserCursorBeforeOpeningAStream() throws Exception {
+        Seed seed = seedRun();
+        String base = "http://localhost:" + port + "/api/v1/test-runs/" + seed.runId() + "/events";
+        for (String query : List.of("?after=", "?after=-1", "?after=abc",
+                "?after=1&after=2", "?after=9223372036854775808")) {
+            HttpResponse<String> response = HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create(base + query))
+                            .header("Accept", "text/event-stream")
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString()
+            );
+            assertThat(response.statusCode()).as(query).isEqualTo(400);
+            assertThat(response.body()).as(query).contains("VALIDATION_ERROR");
+        }
+        HttpResponse<String> invalidHeader = HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create(base + "?after=0"))
+                        .header("Accept", "text/event-stream")
+                        .header("Last-Event-ID", "not-a-sequence")
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString()
+        );
+        assertThat(invalidHeader.statusCode()).isEqualTo(400);
+        assertThat(invalidHeader.body()).contains("VALIDATION_ERROR");
+    }
+
+    @Test
     void expiresOldSseCursorWhileKeepingIntactCanonicalHistory() throws Exception {
         Seed seed = seedRun();
         UUID oldEventId = insertOldStartedEvent(seed.runId());
@@ -353,6 +402,15 @@ class EventEvidenceIntegrationTest {
         );
         assertThat(expired.statusCode()).isEqualTo(410);
         assertThat(expired.body()).contains("STREAM_CURSOR_EXPIRED");
+        HttpResponse<String> expiredQuery = HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create(base + "/events?after=0"))
+                        .header("Accept", "text/event-stream")
+                        .timeout(Duration.ofSeconds(5))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString()
+        );
+        assertThat(expiredQuery.statusCode()).isEqualTo(410);
+        assertThat(expiredQuery.body()).contains("STREAM_CURSOR_EXPIRED");
         assertThat(eventService.streamReplayHistory(seed.runId(), 1, 10).items()).isEmpty();
 
         Seed newRun = seedRun();
@@ -629,6 +687,34 @@ class EventEvidenceIntegrationTest {
                        model_config_hash, 1
                   from test_runs where id = ?
                 """, UuidV7.generate(), foreignSuite, seed.runId()));
+    }
+
+    private String firstSseEvent(UUID runId, String query, String lastEventId) throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(
+                        "http://localhost:" + port + "/api/v1/test-runs/" + runId + "/events" + query))
+                .header("Accept", "text/event-stream")
+                .timeout(Duration.ofSeconds(5));
+        if (lastEventId != null) {
+            request.header("Last-Event-ID", lastEventId);
+        }
+        HttpResponse<java.io.InputStream> response = HttpClient.newHttpClient().send(
+                request.GET().build(), HttpResponse.BodyHandlers.ofInputStream()
+        );
+        assertThat(response.statusCode()).isEqualTo(200);
+        StringBuilder first = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(response.body()))) {
+            for (int lines = 0; lines < 12; lines++) {
+                String line = reader.readLine();
+                if (line == null) {
+                    break;
+                }
+                first.append(line).append('\n');
+                if (line.startsWith("data:")) {
+                    break;
+                }
+            }
+        }
+        return first.toString();
     }
 
     private Seed seedRun() {
