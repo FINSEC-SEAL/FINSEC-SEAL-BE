@@ -10,6 +10,7 @@ import com.finsecseal.release.DigestService;
 import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.time.Duration;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -29,6 +30,8 @@ import tools.jackson.databind.node.ObjectNode;
 public class ExecutionEventService {
 
     private static final String SCHEMA_VERSION = "1.0";
+    private static final long STREAM_REPLAY_EVENT_LIMIT = 10_000;
+    private static final Duration STREAM_REPLAY_AGE_LIMIT = Duration.ofDays(7);
     private static final Set<String> TERMINAL_RUN_STATUSES = Set.of("COMPLETED", "FAILED", "CANCELLED");
     private static final Set<ExecutionEventType> TERMINAL_EVENT_TYPES = Set.of(
             ExecutionEventType.RUN_COMPLETED,
@@ -265,6 +268,46 @@ public class ExecutionEventService {
             nextCursor = events.getLast().sequence();
         }
         return new ExecutionEventDto.History(List.copyOf(events), range.maximum(), nextCursor);
+    }
+
+    public ExecutionEventDto.History streamReplayHistory(UUID runId, long after, int limit) {
+        if (after < 0 || limit < 1 || limit > 1000) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "after must be non-negative and limit 1..1000");
+        }
+        requireRun(runId);
+        SequenceRange range = sequenceRange(runId);
+        if (after > range.maximum()) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Event cursor is ahead of stream head");
+        }
+
+        long countFloor = Math.max(1, range.maximum() - STREAM_REPLAY_EVENT_LIMIT + 1);
+        Long newestExpired = range.maximum() == 0 ? null : jdbcTemplate.query("""
+                select sequence
+                  from execution_events
+                 where run_id = ? and sequence >= ? and occurred_at < ?
+                 order by sequence desc
+                 limit 1
+                """, (resultSet, rowNumber) -> resultSet.getLong("sequence"),
+                runId,
+                countFloor,
+                Timestamp.from(Instant.now().minus(STREAM_REPLAY_AGE_LIMIT))
+        ).stream().findFirst().orElse(null);
+        long firstReplayable = firstStreamReplaySequence(range.minimum(), range.maximum(), newestExpired);
+        if (after < firstReplayable - 1) {
+            throw new BusinessException(ErrorCode.STREAM_CURSOR_EXPIRED, "Event cursor is outside stream replay retention");
+        }
+        return history(runId, after, limit);
+    }
+
+    static long firstStreamReplaySequence(Long physicalMinimum, long head, Long newestExpired) {
+        long first = Math.max(1, head - STREAM_REPLAY_EVENT_LIMIT + 1);
+        if (physicalMinimum != null) {
+            first = Math.max(first, physicalMinimum);
+        }
+        if (newestExpired != null) {
+            first = Math.max(first, newestExpired + 1);
+        }
+        return first;
     }
 
     public ExecutionEventDto.ChainVerification verifyChain(UUID runId) {
