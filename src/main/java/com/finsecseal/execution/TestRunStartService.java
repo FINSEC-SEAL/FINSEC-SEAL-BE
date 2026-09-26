@@ -77,7 +77,10 @@ public class TestRunStartService {
                         "Release not found"
                 ));
 
-        String fixtureDigest = fixtureService.fixtureDigest();
+        String fixtureVersion = jdbcTemplate.queryForObject(
+                "select fixture_version from test_suites where id = ?",
+                String.class, request.suiteId());
+        String fixtureDigest = fixtureService.fixtureDigest(fixtureVersion);
         String modelConfigHash = fingerprintService.hash(
                 release.getManifestJson().path("model")
         );

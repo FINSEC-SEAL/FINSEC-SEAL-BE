@@ -4,7 +4,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.finsecseal.attack.AttackSeedCatalog;
 import com.finsecseal.attack.AttackVariantFactory;
+import com.finsecseal.common.domain.ExecutionEventType;
 import com.finsecseal.common.domain.TestRunMode;
+import com.finsecseal.evidence.ExecutionEventDto;
+import com.finsecseal.evidence.ExecutionEventService;
 import com.finsecseal.evidence.TestRunPersistenceDto;
 import com.finsecseal.evidence.TestRunPersistenceService;
 import com.finsecseal.runtime.ai.AgentAiClient;
@@ -24,6 +27,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.JsonNode;
 
 @Testcontainers
 @SpringBootTest
@@ -42,6 +46,7 @@ class Fa03QuarantinedFlowIntegrationTest {
     @Autowired ObjectMapper objectMapper;
     @Autowired TestRunPersistenceService runPersistenceService;
     @Autowired SandboxFixtureService fixtureService;
+    @Autowired ExecutionEventService eventService;
     @Autowired Fa03ExecutionOrchestrator orchestrator;
     @Autowired AttackSeedCatalog attackSeedCatalog;
     @Autowired AttackVariantFactory attackVariantFactory;
@@ -98,6 +103,33 @@ class Fa03QuarantinedFlowIntegrationTest {
                    and reason_code = 'AGENT_TOOL_RESULT_QUARANTINED'
                 """, String.class, seed.runId());
         assertThat(deliveryStatus).isEqualTo("QUARANTINED");
+
+        ExecutionEventDto.Event delivery = eventService.history(seed.runId(), 0, 1000)
+                .items().stream()
+                .filter(event -> event.eventType() == ExecutionEventType.MODEL_RESPONSE
+                        && "AGENT_TOOL_RESULT_QUARANTINED".equals(event.reasonCode()))
+                .findFirst().orElseThrow();
+        JsonNode metadata = delivery.metadata().path("customerFieldDeliveryEvidence");
+        assertThat(metadata.size()).isEqualTo(9);
+        assertThat(metadata.path("schemaVersion").asString()).isEqualTo("1.0");
+        assertThat(metadata.path("hashAlgorithm").asString())
+                .isEqualTo("FINSEC_CUSTOMER_FIELD_HMAC_SHA256_CASE_RUN_RAW_UTF8_V1");
+        assertThat(metadata.path("hashKeyId").asString()).matches("[0-9a-f]{64}");
+        assertThat(metadata.path("status").asString()).isEqualTo("NOT_DELIVERED");
+        assertThat(metadata.path("responseRowCount").asInt()).isPositive();
+        assertThat(metadata.path("tuples")).isEmpty();
+        assertThat(delivery.output().path("accepted").asBoolean()).isFalse();
+        UUID sourceId = UUID.fromString(metadata.path("sourceToolResponseEventId").asString());
+        ExecutionEventDto.Event source = eventService.findById(sourceId);
+        assertThat(source.eventType()).isEqualTo(ExecutionEventType.TOOL_RESPONSE);
+        assertThat(source.runId()).isEqualTo(seed.runId());
+        assertThat(source.testCaseRunId()).isEqualTo(delivery.testCaseRunId());
+        assertThat(source.traceId()).isEqualTo(delivery.traceId());
+        assertThat(source.sequence()).isLessThan(delivery.sequence())
+                .isEqualTo(metadata.path("sourceToolResponseSequence").asLong());
+        assertThat(source.payloadDigest())
+                .isEqualTo(metadata.path("sourceToolResponsePayloadDigest").asString());
+        assertThat(metadata.toString()).doesNotContain("CUST-1001", "SYNTH-ACCT");
     }
 
     private Seed seedQueuedFa03Run() {
