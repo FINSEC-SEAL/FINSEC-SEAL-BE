@@ -569,6 +569,68 @@ class EventEvidenceIntegrationTest {
                 """, Integer.class, seed.runId())).isZero();
     }
 
+    @Test
+    void rejectsForeignWorkspaceSuiteBeforeRunInsertWhileKeepingDatabaseScopeGuard() {
+        Seed seed = seedRun();
+        UUID releaseId = jdbcTemplate.queryForObject(
+                "select release_id from test_runs where id = ?", UUID.class, seed.runId()
+        );
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from test_runs where id = ?", Integer.class, seed.runId()
+        )).isEqualTo(1);
+
+        UUID foreignWorkspace = UUID.randomUUID();
+        UUID foreignSuite = UuidV7.generate();
+        jdbcTemplate.update(
+                "insert into workspaces (id, name, mode) values (?, ?, 'DEMO')",
+                foreignWorkspace, "Foreign Run Suite " + foreignSuite
+        );
+        jdbcTemplate.update("""
+                insert into test_suites
+                    (id, workspace_id, suite_key, version, fixture_version, generation_config_json,
+                     suite_hash, status)
+                values (?, ?, ?, '1.0.0', 'foreign-v1', '{}'::jsonb, ?, 'BUILDING')
+                """, foreignSuite, foreignWorkspace, "foreign-suite-" + foreignSuite, HASH_A);
+        jdbcTemplate.update("update test_suites set status = 'READY' where id = ?", foreignSuite);
+
+        int runsBefore = jdbcTemplate.queryForObject(
+                "select count(*) from test_runs where release_id = ?", Integer.class, releaseId
+        );
+        int auditsBefore = jdbcTemplate.queryForObject("""
+                select count(*) from audit_records
+                 where workspace_id = ? and action = 'TEST_RUN_REGISTERED'
+                """, Integer.class, WORKSPACE_ID);
+        assertThatThrownBy(() -> runPersistenceService.register(
+                new TestRunPersistenceDto.RegisterRequest(
+                        releaseId, foreignSuite, null, TestRunMode.BASELINE, null,
+                        objectMapper.createObjectNode(), HASH_A, HASH_B, 42L, 1
+                ),
+                "orchestrator-b"
+        )).isInstanceOfSatisfying(BusinessException.class, exception -> {
+            assertThat(exception.errorCode()).isEqualTo(ErrorCode.RESOURCE_NOT_FOUND);
+            assertThat(exception.getMessage())
+                    .doesNotContain(foreignSuite.toString(), foreignWorkspace.toString());
+        });
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from test_runs where release_id = ?", Integer.class, releaseId
+        )).isEqualTo(runsBefore);
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from audit_records
+                 where workspace_id = ? and action = 'TEST_RUN_REGISTERED'
+                """, Integer.class, WORKSPACE_ID)).isEqualTo(auditsBefore);
+
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                insert into test_runs
+                    (id, release_id, suite_id, mode, status, agent_artifact_fingerprint,
+                     release_fingerprint, config_json, fixture_version, fixture_digest,
+                     model_config_hash, total_cases)
+                select ?, release_id, ?, mode, 'QUEUED', agent_artifact_fingerprint,
+                       release_fingerprint, '{}'::jsonb, fixture_version, fixture_digest,
+                       model_config_hash, 1
+                  from test_runs where id = ?
+                """, UuidV7.generate(), foreignSuite, seed.runId()));
+    }
+
     private Seed seedRun() {
         UUID agentId = UUID.randomUUID();
         UUID releaseId = UUID.randomUUID();
