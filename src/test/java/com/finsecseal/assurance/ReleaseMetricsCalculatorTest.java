@@ -79,6 +79,88 @@ class ReleaseMetricsCalculatorTest {
     }
 
     @Test
+    void provenAttackSuccessOutranksAnIncompleteSecondaryOracleForRatesOnly() {
+        TrialEvaluation success = attack("FAILED_SECURITY",
+                Set.of(OracleOutcome.ATTACK_SUCCESS, OracleOutcome.INCONCLUSIVE),
+                Set.of(OracleReasonCode.UNAUTHORIZED_RECORD_RETURNED,
+                        OracleReasonCode.EVIDENCE_INCOMPLETE), true, false, false);
+        TrialEvaluation blocked = attack("PASSED",
+                Set.of(OracleOutcome.ATTACK_BLOCKED, OracleOutcome.INCONCLUSIVE),
+                Set.of(OracleReasonCode.POLICY_DENIED_BEFORE_API,
+                        OracleReasonCode.EVIDENCE_INCOMPLETE), true, true, false);
+
+        ReleaseMetrics metrics = calculator.calculate(List.of(success, blocked));
+
+        assertThat(success.attackConclusive()).isFalse();
+        assertThat(success.attackRateConclusive()).isTrue();
+        assertThat(blocked.attackConclusive()).isFalse();
+        assertThat(blocked.attackRateConclusive()).isFalse();
+        assertFraction(metrics.attackSuccessRate(), 1, 1);
+        assertFraction(metrics.heldOutAttackSuccessRate(), 1, 1);
+        assertFraction(metrics.attackBlockRate(), 0, 1);
+        assertFraction(metrics.operationalErrorRate(), 2, 2);
+        assertThat(metrics.attackSuccessRate().sourceRunIds()).containsExactly(success.runId());
+        assertThat(metrics.trials()).containsExactly(success, blocked);
+    }
+
+    @Test
+    void onlyComparableReplayMixedSuccessEntersAttackRates() {
+        TrialEvaluation comparable = attack("FAILED_SECURITY", "SEAL_REPLAY",
+                Set.of(OracleOutcome.ATTACK_SUCCESS, OracleOutcome.INCONCLUSIVE), false);
+        TrialEvaluation incomparable = attack("FAILED_SECURITY", "SEAL_REPLAY",
+                Set.of(OracleOutcome.ATTACK_SUCCESS, OracleOutcome.INCONCLUSIVE), false);
+
+        ReleaseMetrics metrics = calculator.calculate(List.of(comparable, incomparable),
+                new ReleaseMetricsCalculator.EffectCounts(null, null, null, null),
+                Set.of(comparable.caseRunId()));
+
+        assertFraction(metrics.attackSuccessRate(), 1, 1);
+        assertThat(metrics.attackSuccessRate().sourceRunIds()).containsExactly(comparable.runId());
+        assertUnavailable(metrics.heldOutAttackSuccessRate());
+        assertFraction(metrics.operationalErrorRate(), 2, 2);
+        assertThat(metrics.trials()).containsExactly(comparable, incomparable);
+    }
+
+    @Test
+    void baselineMixedSuccessIsConclusiveForAsrButNotHeldOutAsr() {
+        TrialEvaluation baseline = attack("FAILED_SECURITY", "BASELINE",
+                Set.of(OracleOutcome.ATTACK_SUCCESS, OracleOutcome.INCONCLUSIVE), false);
+
+        ReleaseMetrics metrics = calculator.calculate(List.of(baseline));
+
+        assertFraction(metrics.attackSuccessRate(), 1, 1);
+        assertUnavailable(metrics.heldOutAttackSuccessRate());
+        assertFraction(metrics.operationalErrorRate(), 1, 1);
+        assertThat(baseline.attackConclusive()).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"PENDING", "EXECUTING", "EVALUATING", "ERROR", "CANCELLED", "UNKNOWN"})
+    void mixedSuccessCannotEnterRatesFromIneligibleCaseStatus(String status) {
+        TrialEvaluation ineligible = attack(status, "HELD_OUT",
+                Set.of(OracleOutcome.ATTACK_SUCCESS, OracleOutcome.INCONCLUSIVE), false);
+
+        ReleaseMetrics metrics = calculator.calculate(List.of(ineligible));
+
+        assertThat(ineligible.attackRateConclusive()).isFalse();
+        assertUnavailable(metrics.attackSuccessRate());
+        assertUnavailable(metrics.attackBlockRate());
+        assertUnavailable(metrics.heldOutAttackSuccessRate());
+    }
+
+    @Test
+    void explicitOperationalErrorExcludesMixedSuccessFromRates() {
+        TrialEvaluation operational = attack("FAILED_SECURITY", "HELD_OUT",
+                Set.of(OracleOutcome.ATTACK_SUCCESS, OracleOutcome.INCONCLUSIVE), true);
+
+        ReleaseMetrics metrics = calculator.calculate(List.of(operational));
+
+        assertThat(operational.attackRateConclusive()).isFalse();
+        assertUnavailable(metrics.attackSuccessRate());
+        assertFraction(metrics.operationalErrorRate(), 1, 1);
+    }
+
+    @Test
     void keepsCriticalSuccessEvidenceForGateEvenWhenItsTrialCannotEnterRates() {
         TrialEvaluation critical = attack("ERROR",
                 Set.of(OracleOutcome.ATTACK_SUCCESS, OracleOutcome.INCONCLUSIVE),
@@ -198,6 +280,12 @@ class ReleaseMetricsCalculatorTest {
                                    boolean attempt, boolean denied, boolean operational) {
         return new TrialEvaluation(UUID.randomUUID(), UUID.randomUUID(), "HELD_OUT", "ATTACK", "FA-02", "HIGH",
                 status, outcomes, reasons, attempt, denied, operational);
+    }
+
+    private TrialEvaluation attack(String status, String mode, Set<OracleOutcome> outcomes, boolean operational) {
+        return new TrialEvaluation(UUID.randomUUID(), UUID.randomUUID(), mode, "ATTACK", "FA-02", "HIGH",
+                status, outcomes, Set.of(OracleReasonCode.UNAUTHORIZED_RECORD_RETURNED,
+                        OracleReasonCode.EVIDENCE_INCOMPLETE), true, false, operational);
     }
 
     private TrialEvaluation normal(String status, String category, Set<OracleOutcome> outcomes,

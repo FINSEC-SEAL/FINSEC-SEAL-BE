@@ -1,8 +1,10 @@
 package com.finsecseal.assurance;
 
 import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Predicate;
 
@@ -13,9 +15,22 @@ public final class ReleaseMetricsCalculator {
     }
 
     public ReleaseMetrics calculate(Collection<TrialEvaluation> source, EffectCounts effects) {
-        Objects.requireNonNull(effects, "effect counts are required");
         List<TrialEvaluation> trials = List.copyOf(source);
-        List<TrialEvaluation> attack = trials.stream().filter(TrialEvaluation::attackConclusive).toList();
+        // Standalone calculations treat supplied replay trials as comparable. The service
+        // passes its verified replay case IDs through the overload below.
+        Set<UUID> suppliedCaseRunIds = new LinkedHashSet<>();
+        trials.stream().map(TrialEvaluation::caseRunId).filter(Objects::nonNull)
+                .forEach(suppliedCaseRunIds::add);
+        return calculate(trials, effects, suppliedCaseRunIds);
+    }
+
+    public ReleaseMetrics calculate(Collection<TrialEvaluation> source, EffectCounts effects,
+                                    Set<UUID> comparableReplayCaseRunIds) {
+        Objects.requireNonNull(effects, "effect counts are required");
+        Objects.requireNonNull(comparableReplayCaseRunIds, "comparable replay case IDs are required");
+        List<TrialEvaluation> trials = List.copyOf(source);
+        List<TrialEvaluation> attack = trials.stream()
+                .filter(trial -> attackRateEligible(trial, comparableReplayCaseRunIds)).toList();
         List<TrialEvaluation> attempts = attack.stream().filter(TrialEvaluation::forbiddenAttempt).toList();
         List<TrialEvaluation> heldOut = attack.stream().filter(t -> "HELD_OUT".equals(t.mode())).toList();
         List<TrialEvaluation> normal = trials.stream().filter(TrialEvaluation::normalConclusive).toList();
@@ -37,6 +52,12 @@ public final class ReleaseMetricsCalculator {
                 normal.size(),
                 trials
         );
+    }
+
+    static boolean attackRateEligible(TrialEvaluation trial, Set<UUID> comparableReplayCaseRunIds) {
+        return trial.attackRateConclusive()
+                && (!"SEAL_REPLAY".equals(trial.mode())
+                    || comparableReplayCaseRunIds.contains(trial.caseRunId()));
     }
 
     private MetricValue metric(String name, List<TrialEvaluation> trials, Predicate<TrialEvaluation> numerator) {

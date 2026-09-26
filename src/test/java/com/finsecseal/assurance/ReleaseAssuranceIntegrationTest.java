@@ -13,6 +13,7 @@ import com.finsecseal.common.domain.ExecutionEventType;
 import com.finsecseal.evidence.ExecutionEventDto;
 import com.finsecseal.evidence.ExecutionEventService;
 import com.finsecseal.release.ReleaseDto;
+import com.finsecseal.release.FingerprintService;
 import com.finsecseal.release.ReleaseService;
 import com.finsecseal.runtime.CustomerFieldDeliveryEvidence;
 import com.finsecseal.sandbox.SandboxFixtureService;
@@ -52,6 +53,7 @@ class ReleaseAssuranceIntegrationTest {
     @Autowired ReleaseAssuranceService assuranceService;
     @Autowired AgentService agentService;
     @Autowired ReleaseService releaseService;
+    @Autowired FingerprintService fingerprintService;
     @Autowired AttestationService attestationService;
     @Autowired JdbcTemplate jdbcTemplate;
     @Autowired ObjectMapper objectMapper;
@@ -192,6 +194,107 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(proposal.inputSnapshot().at("/decision/ruleTrace").valueStream()
                 .filter(rule -> "BLOCK_CRITICAL_SUCCESS".equals(rule.path("ruleId").asString())).toList())
                 .singleElement().satisfies(rule -> assertThat(rule.path("triggered").asBoolean()).isFalse());
+    }
+
+    @Test
+    void heldOutMixedOracleSuccessAppearsOnceInApiAndDecisionRatesWithoutCompletingEffects() throws Exception {
+        Seed seed = seedCriticalRelease("HELD_OUT", false, null, null, "{}", true);
+        UUID runId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+
+        var api = assuranceService.metrics(seed.releaseId());
+        var metrics = api.metrics();
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from oracle_results oracle
+                  join test_case_runs case_run on case_run.id = oracle.test_case_run_id
+                 where case_run.test_run_id = ?
+                """, Long.class, runId)).isEqualTo(2L);
+        assertThat(metrics.attackSuccessRate().numerator()).isEqualTo(1L);
+        assertThat(metrics.attackSuccessRate().denominator()).isEqualTo(1L);
+        assertThat(metrics.heldOutAttackSuccessRate().numerator()).isEqualTo(1L);
+        assertThat(metrics.heldOutAttackSuccessRate().denominator()).isEqualTo(1L);
+        assertThat(metrics.attackSuccessRate().sourceRunIds()).containsExactly(runId);
+        assertThat(metrics.operationalErrorRate().numerator()).isEqualTo(1L);
+        assertThat(metrics.operationalErrorRate().denominator()).isEqualTo(1L);
+        assertThat(proposal.inputSnapshot().at("/results/heldOut/numerator").asLong()).isEqualTo(1L);
+        assertThat(proposal.inputSnapshot().at("/results/heldOut/denominator").asLong()).isEqualTo(1L);
+        assertThat(proposal.inputSnapshot().at("/results/heldOut/sourceRunIds/0").asString())
+                .isEqualTo(runId.toString());
+        assertThat(proposal.inputSnapshot().at("/metrics/0/sourceTestRunIds/0").asString())
+                .isEqualTo(runId.toString());
+        assertThat(proposal.inputSnapshot().at("/criticalTrialCoverage/cases/0/conclusiveTrials").asLong())
+                .isZero();
+        assertThat(proposal.inputSnapshot().path("criticalSuccessEvidence").size()).isEqualTo(1);
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+        assertThat(metrics.unauthorizedRecordExposureCount()).isNull();
+        assertThat(metrics.sensitiveFieldExposureCount()).isNull();
+        assertThat(proposal.inputSnapshot().at("/decision/ruleTrace").valueStream()
+                .filter(rule -> "REVIEW_EVIDENCE".equals(rule.path("ruleId").asString())).toList())
+                .isEmpty(); // BLOCKED precedence stops before REVIEW rules.
+    }
+
+    @Test
+    void baselineMixedOracleSuccessCountsInBaselineFractionWithoutCriticalEnforceBlock() throws Exception {
+        Seed seed = seedCriticalRelease("BASELINE", false, null, null, "{}", true);
+        UUID runId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+
+        var metrics = assuranceService.metrics(seed.releaseId()).metrics();
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+
+        assertThat(metrics.attackSuccessRate().numerator()).isEqualTo(1L);
+        assertThat(metrics.attackSuccessRate().denominator()).isEqualTo(1L);
+        assertThat(metrics.operationalErrorRate().numerator()).isEqualTo(1L);
+        assertThat(proposal.inputSnapshot().at("/results/baseline/numerator").asLong()).isEqualTo(1L);
+        assertThat(proposal.inputSnapshot().at("/results/baseline/denominator").asLong()).isEqualTo(1L);
+        assertThat(proposal.inputSnapshot().at("/results/baseline/sourceRunIds/0").asString())
+                .isEqualTo(runId.toString());
+        assertThat(proposal.inputSnapshot().path("criticalSuccessEvidence")).isEmpty();
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+    }
+
+    @Test
+    void incomparableMixedReplayRetainsErrorAndCriticalEvidenceButHasNoRate() throws Exception {
+        Seed seed = seedCriticalRelease("SEAL_REPLAY", false, null, null, "{}", true);
+
+        var api = assuranceService.metrics(seed.releaseId());
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+
+        assertThat(api.replaySummary().nonComparableCount()).isEqualTo(1);
+        assertThat(api.metrics().attackSuccessRate().status()).isEqualTo(MetricValue.Status.N_A);
+        assertThat(api.metrics().operationalErrorRate().numerator()).isEqualTo(1L);
+        assertThat(proposal.inputSnapshot().at("/results/sealReplay/status").asString())
+                .isEqualTo("N_A");
+        assertThat(proposal.inputSnapshot().at("/criticalTrialCoverage/cases/0/conclusiveTrials").asLong())
+                .isZero();
+        assertThat(proposal.inputSnapshot().path("criticalSuccessEvidence").size()).isEqualTo(1);
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+    }
+
+    @Test
+    void comparableMixedReplayUsesVerifiedLinkForRateAndDecisionFraction() throws Exception {
+        Seed baseline = seedCriticalRelease("BASELINE");
+        UUID replayRunId = seedComparableMixedReplay(baseline.releaseId());
+
+        var api = assuranceService.metrics(baseline.releaseId());
+        var proposal = assuranceService.evaluate(baseline.releaseId(), "role-d");
+
+        assertThat(api.replaySummary().comparableCount()).isEqualTo(1);
+        assertThat(api.metrics().attackSuccessRate().numerator()).isEqualTo(2L);
+        assertThat(api.metrics().attackSuccessRate().denominator()).isEqualTo(2L);
+        assertThat(api.metrics().attackSuccessRate().sourceRunIds()).contains(replayRunId);
+        assertThat(proposal.inputSnapshot().at("/results/sealReplay/numerator").asLong()).isEqualTo(1L);
+        assertThat(proposal.inputSnapshot().at("/results/sealReplay/denominator").asLong()).isEqualTo(1L);
+        assertThat(proposal.inputSnapshot().at("/results/sealReplay/sourceRunIds/0").asString())
+                .isEqualTo(replayRunId.toString());
+        assertThat(proposal.inputSnapshot().at("/metrics/0/sourceTestRunIds").valueStream()
+                .map(id -> id.asString()).toList()).contains(replayRunId.toString());
+        assertThat(proposal.inputSnapshot().at("/criticalTrialCoverage/cases/0/conclusiveTrials").asLong())
+                .isZero();
+        assertThat(proposal.inputSnapshot().path("criticalSuccessEvidence").size()).isEqualTo(1);
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
     }
 
     @Test
@@ -588,6 +691,111 @@ class ReleaseAssuranceIntegrationTest {
                 .containsExactly("REPLAY_LINK_MISSING");
     }
 
+    private UUID seedComparableMixedReplay(UUID releaseId) {
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ? and mode = 'BASELINE'",
+                UUID.class, releaseId);
+        UUID baselineCaseRunId = jdbcTemplate.queryForObject(
+                "select id from test_case_runs where test_run_id = ?", UUID.class, baselineRunId);
+        UUID findingId = jdbcTemplate.queryForObject(
+                "select id from findings where first_seen_run_id = ?", UUID.class, baselineRunId);
+        String agentFingerprint = jdbcTemplate.queryForObject(
+                "select agent_artifact_fingerprint from test_runs where id = ?", String.class, baselineRunId);
+        String baselineFingerprint = jdbcTemplate.queryForObject(
+                "select release_fingerprint from test_runs where id = ?", String.class, baselineRunId);
+        UUID contractVersionId = seedApprovedContract(releaseId);
+        String replayFingerprint = fingerprintService.releaseFingerprint(agentFingerprint, HASH_A);
+        assertThat(replayFingerprint).isNotEqualTo(baselineFingerprint);
+        jdbcTemplate.update("""
+                update agent_releases
+                   set lifecycle_state = 'REMEDIATION', effective_status = 'REMEDIATION'
+                 where id = ?
+                """, releaseId);
+        jdbcTemplate.update("""
+                update agent_releases
+                   set lifecycle_state = 'VERIFYING', effective_status = 'VERIFYING',
+                       safety_contract_hash = ?, release_fingerprint = ?
+                 where id = ?
+                """, HASH_A, replayFingerprint, releaseId);
+
+        UUID replayRunId = UUID.randomUUID();
+        UUID replayCaseRunId = UUID.randomUUID();
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        jdbcTemplate.update("""
+                insert into test_runs
+                    (id, release_id, suite_id, contract_version_id, mode, status,
+                     agent_artifact_fingerprint, release_fingerprint, config_json,
+                     fixture_version, fixture_digest, model_config_hash,
+                     baseline_pair_group_id, random_seed, total_cases, completed_cases,
+                     operational_error_count, started_at, completed_at, summary_json, created_at, updated_at)
+                select ?, release_id, suite_id, ?, 'SEAL_REPLAY', 'QUEUED',
+                       agent_artifact_fingerprint, ?, config_json, fixture_version, fixture_digest,
+                       model_config_hash, baseline_pair_group_id, random_seed,
+                       1, 0, 0, null, null, '{}'::jsonb, ?, ?
+                  from test_runs where id = ?
+                """, replayRunId, contractVersionId, replayFingerprint,
+                Timestamp.from(now), Timestamp.from(now), baselineRunId);
+        jdbcTemplate.update("""
+                insert into test_case_runs
+                    (id, test_run_id, test_case_id, trial_index, status, security_outcome,
+                     variant_hash, started_at, completed_at, result_json, created_at, updated_at)
+                select ?, ?, test_case_id, trial_index, 'PENDING', null,
+                       variant_hash, null, null, '{}'::jsonb, ?, ?
+                  from test_case_runs where id = ?
+                """, replayCaseRunId, replayRunId, Timestamp.from(now), Timestamp.from(now), baselineCaseRunId);
+        jdbcTemplate.update("""
+                update test_case_runs
+                   set status = 'FAILED_SECURITY', security_outcome = 'ATTACK_SUCCESS',
+                       started_at = ?, completed_at = ?, updated_at = ?
+                 where id = ?
+                """, Timestamp.from(now.minusSeconds(1)), Timestamp.from(now),
+                Timestamp.from(now), replayCaseRunId);
+        jdbcTemplate.update("""
+                insert into oracle_results
+                    (id, test_case_run_id, oracle_type, oracle_version, outcome, reason_code,
+                     invariant_id, evidence_json, evidence_digest, evaluated_at, created_at, updated_at)
+                values (?, ?, 'CROSS_CUSTOMER', '1.0', 'ATTACK_SUCCESS',
+                        'UNAUTHORIZED_RECORD_RETURNED', 'INV-01', '{}'::jsonb, ?, ?, ?, ?)
+                """, UUID.randomUUID(), replayCaseRunId, HASH_A,
+                Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
+        jdbcTemplate.update("""
+                insert into oracle_results
+                    (id, test_case_run_id, oracle_type, oracle_version, outcome, reason_code,
+                     invariant_id, evidence_json, evidence_digest, evaluated_at, created_at, updated_at)
+                values (?, ?, 'SENSITIVE_FIELD', '1.0', 'INCONCLUSIVE',
+                        'EVIDENCE_INCOMPLETE', 'INV-02', '{"evidenceComplete":false}'::jsonb, ?, ?, ?, ?)
+                """, UUID.randomUUID(), replayCaseRunId, HASH_A,
+                Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
+        jdbcTemplate.update("update test_runs set status = 'PREPARING', updated_at = ? where id = ?",
+                Timestamp.from(now.minusSeconds(2)), replayRunId);
+        jdbcTemplate.update("update test_runs set status = 'RUNNING', started_at = ?, updated_at = ? where id = ?",
+                Timestamp.from(now.minusSeconds(1)), Timestamp.from(now.minusSeconds(1)), replayRunId);
+        jdbcTemplate.update("insert into run_event_counters (run_id, last_sequence) values (?, 0)", replayRunId);
+        UUID traceId = UUID.randomUUID();
+        eventService.append(replayRunId, new ExecutionEventDto.AppendRequest(
+                null, traceId, ExecutionEventType.RUN_STARTED,
+                null, null, null, null, "RUN_STARTED", objectMapper.createObjectNode()
+        ), "test");
+        eventService.append(replayRunId, new ExecutionEventDto.AppendRequest(
+                null, traceId, ExecutionEventType.RUN_COMPLETED,
+                null, null, null, null, "RUN_COMPLETED", objectMapper.createObjectNode()
+        ), "test");
+        jdbcTemplate.update("""
+                update test_runs
+                   set status = 'COMPLETED', completed_cases = 1,
+                       completed_at = ?, updated_at = ? where id = ?
+                """, Timestamp.from(now), Timestamp.from(now), replayRunId);
+        jdbcTemplate.update("""
+                insert into replay_links
+                    (id, finding_id, baseline_case_run_id, replay_case_run_id,
+                     same_agent_artifact_fingerprint, same_fixture_digest, same_model_config,
+                     same_variant_hash, expected_policy_difference, comparison_json)
+                values (?, ?, ?, ?, true, true, true, true, true,
+                        '{"comparable":true}'::jsonb)
+                """, UUID.randomUUID(), findingId, baselineCaseRunId, replayCaseRunId);
+        return replayRunId;
+    }
+
     private Seed seedCriticalRelease() throws Exception {
         return seedCriticalRelease("HELD_OUT");
     }
@@ -602,6 +810,13 @@ class ReleaseAssuranceIntegrationTest {
 
     private Seed seedCriticalRelease(String mode, boolean splitOracleOutcomes,
                                      String effectOracleType, String effectReason, String effectEvidence) throws Exception {
+        return seedCriticalRelease(mode, splitOracleOutcomes, effectOracleType, effectReason,
+                effectEvidence, false);
+    }
+
+    private Seed seedCriticalRelease(String mode, boolean splitOracleOutcomes,
+                                     String effectOracleType, String effectReason, String effectEvidence,
+                                     boolean secondaryInconclusive) throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         AgentDto.Response agent = agentService.create(new AgentDto.CreateRequest(
                 "assurance-" + suffix, "Assurance Agent", "Release assurance integration test"
@@ -625,6 +840,7 @@ class ReleaseAssuranceIntegrationTest {
         UUID runId = UUID.randomUUID();
         UUID caseRunId = UUID.randomUUID();
         UUID oracleId = UUID.randomUUID();
+        UUID pairGroupId = UUID.randomUUID();
         Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
 
         jdbcTemplate.update("""
@@ -651,12 +867,14 @@ class ReleaseAssuranceIntegrationTest {
                 insert into test_runs
                     (id, release_id, suite_id, contract_version_id, mode, status, agent_artifact_fingerprint,
                      release_fingerprint, config_json, fixture_version, fixture_digest,
-                     model_config_hash, total_cases, completed_cases, operational_error_count,
+                     model_config_hash, baseline_pair_group_id, random_seed,
+                     total_cases, completed_cases, operational_error_count,
                      started_at, completed_at, summary_json, created_at, updated_at)
                 values (?, ?, ?, ?, ?, 'QUEUED', ?, ?, '{}'::jsonb, 'fixture-v1', ?, ?,
-                        1, 0, 0, null, null, '{}'::jsonb, ?, ?)
+                        ?, 17, 1, 0, 0, null, null, '{}'::jsonb, ?, ?)
                 """, runId, release.id(), suiteId, contractVersionId, mode, current.agentArtifactFingerprint(),
-                current.releaseFingerprint(), HASH_A, HASH_A, Timestamp.from(now), Timestamp.from(now));
+                current.releaseFingerprint(), HASH_A, HASH_A, pairGroupId,
+                Timestamp.from(now), Timestamp.from(now));
         jdbcTemplate.update("""
                 insert into test_case_runs
                     (id, test_run_id, test_case_id, trial_index, status, security_outcome,
@@ -676,6 +894,16 @@ class ReleaseAssuranceIntegrationTest {
                 values (?, ?, ?, '1.0', 'ATTACK_SUCCESS', ?, 'INV-01', ?::jsonb, ?, ?, ?, ?)
                 """, oracleId, caseRunId, oracleType, successReason, effectEvidence, HASH_A,
                 Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
+        if (secondaryInconclusive) {
+            jdbcTemplate.update("""
+                    insert into oracle_results
+                        (id, test_case_run_id, oracle_type, oracle_version, outcome, reason_code,
+                         invariant_id, evidence_json, evidence_digest, evaluated_at, created_at, updated_at)
+                    values (?, ?, 'SENSITIVE_FIELD', '1.0', 'INCONCLUSIVE',
+                            'EVIDENCE_INCOMPLETE', 'INV-02', '{"evidenceComplete":false}'::jsonb, ?, ?, ?, ?)
+                    """, UUID.randomUUID(), caseRunId, HASH_A,
+                    Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
+        }
         if (splitOracleOutcomes) {
             jdbcTemplate.update("""
                     insert into oracle_results
