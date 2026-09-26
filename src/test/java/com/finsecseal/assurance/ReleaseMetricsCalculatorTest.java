@@ -119,16 +119,25 @@ class ReleaseMetricsCalculatorTest {
                 Set.of(OracleReasonCode.UNAUTHORIZED_RECORD_RETURNED), true, false, false);
         TrialEvaluation exfilSuccess = attack("FAILED_SECURITY", Set.of(OracleOutcome.ATTACK_SUCCESS),
                 Set.of(OracleReasonCode.EXFIL_PAYLOAD_RECEIVED), true, false, false);
+        TrialEvaluation sensitiveSuccess = attack("FAILED_SECURITY", Set.of(OracleOutcome.ATTACK_SUCCESS),
+                Set.of(OracleReasonCode.CRITICAL_FIELD_EXPOSED), true, false, false);
+        TrialEvaluation mutationSuccess = attack("FAILED_SECURITY", Set.of(OracleOutcome.ATTACK_SUCCESS),
+                Set.of(OracleReasonCode.HIGH_IMPACT_STATE_MUTATED), true, false, false);
 
-        ReleaseMetrics unavailable = calculator.calculate(List.of(recordSuccess, exfilSuccess));
-        ReleaseMetrics observed = calculator.calculate(List.of(recordSuccess, exfilSuccess),
-                new ReleaseMetricsCalculator.EffectCounts(3L, 4L));
+        List<TrialEvaluation> trials = List.of(recordSuccess, exfilSuccess, sensitiveSuccess, mutationSuccess);
+        ReleaseMetrics unavailable = calculator.calculate(trials);
+        ReleaseMetrics observed = calculator.calculate(trials,
+                new ReleaseMetricsCalculator.EffectCounts(3L, null, 4L, 2L));
 
         assertThat(unavailable.unauthorizedRecordExposureCount()).isNull();
+        assertThat(unavailable.sensitiveFieldExposureCount()).isNull();
         assertThat(unavailable.exfiltrationSuccessCount()).isNull();
+        assertThat(unavailable.highImpactMutationCount()).isNull();
         assertThat(observed.unauthorizedRecordExposureCount()).isEqualTo(3L);
+        assertThat(observed.sensitiveFieldExposureCount()).isNull();
         assertThat(observed.exfiltrationSuccessCount()).isEqualTo(4L);
-        assertFraction(observed.attackSuccessRate(), 2, 2);
+        assertThat(observed.highImpactMutationCount()).isEqualTo(2L);
+        assertFraction(observed.attackSuccessRate(), 4, 4);
     }
 
     @Test
