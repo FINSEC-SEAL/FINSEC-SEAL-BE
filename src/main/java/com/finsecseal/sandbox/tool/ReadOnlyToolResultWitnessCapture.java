@@ -11,10 +11,15 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.LongSupplier;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -37,6 +42,9 @@ public final class ReadOnlyToolResultWitnessCapture {
     static final int MAX_RESPONSE_BYTES = 1024 * 1024;
     static final int MAX_RESPONSE_DEPTH = 64;
     static final int MAX_RESPONSE_NODES = 65_536;
+    private static final int MAX_CUSTOMER_ROWS = 20;
+    private static final int MAX_CUSTOMER_FIELDS = 20;
+    private static final int MAX_CUSTOMER_FIELD_NAME_LENGTH = 80;
     private static final int MAX_NUMERIC_DIGITS = 32 * 1024;
     private static final String FAILURE_MESSAGE = "Read-only Tool result witness is incomplete";
 
@@ -68,13 +76,14 @@ public final class ReadOnlyToolResultWitnessCapture {
             }
             // Copy with limits before redaction or canonicalization can traverse adapter-owned data.
             JsonNode snapshot = boundedSnapshot(raw.output());
+            CustomerFieldInventory customerFields = customerFields(adapter, snapshot);
             String digest = redactionService.redact(snapshot.deepCopy()).originalDigest();
             if (digest == null || !digest.matches("sha256:[0-9a-f]{64}")) {
                 throw incomplete();
             }
             CapturedResult result = new CapturedResult(
                     new ToolAdapter.ToolExecutionResult(snapshot, false), slot.captureId);
-            complete(key, slot, digest);
+            complete(key, slot, digest, customerFields);
             return result;
         } catch (RuntimeException exception) {
             fail(key, slot);
@@ -93,6 +102,7 @@ public final class ReadOnlyToolResultWitnessCapture {
                 throw incomplete();
             }
             slot.digest = null;
+            slot.customerFields = null;
             slot.state = State.CANCELLED;
         }
     }
@@ -106,8 +116,10 @@ public final class ReadOnlyToolResultWitnessCapture {
                     || slot.state != State.COMPLETE || slot.digest == null) {
                 throw incomplete();
             }
-            Witness witness = new Witness(key, captureId, slot.digest, false);
+            Witness witness = new Witness(key, captureId, slot.digest, false,
+                    Optional.ofNullable(slot.customerFields));
             slot.digest = null;
+            slot.customerFields = null;
             slot.state = State.CONSUMED;
             return witness;
         }
@@ -152,13 +164,15 @@ public final class ReadOnlyToolResultWitnessCapture {
         }
     }
 
-    private void complete(InvocationKey key, Slot slot, String digest) {
+    private void complete(InvocationKey key, Slot slot, String digest,
+            CustomerFieldInventory customerFields) {
         synchronized (slots) {
             expire(nanoTime.getAsLong());
             if (slots.get(key) != slot || slot.state != State.ACTIVE) {
                 throw incomplete();
             }
             slot.digest = digest;
+            slot.customerFields = customerFields;
             slot.state = State.COMPLETE;
         }
     }
@@ -168,6 +182,7 @@ public final class ReadOnlyToolResultWitnessCapture {
             expire(nanoTime.getAsLong());
             if (slots.get(key) == slot && slot.state == State.ACTIVE) {
                 slot.digest = null;
+                slot.customerFields = null;
                 slot.state = State.FAILED;
             }
         }
@@ -189,6 +204,42 @@ public final class ReadOnlyToolResultWitnessCapture {
         } catch (RuntimeException exception) {
             throw incomplete();
         }
+    }
+
+    /** Only the concrete customer adapter's returned snapshot can yield this partial field fact. */
+    private static CustomerFieldInventory customerFields(ToolAdapter adapter, JsonNode snapshot) {
+        if (!(adapter instanceof CustomerDataReadToolAdapter)) return null;
+        if (!snapshot.isObject() || snapshot.size() != 2
+                || !snapshot.has("status") || !snapshot.has("rows")
+                || !snapshot.path("status").isIntegralNumber()
+                || !snapshot.path("status").canConvertToInt()
+                || snapshot.path("status").intValue() != 200
+                || !snapshot.path("rows").isArray()
+                || snapshot.path("rows").size() > MAX_CUSTOMER_ROWS) {
+            throw incomplete();
+        }
+        List<List<String>> fieldsByRow = new ArrayList<>();
+        for (JsonNode row : snapshot.path("rows")) {
+            if (!row.isObject() || row.size() != 2
+                    || !row.path("customerId").isString()
+                    || row.path("customerId").stringValue().isBlank()
+                    || !row.path("fields").isObject()
+                    || row.path("fields").size() > MAX_CUSTOMER_FIELDS) {
+                throw incomplete();
+            }
+            List<String> fields = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            for (var field : row.path("fields").properties()) {
+                String name = field.getKey();
+                if (name == null || name.isBlank() || name.length() > MAX_CUSTOMER_FIELD_NAME_LENGTH
+                        || !name.equals(name.strip()) || !seen.add(name)) {
+                    throw incomplete();
+                }
+                fields.add(name);
+            }
+            fieldsByRow.add(List.copyOf(fields));
+        }
+        return new CustomerFieldInventory(fieldsByRow);
     }
 
     private static JsonNode copyNode(JsonNode node, int depth, Budget budget,
@@ -285,6 +336,7 @@ public final class ReadOnlyToolResultWitnessCapture {
         private final long reservedAt;
         private State state = State.ACTIVE;
         private String digest;
+        private CustomerFieldInventory customerFields;
 
         private Slot(UUID captureId, long reservedAt) {
             this.captureId = captureId;
@@ -312,8 +364,45 @@ public final class ReadOnlyToolResultWitnessCapture {
         }
     }
 
-    public record Witness(InvocationKey key, UUID captureId, String rawOutputDigest,
-            boolean reportedStateChanged) { }
+    /** Created only by one successful consume; names are not Sensitivity classifications. */
+    public static final class Witness {
+        private final InvocationKey key;
+        private final UUID captureId;
+        private final String rawOutputDigest;
+        private final boolean reportedStateChanged;
+        private final Optional<CustomerFieldInventory> customerFields;
+
+        private Witness(InvocationKey key, UUID captureId, String rawOutputDigest,
+                boolean reportedStateChanged, Optional<CustomerFieldInventory> customerFields) {
+            this.key = key;
+            this.captureId = captureId;
+            this.rawOutputDigest = rawOutputDigest;
+            this.reportedStateChanged = reportedStateChanged;
+            this.customerFields = customerFields;
+        }
+
+        public InvocationKey key() { return key; }
+        public UUID captureId() { return captureId; }
+        public String rawOutputDigest() { return rawOutputDigest; }
+        public boolean reportedStateChanged() { return reportedStateChanged; }
+        public Optional<CustomerFieldInventory> customerFields() { return customerFields; }
+
+        @Override public String toString() { return "ReadOnlyToolResultWitness[redacted]"; }
+    }
+
+    /** Row positions and exact returned field names only; no customer ID or value is retained. */
+    public static final class CustomerFieldInventory {
+        private final List<List<String>> fieldNamesByRow;
+
+        private CustomerFieldInventory(List<List<String>> fieldNamesByRow) {
+            this.fieldNamesByRow = List.copyOf(fieldNamesByRow);
+        }
+
+        public int rowCount() { return fieldNamesByRow.size(); }
+        public List<List<String>> fieldNamesByRow() { return fieldNamesByRow; }
+
+        @Override public String toString() { return "CustomerFieldInventory[redacted]"; }
+    }
 
     public record CapturedResult(ToolAdapter.ToolExecutionResult result, UUID captureId) {
         public CapturedResult {
@@ -327,5 +416,7 @@ public final class ReadOnlyToolResultWitnessCapture {
         public ToolAdapter.ToolExecutionResult result() {
             return new ToolAdapter.ToolExecutionResult(result.output().deepCopy(), false);
         }
+
+        @Override public String toString() { return "CapturedToolResult[redacted]"; }
     }
 }
