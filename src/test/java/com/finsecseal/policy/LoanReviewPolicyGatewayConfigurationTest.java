@@ -15,6 +15,7 @@ import com.finsecseal.evidence.RedactionService;
 import com.finsecseal.evidence.TestRunProjectionService;
 import com.finsecseal.policy.LoanReviewPolicyGateway.FailureCode;
 import com.finsecseal.policy.LoanReviewPolicyGateway.GatewayException;
+import com.finsecseal.policy.GatewayRuntimeObservations.InvocationKey;
 import com.finsecseal.release.ReleaseService;
 import com.finsecseal.runtime.ToolInvocation;
 import com.finsecseal.runtime.ToolProposal;
@@ -27,7 +28,7 @@ import com.finsecseal.sandbox.tool.TemporaryPolicyGatewayBridge;
 import com.finsecseal.sandbox.tool.ToolAdapter;
 import com.finsecseal.sandbox.tool.ToolDispatcher;
 import java.util.UUID;
-import java.util.function.Supplier;
+import java.time.Duration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -56,7 +57,8 @@ class LoanReviewPolicyGatewayConfigurationTest {
         if (!setting.equals("absent")) runner = runner.withPropertyValues("finsec.policy.gateway.enabled=" + setting);
         runner.run(context -> {
             assertThat(context).hasNotFailed().doesNotHaveBean(LoanReviewPolicyGateway.class)
-                    .doesNotHaveBean(GatewayRuntimeObservations.class).doesNotHaveBean(REVIEWER_BEAN)
+                    .doesNotHaveBean(GatewayRuntimeObservations.class)
+                    .doesNotHaveBean(GatewayReviewerContextSource.class).doesNotHaveBean(REVIEWER_BEAN)
                     .hasSingleBean(PolicyGateway.class).hasSingleBean(ToolDispatcher.class);
             assertThat(context.getBean(PolicyGateway.class)).isSameAs(context.getBean(TemporaryPolicyGatewayBridge.class));
             // Actual Dispatcher/validator reach the actual BASELINE-only bridge, which rejects this mode.
@@ -85,17 +87,25 @@ class LoanReviewPolicyGatewayConfigurationTest {
                     assertThat(LoanReviewPolicyGatewayConfiguration.REVIEWER_CONTEXT_BEAN).isEqualTo(REVIEWER_BEAN);
                     assertThat(context.getBeansOfType(PolicyGateway.class)).hasSize(2);
                     assertThat(context.getBean(PolicyGateway.class)).isSameAs(context.getBean(LoanReviewPolicyGateway.class));
-                    assertThat(provider.resolutions).as("Bean creation must retain, not resolve, the supplier").isZero();
+                    assertThat(provider.resolutions).as("Bean creation must not resolve reviewer identity").isZero();
                     ToolDispatcher dispatcher = context.getBean(ToolDispatcher.class);
                     expectAuthenticationFailure(dispatcher, fixture);
                     assertThat(provider.resolutions).isEqualTo(1);
+                    assertThat(provider.lastKey).isEqualTo(new InvocationKey(RUN, CASE_RUN, TRACE, CALL,
+                            "sha256:" + "a".repeat(64)));
+                    assertThat(provider.lastRemaining.toNanos()).isBetween(1L, Duration.ofSeconds(5).toNanos());
                     provider.current = reviewer(ACTOR, false);
                     expectAuthenticationFailure(dispatcher, fixture);
                     assertThat(provider.resolutions).isEqualTo(2);
                     provider.current = reviewer("different-fixture-actor", true);
                     expectAuthenticationFailure(dispatcher, fixture);
                     assertThat(provider.resolutions).isEqualTo(3);
-                    assertThat(fixture.adapter.validations).isEqualTo(3);
+                    provider.current = reviewer(ACTOR, true);
+                    provider.returnedKey = new InvocationKey(RUN, CASE_RUN, TRACE, UUID.randomUUID(),
+                            "sha256:" + "a".repeat(64));
+                    expectAuthenticationFailure(dispatcher, fixture);
+                    assertThat(provider.resolutions).isEqualTo(4);
+                    assertThat(fixture.adapter.validations).isEqualTo(4);
                     assertThat(fixture.adapter.executions).isZero();
                     // A BASELINE bridge fallback would append POLICY_EVALUATED; none of its effects occurred.
                     // These references are explicit mocks, never actual @Autowired objects passed to verify().
@@ -225,10 +235,18 @@ class LoanReviewPolicyGatewayConfigurationTest {
     }
 
     /** Deliberately synthetic and invalid for execution: this fixture does not authenticate any real actor. */
-    private static final class SyntheticReviewerProvider implements Supplier<ReviewerContext> {
+    private static final class SyntheticReviewerProvider implements GatewayReviewerContextSource {
         private ReviewerContext current;
+        private InvocationKey returnedKey;
+        private InvocationKey lastKey;
+        private Duration lastRemaining;
         private int resolutions;
-        @Override public ReviewerContext get() { resolutions++; return current; }
+        @Override public Resolution resolve(InvocationKey key, Duration remaining) {
+            resolutions++;
+            lastKey = key;
+            lastRemaining = GatewayRuntimeObservations.requireTimeout(remaining);
+            return new Resolution(returnedKey == null ? key : returnedKey, current);
+        }
     }
 
     private static final class ProbeAdapter implements ToolAdapter {

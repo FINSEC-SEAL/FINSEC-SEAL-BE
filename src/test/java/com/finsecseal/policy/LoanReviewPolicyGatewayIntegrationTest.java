@@ -163,6 +163,46 @@ class LoanReviewPolicyGatewayIntegrationTest {
         assertThat(output.getAll()).doesNotContain(PRIVATE);
     }
 
+    @Test
+    void mismatchedReviewerInvocationFailsBeforeAnyPgOwnerOrExecutionChange() throws Exception {
+        Seed seed = seed(TestRunMode.SEAL_REPLAY);
+        var observations = new PgObservations(seed, ClassificationMode.EXPLICIT_SYNTHETIC_POSITIVE);
+        var adapter = new ObservedCustomer(observations);
+        ToolInvocation invocation = propose(seed, customerProposal());
+        Snapshot before = snapshot();
+        Evidence beforeEvidence = evidence(seed);
+        List<InvocationKey> requested = new ArrayList<>();
+        GatewayReviewerContextSource reviewerSource = (key, remaining) -> {
+            requested.add(key);
+            assertThat(key.runId()).isEqualTo(seed.runId());
+            assertThat(key.caseRunId()).isEqualTo(seed.caseRunId());
+            assertThat(key.traceId()).isEqualTo(seed.context().traceId());
+            assertThat(key.toolCallId()).isEqualTo(invocation.toolCallId());
+            assertThat(key.requestDigest()).isEqualTo(invocation.requestDigest());
+            assertThat(remaining.toNanos()).isBetween(1L, Duration.ofSeconds(5).toNanos());
+            return new GatewayReviewerContextSource.Resolution(new InvocationKey(key.runId(),
+                    key.caseRunId(), key.traceId(), UUID.randomUUID(), key.requestDigest()), REVIEWER);
+        };
+        GatewayException failure = safe(catchThrowable(() ->
+                gateway(observations, adapter, reviewerSource).invoke(seed.context(), invocation, ACTOR)),
+                FailureCode.AUTHENTICATION_REQUIRED);
+        assertThat(failure.successfulSecurityBlock()).isFalse();
+        assertThat(requested).singleElement().satisfies(key ->
+                assertThat(key.toolCallId()).isEqualTo(invocation.toolCallId()));
+        assertThat(catalogCalls).isZero();
+        assertThat(policyAppends).isZero();
+        assertThat(sourceCanonicalizations).isZero();
+        assertThat(adapter.calls).isZero();
+        assertThat(observations.resolves).isZero();
+        assertThat(observations.registryCalls).isZero();
+        assertThat(observations.begins).isZero();
+        assertThat(observations.completes).isZero();
+        assertThat(evidence(seed)).isEqualTo(beforeEvidence);
+        assertThat(snapshot()).isEqualTo(before);
+        assertEvents(seed, ExecutionEventType.RUN_STARTED, ExecutionEventType.TOOL_PROPOSED);
+        assertGolden(seed);
+    }
+
     @ParameterizedTest @EnumSource(value = TestRunMode.class, names = {"BASELINE", "SEAL_REPLAY"})
     void conditionalSyntheticClassificationPositiveCommitsReadsAndDeliversThroughActualBCaller(TestRunMode mode) throws Exception {
         Seed seed = seed(mode);
@@ -705,7 +745,13 @@ class LoanReviewPolicyGatewayIntegrationTest {
     }
 
     private LoanReviewPolicyGateway gateway(PgObservations observations, ToolAdapter adapter) {
-        return new LoanReviewPolicyGateway(transactions, () -> REVIEWER, observations, approved, baseline, runs, releases,
+        return gateway(observations, adapter,
+                (key, remaining) -> new GatewayReviewerContextSource.Resolution(key, REVIEWER));
+    }
+
+    private LoanReviewPolicyGateway gateway(PgObservations observations, ToolAdapter adapter,
+            GatewayReviewerContextSource reviewerSource) {
+        return new LoanReviewPolicyGateway(transactions, reviewerSource, observations, approved, baseline, runs, releases,
                 facts, events, mutations, redaction, json, new LoanReviewFinancialTemplate(json), List.of(adapter));
     }
 

@@ -80,7 +80,6 @@ import java.util.List;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.UUID;
-import java.util.function.Supplier;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -155,7 +154,10 @@ class LoanReviewPolicyGatewayTest {
     private InvocationKey key;
     private TestRunMode mode;
     private int executions;
-    private Supplier<ReviewerContext> reviewers = () -> REVIEWER;
+    private GatewayReviewerContextSource reviewers = (invocationKey, remaining) -> {
+        deadline(remaining);
+        return new GatewayReviewerContextSource.Resolution(invocationKey, REVIEWER);
+    };
 
     @BeforeEach
     void setup() throws Exception {
@@ -234,6 +236,15 @@ class LoanReviewPolicyGatewayTest {
     @ParameterizedTest @EnumSource(value = TestRunMode.class, names = {"BASELINE", "SEAL_REPLAY"})
     void safeReadUsesRealSourcesAndCommitsDecisionAndRequestBeforeCallingAdapter(TestRunMode selected) {
         configure(selected, TOOL, customerArguments());
+        List<InvocationKey> reviewerKeys = new ArrayList<>();
+        reviewers = (invocationKey, remaining) -> {
+            reviewerKeys.add(invocationKey);
+            assertThat(invocationKey).isEqualTo(key);
+            deadline(remaining);
+            assertThat(committed).isEmpty();
+            verifyNoInteractions(runs, cases, contracts, observations, events, mutations);
+            return new GatewayReviewerContextSource.Resolution(invocationKey, REVIEWER);
+        };
         output.put("status", new BigDecimal("200.0")); // Schema's mathematical integer remains compatible with the customer guard.
         String expectedInputDigest = redaction.redact(args.deepCopy()).originalDigest();
         String expectedContextDigest = redaction.redact(json.valueToTree(preCall(namespace()))).originalDigest();
@@ -243,6 +254,7 @@ class LoanReviewPolicyGatewayTest {
         assertThat(result.policyDecision().allowed()).isTrue();
         assertThat(result.execution().output()).isEqualTo(output);
         assertThat(executions).isEqualTo(1);
+        assertThat(reviewerKeys).containsExactly(key);
         assertThat(committed).extracting(Event::eventType).containsExactly(ExecutionEventType.POLICY_EVALUATED,
                 ExecutionEventType.TOOL_REQUEST, ExecutionEventType.TOOL_RESPONSE);
         assertThat(result.responseEvent().metadata().path("deliveredToAgent").booleanValue()).isFalse();
@@ -652,7 +664,7 @@ class LoanReviewPolicyGatewayTest {
                 .isEqualTo(GatewayApprovedPolicySourceService.FailureCode.CONTRACT_NOT_APPROVED);
         when(runs.find(RUN)).thenAnswer(call -> projection(mode, FINGERPRINT));
         clearInvocations(approved, runs, contracts, observations);
-        if (origin.equals("reviewer")) reviewers = () -> { throw sourceFailure; };
+        if (origin.equals("reviewer")) reviewers = (invocationKey, remaining) -> { throw sourceFailure; };
         else doAnswer(call -> { throw sourceFailure; }).when(observations).resolve(any(), any());
 
         assertSourceFailure(catchThrowable(() -> gateway().invoke(context, invocation, ACTOR)), null);
@@ -667,9 +679,54 @@ class LoanReviewPolicyGatewayTest {
     @Test
     void legacyProposalAndMissingReviewerDoNotCreateAnInvocationOrReadOwners() {
         safe(catchThrowable(() -> gateway().invoke(context, invocation.proposal(), ACTOR)), FailureCode.INVALID_INVOCATION);
-        reviewers = () -> null;
+        reviewers = (invocationKey, remaining) -> null;
         safe(catchThrowable(() -> gateway().invoke(context, invocation, ACTOR)), FailureCode.AUTHENTICATION_REQUIRED);
         verifyNoInteractions(runs, cases, contracts, releases, agents, observations);
+        assertNoExecutionOrEvents();
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"run", "case", "trace", "call", "digest", "null-key",
+            "null-reviewer", "unauthenticated", "wrong-actor"})
+    void reviewerSourceRejectsMismatchedOrUnauthenticatedResolutionBeforeOwnerCalls(String problem) {
+        reviewers = (requested, remaining) -> {
+            assertThat(requested).isEqualTo(key);
+            deadline(remaining);
+            InvocationKey returned = switch (problem) {
+                case "run" -> new InvocationKey(UUID.randomUUID(), CASE_RUN, TRACE, CALL, key.requestDigest());
+                case "case" -> new InvocationKey(RUN, UUID.randomUUID(), TRACE, CALL, key.requestDigest());
+                case "trace" -> new InvocationKey(RUN, CASE_RUN, UUID.randomUUID(), CALL, key.requestDigest());
+                case "call" -> new InvocationKey(RUN, CASE_RUN, TRACE, UUID.randomUUID(), key.requestDigest());
+                case "digest" -> new InvocationKey(RUN, CASE_RUN, TRACE, CALL, ARTIFACT);
+                case "null-key" -> null;
+                default -> requested;
+            };
+            ReviewerContext resolved = switch (problem) {
+                case "null-reviewer" -> null;
+                case "unauthenticated" -> new ReviewerContext(WORKSPACE, ACTOR, "AI_SECURITY_REVIEWER",
+                        PRIVATE, false, true, false);
+                case "wrong-actor" -> new ReviewerContext(WORKSPACE, "other-reviewer", "AI_SECURITY_REVIEWER",
+                        PRIVATE, true, true, false);
+                default -> REVIEWER;
+            };
+            return new GatewayReviewerContextSource.Resolution(returned, resolved);
+        };
+        safe(catchThrowable(() -> gateway().invoke(context, invocation, ACTOR)), FailureCode.AUTHENTICATION_REQUIRED);
+        verifyNoInteractions(runs, cases, contracts, releases, agents, observations, events, mutations);
+        assertNoExecutionOrEvents();
+        assertThat(deadlines).singleElement().satisfies(value ->
+                assertThat(value.toNanos()).isBetween(1L, Duration.ofSeconds(5).toNanos()));
+    }
+
+    @Test
+    void reviewerSourceReturningAfterDeadlineCannotStartPolicyOrExecution() throws Exception {
+        reviewers = (requested, remaining) -> {
+            deadline(remaining);
+            try { Thread.sleep(5_100); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IllegalStateException(); }
+            return new GatewayReviewerContextSource.Resolution(requested, REVIEWER);
+        };
+        safe(catchThrowable(() -> gateway().invoke(context, invocation, ACTOR)), FailureCode.POLICY_EVALUATION_TIMEOUT);
+        verifyNoInteractions(runs, cases, contracts, releases, agents, observations, events, mutations);
         assertNoExecutionOrEvents();
     }
 
