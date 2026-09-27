@@ -267,6 +267,126 @@ class EventEvidenceIntegrationTest {
     }
 
     @Test
+    void rejectsEveryPublicEventWriteWithoutChangingEvidence() throws Exception {
+        Seed seed = seedRun();
+        URI eventsUri = URI.create("http://localhost:" + port + "/api/v1/test-runs/" + seed.runId() + "/events");
+        HttpClient client = HttpClient.newHttpClient();
+        long headBefore = eventService.history(seed.runId(), 0, 100).headSequence();
+        int eventsBefore = jdbcTemplate.queryForObject(
+                "select count(*) from execution_events where run_id = ?", Integer.class, seed.runId());
+        int counterRowsBefore = jdbcTemplate.queryForObject(
+                "select count(*) from run_event_counters where run_id = ?", Integer.class, seed.runId());
+        assertThat(counterRowsBefore).isZero();
+        int outboxBefore = jdbcTemplate.queryForObject(
+                "select count(*) from event_outbox where run_id = ?", Integer.class, seed.runId());
+        int auditsBefore = jdbcTemplate.queryForObject(
+                "select count(*) from audit_records where action = 'EXECUTION_EVENT_APPENDED'",
+                Integer.class);
+        int idempotencyBefore = jdbcTemplate.queryForObject(
+                "select count(*) from api_idempotency_records where request_path = ?",
+                Integer.class, eventsUri.getPath());
+
+        for (ExecutionEventType eventType : ExecutionEventType.values()) {
+            assertPublicEventPostForbidden(client, eventsUri,
+                    "{\"traceId\":\"" + UUID.randomUUID() + "\",\"eventType\":\""
+                            + eventType.name() + "\",\"metadata\":{}}");
+        }
+        assertPublicEventPostForbidden(client, eventsUri,
+                "{\"traceId\":\"" + UUID.randomUUID() + "\",\"eventType\":\"FUTURE_EVENT\"}");
+        assertPublicEventPostForbidden(client, eventsUri, "{malformed-json");
+        String proposal = "{\"traceId\":\"" + UUID.randomUUID() + "\",\"eventType\":\"TOOL_PROPOSED\"}";
+        assertPublicEventPostForbidden(client, eventsUri, proposal, "event-forbidden-" + UUID.randomUUID());
+        assertPublicEventPostForbidden(client, eventsUri, proposal, "invalid key");
+
+        assertThat(eventService.history(seed.runId(), 0, 100).headSequence()).isEqualTo(headBefore);
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from execution_events where run_id = ?", Integer.class, seed.runId()))
+                .isEqualTo(eventsBefore);
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from run_event_counters where run_id = ?", Integer.class, seed.runId()))
+                .isEqualTo(counterRowsBefore);
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from event_outbox where run_id = ?", Integer.class, seed.runId()))
+                .isEqualTo(outboxBefore);
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from audit_records where action = 'EXECUTION_EVENT_APPENDED'", Integer.class))
+                .isEqualTo(auditsBefore);
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from api_idempotency_records where request_path = ?",
+                Integer.class, eventsUri.getPath()))
+                .isEqualTo(idempotencyBefore);
+
+        ExecutionEventDto.Event internal = eventService.append(seed.runId(),
+                new ExecutionEventDto.AppendRequest(null, UUID.randomUUID(), ExecutionEventType.RUN_STARTED,
+                        null, null, null, null, null, objectMapper.createObjectNode()), "runtime-b");
+        assertThat(internal.sequence()).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject(
+                "select last_sequence from run_event_counters where run_id = ?", Long.class, seed.runId()))
+                .isEqualTo(1L);
+        HttpResponse<String> history = client.send(HttpRequest.newBuilder(URI.create("http://localhost:" + port
+                        + "/api/v1/test-runs/" + seed.runId() + "/event-history"))
+                        .GET().build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(history.statusCode()).isEqualTo(200);
+        assertThat(objectMapper.readTree(history.body()).path("data").path("items").size()).isEqualTo(1);
+    }
+
+    private void assertPublicEventPostForbidden(HttpClient client, URI uri, String body) throws Exception {
+        assertPublicEventPostForbidden(client, uri, body, null);
+    }
+
+    private void assertPublicEventPostForbidden(HttpClient client, URI uri, String body, String idempotencyKey)
+            throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(uri)
+                .header("Content-Type", "application/json")
+                .header("X-Actor-Id", "runtime-b");
+        if (idempotencyKey != null) {
+            request.header("Idempotency-Key", idempotencyKey);
+        }
+        HttpResponse<String> response = client.send(request.POST(HttpRequest.BodyPublishers.ofString(body)).build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).isEqualTo(403);
+        JsonNode problem = objectMapper.readTree(response.body());
+        assertThat(problem.path("code").asString()).isEqualTo("EXECUTION_EVENT_INGEST_FORBIDDEN");
+        assertThat(problem.path("retryable").isBoolean()).isTrue();
+        assertThat(problem.path("retryable").booleanValue()).isFalse();
+    }
+
+    @Test
+    void keepsIdempotencyAdmissionOnOtherRunMutations() throws Exception {
+        HttpClient client = HttpClient.newHttpClient();
+        URI startUri = URI.create("http://localhost:" + port + "/api/v1/test-runs");
+        HttpResponse<String> missingKey = client.send(HttpRequest.newBuilder(startUri)
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString("{}"))
+                        .build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(missingKey.statusCode()).isEqualTo(400);
+        assertThat(objectMapper.readTree(missingKey.body()).path("code").asString())
+                .isEqualTo("VALIDATION_ERROR");
+
+        String key = "run-start-" + UUID.randomUUID();
+        HttpResponse<String> admitted = client.send(HttpRequest.newBuilder(startUri)
+                        .header("Content-Type", "application/json")
+                        .header("Idempotency-Key", key)
+                        .POST(HttpRequest.BodyPublishers.ofString("{}"))
+                        .build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(admitted.statusCode()).isEqualTo(400);
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from api_idempotency_records
+                 where request_path = ? and idempotency_key = ?
+                """, Integer.class, startUri.getPath(), key)).isEqualTo(1);
+
+        URI malformedRunEvents = URI.create("http://localhost:" + port
+                + "/api/v1/test-runs/not-a-uuid/events");
+        HttpResponse<String> malformedPath = client.send(HttpRequest.newBuilder(malformedRunEvents)
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString("{}"))
+                        .build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(malformedPath.statusCode()).isEqualTo(400);
+        assertThat(objectMapper.readTree(malformedPath.body()).path("code").asString())
+                .isEqualTo("VALIDATION_ERROR");
+    }
+
+    @Test
     void replaysSseFromLastEventIdWithoutRawSensitiveValues() throws Exception {
         Seed seed = seedRun();
         UUID traceId = UUID.randomUUID();

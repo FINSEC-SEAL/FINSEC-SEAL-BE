@@ -6,15 +6,11 @@ import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.api.TraceIdFilter;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
-import jakarta.validation.Valid;
-import java.net.URI;
 import java.util.UUID;
 import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -45,15 +41,9 @@ public class TestRunEvidenceController {
     }
 
     @PostMapping("/{runId}/events")
-    ResponseEntity<ApiResponse<ExecutionEventDto.Event>> append(
-            @PathVariable UUID runId,
-            @Valid @RequestBody ExecutionEventDto.AppendRequest request,
-            @RequestHeader(value = "X-Actor-Id", required = false) String actorId
-    ) {
-        ExecutionEventDto.Event event = eventService.append(runId, request, actorId);
-        return ResponseEntity.created(URI.create(
-                "/api/v1/test-runs/" + runId + "/event-history?after=" + (event.sequence() - 1)
-        )).body(ApiResponse.success(event, TraceIdFilter.currentTraceId()));
+    void rejectExternalAppend(@PathVariable UUID runId) {
+        throw new BusinessException(ErrorCode.EXECUTION_EVENT_INGEST_FORBIDDEN,
+                "Execution events can only be produced by server components");
     }
 
     @GetMapping("/{runId}/event-history")
