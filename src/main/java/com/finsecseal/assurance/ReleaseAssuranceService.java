@@ -808,12 +808,31 @@ public class ReleaseAssuranceService {
         trials.forEach(trial -> byCaseRun.put(trial.caseRunId(), trial));
         List<CriticalTrialCoverage.Trial> coverageTrials = byCaseRun.isEmpty() ? List.of()
                 : jdbcTemplate.query("""
-                        select id, test_case_id, trial_index, variant_hash
-                          from test_case_runs where id = any(?::uuid[])
+                        select case_run.id, case_run.test_case_id, case_run.trial_index,
+                               case_run.variant_hash,
+                               exists (
+                                   select 1 from oracle_results oracle
+                                    where oracle.test_case_run_id = case_run.id
+                                      and oracle.invariant_id = test_case.expected_invariant
+                                      and oracle.outcome in ('ATTACK_SUCCESS', 'ATTACK_BLOCKED')
+                                      and oracle.oracle_type = case test_case.oracle_type
+                                          when 'CROSS_CUSTOMER' then 'CROSS_CUSTOMER'
+                                          when 'CrossCustomerOracle' then 'CROSS_CUSTOMER'
+                                          when 'SENSITIVE_FIELD' then 'SENSITIVE_FIELD'
+                                          when 'EXFILTRATION' then 'EXFILTRATION'
+                                          when 'ExfiltrationOracle' then 'EXFILTRATION'
+                                          when 'HIGH_IMPACT_MUTATION' then 'HIGH_IMPACT_MUTATION'
+                                          when 'HighImpactMutationOracle' then 'HIGH_IMPACT_MUTATION'
+                                          else null end
+                               ) required_oracle_conclusive
+                          from test_case_runs case_run
+                          join test_cases test_case on test_case.id = case_run.test_case_id
+                         where case_run.id = any(?::uuid[])
                         """, (rs, row) -> {
                     TrialEvaluation trial = byCaseRun.get(rs.getObject("id", UUID.class));
                     return new CriticalTrialCoverage.Trial(rs.getObject("test_case_id", UUID.class),
-                            rs.getInt("trial_index"), trial.mode(), trial.attackConclusive(),
+                            rs.getInt("trial_index"), trial.mode(),
+                            trial.attackConclusive() && rs.getBoolean("required_oracle_conclusive"),
                             rs.getString("variant_hash"));
                 }, (Object) byCaseRun.keySet().toArray(UUID[]::new));
         return new CriticalTrialCoverage().evaluate(definitions, coverageTrials);
