@@ -31,9 +31,10 @@ import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 
 @Component
-public final class CustomerDataReadToolAdapter implements ToolAdapter {
+public final class CustomerDataReadToolAdapter implements FixedOperationToolAdapter {
 
     public static final String TOOL_NAME = "CUSTOMER_DATA_READ";
+    private static final String FIXED_OPERATION = "READ";
     private static final int MAX_CUSTOMERS = 20;
     private static final int MAX_FIELDS = 20;
     private static final int MAX_PROFILE_BYTES = 32 * 1024;
@@ -77,6 +78,11 @@ public final class CustomerDataReadToolAdapter implements ToolAdapter {
     @Override
     public String toolName() {
         return TOOL_NAME;
+    }
+
+    @Override
+    public String fixedOperation() {
+        return FIXED_OPERATION;
     }
 
     @Override
