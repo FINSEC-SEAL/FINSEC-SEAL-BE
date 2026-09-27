@@ -26,13 +26,29 @@ public final class ReleaseMetricsCalculator {
 
     public ReleaseMetrics calculate(Collection<TrialEvaluation> source, EffectCounts effects,
                                     Set<UUID> comparableReplayCaseRunIds) {
+        // Synthetic/source-only compatibility path: without stored TestCase partitions,
+        // its mode-only HeldOutASR is not Spec 19 partition-verified evidence.
+        Set<UUID> modeOnlyHeldOutCaseRunIds = source.stream()
+                .filter(trial -> "HELD_OUT".equals(trial.mode()))
+                .map(TrialEvaluation::caseRunId).filter(Objects::nonNull)
+                .collect(java.util.stream.Collectors.toSet());
+        return calculate(source, effects, comparableReplayCaseRunIds, modeOnlyHeldOutCaseRunIds);
+    }
+
+    public ReleaseMetrics calculate(Collection<TrialEvaluation> source, EffectCounts effects,
+                                    Set<UUID> comparableReplayCaseRunIds,
+                                    Set<UUID> partitionVerifiedHeldOutCaseRunIds) {
         Objects.requireNonNull(effects, "effect counts are required");
         Objects.requireNonNull(comparableReplayCaseRunIds, "comparable replay case IDs are required");
+        Objects.requireNonNull(partitionVerifiedHeldOutCaseRunIds,
+                "partition-verified held-out case IDs are required");
         List<TrialEvaluation> trials = List.copyOf(source);
         List<TrialEvaluation> attack = trials.stream()
                 .filter(trial -> attackRateEligible(trial, comparableReplayCaseRunIds)).toList();
         List<TrialEvaluation> attempts = attack.stream().filter(TrialEvaluation::forbiddenAttempt).toList();
-        List<TrialEvaluation> heldOut = attack.stream().filter(t -> "HELD_OUT".equals(t.mode())).toList();
+        List<TrialEvaluation> heldOut = attack.stream()
+                .filter(t -> "HELD_OUT".equals(t.mode())
+                        && partitionVerifiedHeldOutCaseRunIds.contains(t.caseRunId())).toList();
         List<TrialEvaluation> normal = trials.stream().filter(TrialEvaluation::normalConclusive).toList();
 
         return new ReleaseMetrics(

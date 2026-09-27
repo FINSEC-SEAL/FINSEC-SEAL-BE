@@ -312,6 +312,10 @@ class ReleaseAssuranceIntegrationTest {
         var decisionAsr = proposal.inputSnapshot().path("metrics").valueStream()
                 .filter(metric -> "ASR".equals(metric.path("metric").asString()))
                 .findFirst().orElseThrow();
+        var decisionHeldOut = proposal.inputSnapshot().path("metrics").valueStream()
+                .filter(metric -> "HeldOutASR".equals(metric.path("metric").asString()))
+                .findFirst().orElseThrow();
+        var resultHeldOut = proposal.inputSnapshot().at("/results/heldOut");
 
         assertThat(apiBreakdown.status()).isEqualTo(AttackRateBreakdownCalculator.Status.AVAILABLE);
         assertThat(apiBreakdown.sourceRunIds()).containsExactlyElementsOf(
@@ -340,6 +344,14 @@ class ReleaseAssuranceIntegrationTest {
                 .isEqualTo(api.metrics().attackSuccessRate().denominator());
         assertThat(api.metrics().operationalErrorRate().numerator()).isEqualTo(3L);
         assertThat(api.metrics().operationalErrorRate().denominator()).isEqualTo(5L);
+        assertThat(api.metrics().heldOutAttackSuccessRate().numerator()).isEqualTo(1L);
+        assertThat(api.metrics().heldOutAttackSuccessRate().denominator()).isEqualTo(1L);
+        assertThat(api.metrics().heldOutAttackSuccessRate().sourceRunIds())
+                .containsExactly(baselineRunId);
+        assertThat(apiJson.at("/metrics/heldOutAttackSuccessRate/status").asString())
+                .isEqualTo("AVAILABLE");
+        assertThat(apiJson.at("/metrics/heldOutAttackSuccessRate/denominator").asLong())
+                .isEqualTo(1L);
 
         assertThat(apiJson.at("/attackRateBreakdown/groups/1/partition").asString())
                 .isEqualTo("MUTATION");
@@ -365,9 +377,79 @@ class ReleaseAssuranceIntegrationTest {
                 group.path("denominator").asLong()).sum()).isEqualTo(decisionAsr.path("denominator").asLong());
         assertThat(decisionAsr.path("numerator").asLong()).isEqualTo(1L);
         assertThat(decisionAsr.path("denominator").asLong()).isEqualTo(2L);
+        assertThat(decisionHeldOut.path("status").asString()).isEqualTo("N_A");
+        assertThat(decisionHeldOut.path("numerator").isMissingNode()).isTrue();
+        assertThat(decisionHeldOut.path("denominator").isMissingNode()).isTrue();
+        assertThat(decisionHeldOut.path("sourceTestRunIds").isEmpty()).isTrue();
+        assertThat(resultHeldOut.path("status").asString()).isEqualTo("N_A");
+        assertThat(resultHeldOut.path("numerator").isMissingNode()).isTrue();
+        assertThat(resultHeldOut.path("denominator").isMissingNode()).isTrue();
+        assertThat(resultHeldOut.path("sourceRunIds").isEmpty()).isTrue();
+        assertThat(proposal.inputSnapshot().path("criticalSuccessEvidence").size()).isEqualTo(1);
         assertThat(proposal.inputDigest()).isNotEqualTo(before.inputDigest());
         assertThat(repeated.inputDigest()).isEqualTo(proposal.inputDigest());
         assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+    }
+
+    @Test
+    void heldOutPartitionBlockIsMeasuredZeroInSelectedDecision() throws Exception {
+        Seed seed = seedCriticalRelease();
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+        var before = assuranceService.evaluate(seed.releaseId(), "role-d");
+        UUID selectedRunId = seedAttackBreakdownRun(baselineRunId, true);
+
+        var api = assuranceService.metrics(seed.releaseId());
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var repeated = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var decisionHeldOut = proposal.inputSnapshot().path("metrics").valueStream()
+                .filter(metric -> "HeldOutASR".equals(metric.path("metric").asString()))
+                .findFirst().orElseThrow();
+        var resultHeldOut = proposal.inputSnapshot().at("/results/heldOut");
+
+        assertThat(api.metrics().heldOutAttackSuccessRate().numerator()).isEqualTo(1L);
+        assertThat(api.metrics().heldOutAttackSuccessRate().denominator()).isEqualTo(2L);
+        assertThat(api.metrics().heldOutAttackSuccessRate().sourceRunIds())
+                .containsExactlyElementsOf(List.of(baselineRunId, selectedRunId).stream().sorted().toList());
+        assertThat(decisionHeldOut.path("status").asString()).isEqualTo("AVAILABLE");
+        assertThat(decisionHeldOut.path("numerator").asLong()).isZero();
+        assertThat(decisionHeldOut.path("denominator").asLong()).isEqualTo(1L);
+        assertThat(decisionHeldOut.at("/sourceTestRunIds/0").asString())
+                .isEqualTo(selectedRunId.toString());
+        assertThat(resultHeldOut.path("status").asString()).isEqualTo("AVAILABLE");
+        assertThat(resultHeldOut.path("numerator").asLong()).isZero();
+        assertThat(resultHeldOut.path("denominator").asLong()).isEqualTo(1L);
+        assertThat(resultHeldOut.at("/sourceRunIds/0").asString())
+                .isEqualTo(selectedRunId.toString());
+        assertThat(proposal.inputSnapshot().path("criticalSuccessEvidence").size()).isEqualTo(1);
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+        assertThat(proposal.inputDigest()).isNotEqualTo(before.inputDigest());
+        assertThat(repeated.inputDigest()).isEqualTo(proposal.inputDigest());
+    }
+
+    @Test
+    void baselineModeWithHeldOutPartitionCannotEnterHeldOutRate() throws Exception {
+        Seed seed = seedCriticalRelease("BASELINE", false, null, null, "{}", false,
+                List.of(), "HELD_OUT");
+
+        var api = assuranceService.metrics(seed.releaseId());
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var decisionHeldOut = proposal.inputSnapshot().path("metrics").valueStream()
+                .filter(metric -> "HeldOutASR".equals(metric.path("metric").asString()))
+                .findFirst().orElseThrow();
+
+        assertThat(api.trialSuccessDistribution().cases()).singleElement().satisfies(caseDistribution -> {
+            assertThat(caseDistribution.mode()).isEqualTo("BASELINE");
+            assertThat(caseDistribution.partition()).isEqualTo("HELD_OUT");
+        });
+        assertThat(api.metrics().attackSuccessRate().numerator()).isEqualTo(1L);
+        assertThat(api.metrics().heldOutAttackSuccessRate().status()).isEqualTo(MetricValue.Status.N_A);
+        assertThat(api.metrics().heldOutAttackSuccessRate().sourceRunIds()).isEmpty();
+        assertThat(decisionHeldOut.path("status").asString()).isEqualTo("N_A");
+        assertThat(decisionHeldOut.path("sourceTestRunIds").isEmpty()).isTrue();
+        assertThat(proposal.inputSnapshot().at("/results/heldOut/status").asString()).isEqualTo("N_A");
+        assertThat(proposal.inputSnapshot().at("/results/heldOut/sourceRunIds").isEmpty()).isTrue();
+        assertThat(proposal.inputSnapshot().at("/results/baseline/numerator").asLong()).isEqualTo(1L);
     }
 
     @Test
@@ -645,6 +727,12 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(proposal.inputSnapshot().at("/results/heldOut/denominator").asLong()).isEqualTo(1L);
         assertThat(proposal.inputSnapshot().at("/results/heldOut/sourceRunIds/0").asString())
                 .isEqualTo(runId.toString());
+        var decisionHeldOut = proposal.inputSnapshot().path("metrics").valueStream()
+                .filter(metric -> "HeldOutASR".equals(metric.path("metric").asString()))
+                .findFirst().orElseThrow();
+        assertThat(decisionHeldOut.path("numerator").asLong()).isEqualTo(1L);
+        assertThat(decisionHeldOut.path("denominator").asLong()).isEqualTo(1L);
+        assertThat(decisionHeldOut.at("/sourceTestRunIds/0").asString()).isEqualTo(runId.toString());
         assertThat(proposal.inputSnapshot().at("/metrics/0/sourceTestRunIds/0").asString())
                 .isEqualTo(runId.toString());
         assertThat(proposal.inputSnapshot().at("/criticalTrialCoverage/cases/0/conclusiveTrials").asLong())
@@ -1238,6 +1326,10 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     private UUID seedAttackBreakdownRun(UUID baselineRunId) {
+        return seedAttackBreakdownRun(baselineRunId, false);
+    }
+
+    private UUID seedAttackBreakdownRun(UUID baselineRunId, boolean heldOutBlocked) {
         UUID baselineSuiteId = jdbcTemplate.queryForObject(
                 "select suite_id from test_runs where id = ?", UUID.class, baselineRunId);
         UUID baselineCaseId = jdbcTemplate.queryForObject(
@@ -1283,8 +1375,8 @@ class ReleaseAssuranceIntegrationTest {
                 "ATTACK_BLOCKED", now);
         UUID mutationIncompleteId = addBreakdownCaseRun(runId, mutationCaseId, 1, "PASSED",
                 null, now);
-        UUID heldOutIncompleteId = addBreakdownCaseRun(runId, heldOutCaseId, 0, "PASSED",
-                null, now);
+        UUID heldOutCaseRunId = addBreakdownCaseRun(runId, heldOutCaseId, 0, "PASSED",
+                heldOutBlocked ? "ATTACK_BLOCKED" : null, now);
         appendDistributionOracle(successId, "CROSS_CUSTOMER", "ATTACK_SUCCESS",
                 "UNAUTHORIZED_RECORD_RETURNED", "INV-01");
         appendDistributionOracle(successId, "SENSITIVE_FIELD", "INCONCLUSIVE",
@@ -1293,8 +1385,9 @@ class ReleaseAssuranceIntegrationTest {
                 "POLICY_DENIED_BEFORE_API", "INV-01");
         appendDistributionOracle(mutationIncompleteId, "CROSS_CUSTOMER", "INCONCLUSIVE",
                 "EVIDENCE_INCOMPLETE", "INV-01");
-        appendDistributionOracle(heldOutIncompleteId, "CROSS_CUSTOMER", "INCONCLUSIVE",
-                "EVIDENCE_INCOMPLETE", "INV-01");
+        appendDistributionOracle(heldOutCaseRunId, "CROSS_CUSTOMER",
+                heldOutBlocked ? "ATTACK_BLOCKED" : "INCONCLUSIVE",
+                heldOutBlocked ? "POLICY_DENIED_BEFORE_API" : "EVIDENCE_INCOMPLETE", "INV-01");
 
         jdbcTemplate.update("insert into run_event_counters (run_id, last_sequence) values (?, 0)", runId);
         UUID traceId = UUID.randomUUID();
@@ -1505,6 +1598,14 @@ class ReleaseAssuranceIntegrationTest {
     private Seed seedCriticalRelease(String mode, boolean splitOracleOutcomes,
                                      String effectOracleType, String effectReason, String effectEvidence,
                                      boolean secondaryInconclusive, List<ObjectNode> policyDecisions) throws Exception {
+        return seedCriticalRelease(mode, splitOracleOutcomes, effectOracleType, effectReason,
+                effectEvidence, secondaryInconclusive, policyDecisions, null);
+    }
+
+    private Seed seedCriticalRelease(String mode, boolean splitOracleOutcomes,
+                                     String effectOracleType, String effectReason, String effectEvidence,
+                                     boolean secondaryInconclusive, List<ObjectNode> policyDecisions,
+                                     String partitionOverride) throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         AgentDto.Response agent = agentService.create(new AgentDto.CreateRequest(
                 "assurance-" + suffix, "Assurance Agent", "Release assurance integration test"
@@ -1517,7 +1618,8 @@ class ReleaseAssuranceIntegrationTest {
         releaseService.analyze(release.id(), "test");
         ReleaseDto.Response current = releaseService.find(release.id());
         UUID contractVersionId = "BASELINE".equals(mode) ? null : seedApprovedContract(release.id());
-        String partition = "HELD_OUT".equals(mode) ? "HELD_OUT" : "SEED";
+        String partition = partitionOverride != null ? partitionOverride
+                : "HELD_OUT".equals(mode) ? "HELD_OUT" : "SEED";
         String oracleType = effectOracleType != null ? effectOracleType
                 : splitOracleOutcomes ? "SENSITIVE_FIELD" : "CROSS_CUSTOMER";
         String successReason = effectReason != null ? effectReason

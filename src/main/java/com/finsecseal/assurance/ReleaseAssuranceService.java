@@ -94,10 +94,11 @@ public class ReleaseAssuranceService {
         ReplayAssessment replay = assessReplay(releaseId, null);
         TrialSuccessDistributionCalculator.Report distribution =
                 trialSuccessDistribution(trials, replay.comparableCaseRunIds());
+        Set<UUID> heldOutCaseRunIds = partitionVerifiedHeldOutCaseRunIds(distribution);
         return new ReleaseAssuranceDto.MetricsView(
                 releaseId,
                 metricsCalculator.calculate(comparableTrials(trials, replay), actualEffectCounts(trials),
-                        replay.comparableCaseRunIds()),
+                        replay.comparableCaseRunIds(), heldOutCaseRunIds),
                 replay.summary(),
                 policyLatency(releaseId, terminalRunIds(releaseId)),
                 completionRate(release, null),
@@ -267,8 +268,11 @@ public class ReleaseAssuranceService {
                 .toList();
         ReplayAssessment replay = assessReplay(release.id(), Set.copyOf(evidence.runIds()));
         List<TrialEvaluation> trials = comparableTrials(loadedTrials, replay);
+        TrialSuccessDistributionCalculator.Report distribution =
+                trialSuccessDistribution(loadedTrials, replay.comparableCaseRunIds());
+        Set<UUID> heldOutCaseRunIds = partitionVerifiedHeldOutCaseRunIds(distribution);
         ReleaseMetrics metrics = metricsCalculator.calculate(trials, actualEffectCounts(loadedTrials),
-                replay.comparableCaseRunIds());
+                replay.comparableCaseRunIds(), heldOutCaseRunIds);
         // Comparability controls rate eligibility; it must not erase an observed ENFORCE effect.
         List<Map<String, Object>> criticalSuccessEvidence = criticalSuccessEvidence(loadedTrials);
         boolean criticalSuccess = !criticalSuccessEvidence.isEmpty();
@@ -306,15 +310,13 @@ public class ReleaseAssuranceService {
                 .put("hash", evidence.suiteHash()));
         snapshot.set("sandbox", objectMapper.createObjectNode()
                 .put("fixtureVersion", evidence.fixtureVersion()).put("fixtureDigest", evidence.fixtureDigest()));
-        snapshot.set("results", resultSummary(trials, replay.comparableCaseRunIds()));
+        snapshot.set("results", resultSummary(trials, replay.comparableCaseRunIds(), heldOutCaseRunIds));
         snapshot.set("replayComparability", objectMapper.valueToTree(replay.summary()));
         snapshot.set("criticalTrialCoverage", objectMapper.valueToTree(coverage));
         snapshot.set("criticalSuccessEvidence", objectMapper.valueToTree(criticalSuccessEvidence));
         snapshot.set("metrics", metricArray(metrics));
         snapshot.set("policyLatency", objectMapper.valueToTree(policyLatency(release.id(), evidence.runIds())));
         snapshot.set("completionRate", objectMapper.valueToTree(completionRate(release, evidence)));
-        TrialSuccessDistributionCalculator.Report distribution =
-                trialSuccessDistribution(loadedTrials, replay.comparableCaseRunIds());
         snapshot.set("trialSuccessDistribution", objectMapper.valueToTree(distribution));
         snapshot.set("attackRateBreakdown", objectMapper.valueToTree(
                 attackRateBreakdownCalculator.calculate(distribution)));
@@ -478,6 +480,21 @@ public class ReleaseAssuranceService {
                     row.testCaseId(), row.caseKey(), row.partition(), row.trialIndex()));
         }
         return trialSuccessDistributionCalculator.calculate(samples, comparableReplayCaseRunIds);
+    }
+
+    private Set<UUID> partitionVerifiedHeldOutCaseRunIds(
+            TrialSuccessDistributionCalculator.Report distribution) {
+        Set<UUID> caseRunIds = new LinkedHashSet<>();
+        for (TrialSuccessDistributionCalculator.CaseDistribution caseDistribution : distribution.cases()) {
+            if ("ATTACK".equals(caseDistribution.caseType())
+                    && "HELD_OUT".equals(caseDistribution.mode())
+                    && "HELD_OUT".equals(caseDistribution.partition())) {
+                caseDistribution.orderedTrials().stream()
+                        .map(TrialSuccessDistributionCalculator.TrialBit::caseRunId)
+                        .forEach(caseRunIds::add);
+            }
+        }
+        return Set.copyOf(caseRunIds);
     }
 
     private List<TrialEvaluation> comparableTrials(List<TrialEvaluation> trials, ReplayAssessment replay) {
@@ -861,18 +878,24 @@ public class ReleaseAssuranceService {
         return values;
     }
 
-    private ObjectNode resultSummary(List<TrialEvaluation> trials, Set<UUID> comparableReplayCaseRunIds) {
+    private ObjectNode resultSummary(List<TrialEvaluation> trials, Set<UUID> comparableReplayCaseRunIds,
+                                     Set<UUID> heldOutCaseRunIds) {
         ObjectNode results = objectMapper.createObjectNode();
-        results.set("baseline", resultMetric("BASELINE", trials, false, comparableReplayCaseRunIds));
-        results.set("sealReplay", resultMetric("SEAL_REPLAY", trials, false, comparableReplayCaseRunIds));
-        results.set("heldOut", resultMetric("HELD_OUT", trials, false, comparableReplayCaseRunIds));
-        results.set("normalRegression", resultMetric("REGRESSION", trials, true, comparableReplayCaseRunIds));
+        results.set("baseline", resultMetric("BASELINE", trials, false,
+                comparableReplayCaseRunIds, heldOutCaseRunIds));
+        results.set("sealReplay", resultMetric("SEAL_REPLAY", trials, false,
+                comparableReplayCaseRunIds, heldOutCaseRunIds));
+        results.set("heldOut", resultMetric("HELD_OUT", trials, false,
+                comparableReplayCaseRunIds, heldOutCaseRunIds));
+        results.set("normalRegression", resultMetric("REGRESSION", trials, true,
+                comparableReplayCaseRunIds, heldOutCaseRunIds));
         return results;
     }
 
     private ObjectNode resultMetric(String mode, List<TrialEvaluation> all, boolean normal,
-                                    Set<UUID> comparableReplayCaseRunIds) {
+                                    Set<UUID> comparableReplayCaseRunIds, Set<UUID> heldOutCaseRunIds) {
         List<TrialEvaluation> trials = all.stream().filter(t -> mode.equals(t.mode()))
+                .filter(trial -> !"HELD_OUT".equals(mode) || heldOutCaseRunIds.contains(trial.caseRunId()))
                 .filter(trial -> normal ? trial.normalConclusive()
                         : ReleaseMetricsCalculator.attackRateEligible(trial, comparableReplayCaseRunIds)).toList();
         long numerator = trials.stream().filter(normal ? TrialEvaluation::normalSuccess : TrialEvaluation::attackSuccess)
