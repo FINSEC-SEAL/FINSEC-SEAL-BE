@@ -1,6 +1,9 @@
 package com.finsecseal.assurance;
 
 import com.finsecseal.audit.AuditService;
+import com.finsecseal.attack.AttackSeedCatalog;
+import com.finsecseal.attack.AttackVariant;
+import com.finsecseal.attack.AttackVariantFactory;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.DecisionValue;
@@ -63,6 +66,8 @@ public class ReleaseAssuranceService {
     private final SensitiveFieldExposureCounter sensitiveFieldExposureCounter;
     private final ExecutionEventService eventService;
     private final SandboxFixtureService fixtureService;
+    private final AttackSeedCatalog attackSeedCatalog;
+    private final AttackVariantFactory attackVariantFactory;
     private final ReleaseMetricsCalculator metricsCalculator = new ReleaseMetricsCalculator();
     private final PolicyLatencyCalculator policyLatencyCalculator = new PolicyLatencyCalculator();
     private final CompletionRateCalculator completionRateCalculator = new CompletionRateCalculator();
@@ -85,7 +90,9 @@ public class ReleaseAssuranceService {
             RedactionService redactionService,
             SensitiveFieldExposureCounter sensitiveFieldExposureCounter,
             ExecutionEventService eventService,
-            SandboxFixtureService fixtureService
+            SandboxFixtureService fixtureService,
+            AttackSeedCatalog attackSeedCatalog,
+            AttackVariantFactory attackVariantFactory
     ) {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
@@ -98,6 +105,8 @@ public class ReleaseAssuranceService {
         this.sensitiveFieldExposureCounter = sensitiveFieldExposureCounter;
         this.eventService = eventService;
         this.fixtureService = fixtureService;
+        this.attackSeedCatalog = attackSeedCatalog;
+        this.attackVariantFactory = attackVariantFactory;
     }
 
     public ReleaseAssuranceDto.MetricsView metrics(UUID releaseId) {
@@ -755,23 +764,61 @@ public class ReleaseAssuranceService {
     }
 
     private CriticalTrialCoverage.Report criticalCoverage(UUID suiteId, List<TrialEvaluation> trials) {
+        AttackVariant curatedFa03 = curatedCriticalFa03Variant();
         List<CriticalTrialCoverage.CaseDefinition> definitions = jdbcTemplate.query("""
-                select id, category, partition_name, oracle_type from test_cases
+                select id, category, partition_name, oracle_type, severity, target_tool,
+                       expected_invariant, generation_source, payload_hash
+                  from test_cases
                  where suite_id = ? and case_type = 'ATTACK' order by id
-                """, (rs, row) -> new CriticalTrialCoverage.CaseDefinition(
-                rs.getObject("id", UUID.class), rs.getString("category"),
-                rs.getString("partition_name"), rs.getString("oracle_type")), suiteId);
+                """, (rs, row) -> {
+            String category = rs.getString("category");
+            String partition = rs.getString("partition_name");
+            String oracleType = rs.getString("oracle_type");
+            boolean exactCuratedSeed = curatedFa03 != null
+                    && "SEED".equals(partition)
+                    && "CURATED".equals(rs.getString("generation_source"))
+                    && curatedFa03.category().equals(category)
+                    && curatedFa03.severity().equals(rs.getString("severity"))
+                    && curatedFa03.targetTool().equals(rs.getString("target_tool"))
+                    && curatedFa03.invariantId().equals(rs.getString("expected_invariant"))
+                    && curatedFa03.oracleType().equals(oracleType)
+                    && curatedFa03.variantHash().equals(rs.getString("payload_hash"));
+            return new CriticalTrialCoverage.CaseDefinition(
+                    rs.getObject("id", UUID.class), category, partition, oracleType,
+                    exactCuratedSeed ? curatedFa03.variantHash() : null);
+        }, suiteId);
         Map<UUID, TrialEvaluation> byCaseRun = new LinkedHashMap<>();
         trials.forEach(trial -> byCaseRun.put(trial.caseRunId(), trial));
         List<CriticalTrialCoverage.Trial> coverageTrials = byCaseRun.isEmpty() ? List.of()
                 : jdbcTemplate.query("""
-                        select id, test_case_id, trial_index from test_case_runs where id = any(?::uuid[])
+                        select id, test_case_id, trial_index, variant_hash
+                          from test_case_runs where id = any(?::uuid[])
                         """, (rs, row) -> {
                     TrialEvaluation trial = byCaseRun.get(rs.getObject("id", UUID.class));
                     return new CriticalTrialCoverage.Trial(rs.getObject("test_case_id", UUID.class),
-                            rs.getInt("trial_index"), trial.mode(), trial.attackConclusive());
+                            rs.getInt("trial_index"), trial.mode(), trial.attackConclusive(),
+                            rs.getString("variant_hash"));
                 }, (Object) byCaseRun.keySet().toArray(UUID[]::new));
         return new CriticalTrialCoverage().evaluate(definitions, coverageTrials);
+    }
+
+    private AttackVariant curatedCriticalFa03Variant() {
+        try {
+            AttackVariant variant = attackVariantFactory.fromSeed(attackSeedCatalog.requireSeed("FA-03"));
+            if (!"FA-03".equals(variant.category())
+                    || !"CUSTOMER_DATA_READ".equals(variant.targetTool())
+                    || !"INV-02".equals(variant.invariantId())
+                    || !"SENSITIVE_FIELD".equals(variant.oracleType())) return null;
+            JsonNode fields = variant.toolArguments().path("fields");
+            if (!fields.isArray()) return null;
+            for (JsonNode field : fields) {
+                if (field.isString() && "accountNumber".equals(field.asString())) return variant;
+            }
+            return null;
+        } catch (RuntimeException invalidSeed) {
+            // An unavailable or changed catalog cannot establish critical target identity.
+            return null;
+        }
     }
 
     private List<Map<String, Object>> criticalSuccessEvidence(List<TrialEvaluation> trials) {
