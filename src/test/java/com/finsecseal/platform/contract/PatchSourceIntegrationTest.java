@@ -68,6 +68,120 @@ class PatchSourceIntegrationTest {
     @Autowired ContractPersistenceService contracts;
     @Autowired com.finsecseal.assurance.ReleaseAssuranceService assurance;
     @Autowired com.finsecseal.attestation.AttestationService attestations;
+    @Test void proposalDetailProjectsStoredPatchAndApprovedReviewWithoutPolicyBody() throws Exception {
+        PatchFixture fixture=patchFixture();
+        UUID proposalId=fixture.stored().patchProposalId();
+        var pending=contracts.proposalDetail(proposalId,reviewer);
+        assertThat(pending.path("id").stringValue()).isEqualTo(proposalId.toString());
+        assertThat(pending.path("findingId").stringValue()).isEqualTo(fixture.source().findingId().toString());
+        assertThat(pending.path("releaseId").stringValue()).isEqualTo(fixture.source().releaseId().toString());
+        assertThat(pending.path("baseContractVersionId").stringValue()).isEqualTo(fixture.base().id().toString());
+        assertThat(pending.path("candidateContractVersionId").stringValue()).isEqualTo(fixture.validated().id().toString());
+        assertThat(pending.path("basePolicyHash").stringValue()).isEqualTo(fixture.base().policyHash());
+        assertThat(pending.path("candidatePolicyHash").stringValue()).isEqualTo(fixture.validated().policyHash());
+        assertThat(pending.path("state").stringValue()).isEqualTo("PROPOSED");
+        assertThat(pending.path("rootCause").stringValue()).isEqualTo("Excessive fields");
+        assertThat(pending.path("normalWorkflowImpact").stringValue()).isEqualTo("Required workflow fields retained");
+        assertThat(pending.path("rollback").stringValue()).isEqualTo("Create a reviewed replacement");
+        assertThat(pending.path("diff").size()).isEqualTo(1);
+        assertThat(pending.at("/diff/0/type").stringValue()).isEqualTo("NARROW_SET");
+        assertThat(pending.at("/diff/0/jsonPointer").stringValue()).isEqualTo("/fieldPolicy/CUSTOMER_DATA_READ/allowed");
+        assertThat(pending.at("/diff/0/value/retainedValues").isArray()).isTrue();
+        assertThat(pending.at("/validation/status").stringValue()).isEqualTo("PROPOSED");
+        assertThat(pending.at("/validation/narrowingValid").booleanValue()).isTrue();
+        assertThat(pending.path("source").path("evidenceDigest").stringValue()).startsWith("sha256:");
+        assertThat(pending.path("catalogBinding").path("serverToolCatalogHash").stringValue()).startsWith("sha256:");
+        assertThat(pending.path("generation").isNull()).isTrue();
+        assertThat(pending.path("review").isNull()).isTrue();
+        assertThat(pending.has("recommendedRule")).isFalse();
+        assertThat(pending.path("validation").has("acceptedProposal")).isFalse();
+        assertThat(pending.toString()).doesNotContain("accountNumber","canonicalJson","sourceOracleResultId","inputJson");
+
+        contracts.approve(fixture.validated().id(),'"'+fixture.validated().resourceHash()+'"',
+                "Reviewed narrowing",proposalId,reviewer);
+        var approved=contracts.proposalDetail(proposalId,reviewer);
+        assertThat(approved.path("state").stringValue()).isEqualTo("APPROVED");
+        assertThat(approved.at("/review/decision").stringValue()).isEqualTo("APPROVED");
+        assertThat(approved.at("/review/comment").stringValue()).isEqualTo("Reviewed narrowing");
+        assertThat(approved.at("/review/decidedAt").isString()).isTrue();
+        assertThat(approved.path("generation").isNull()).isTrue();
+    }
+    @Test void rejectedProposalDetailRemainsReadableAfterFindingCloses() throws Exception {
+        PatchFixture fixture=patchFixture();
+        UUID proposalId=fixture.stored().patchProposalId();
+        contracts.rejectPatchProposal(proposalId,"Review rejected",reviewer);
+        jdbcTemplate.update("update findings set status='RESOLVED' where id=?",fixture.source().findingId());
+        assertThatThrownBy(()->service.find(fixture.source().findingId(),reviewer)).hasMessage("Eligible patch source not found");
+        var detail=contracts.proposalDetail(proposalId,reviewer);
+        assertThat(detail.path("state").stringValue()).isEqualTo("REJECTED");
+        assertThat(detail.at("/review/decision").stringValue()).isEqualTo("REJECTED");
+        assertThat(detail.at("/review/comment").stringValue()).isEqualTo("Review rejected");
+        assertThat(detail.path("generation").isNull()).isTrue();
+    }
+    @Test void proposalDetailChecksReviewerBeforeNarrativeAndReturnsFixedIntegrityError() throws Exception {
+        PatchFixture fixture=patchFixture();
+        UUID proposalId=fixture.stored().patchProposalId();
+        jdbcTemplate.update("update patch_proposals set root_cause='secret-narrative' where id=?",proposalId);
+        var foreign=new com.finsecseal.contract.SafetyContractLifecyclePolicy.ReviewerContext(
+                UUID.randomUUID(),"reviewer","AI_SECURITY_REVIEWER","s",true,true,false);
+        var invalid=new com.finsecseal.contract.SafetyContractLifecyclePolicy.ReviewerContext(
+                reviewer.workspaceId(),"reviewer","AI_SECURITY_REVIEWER","s",false,true,false);
+        assertThatThrownBy(()->contracts.proposalDetail(proposalId,foreign))
+                .isInstanceOf(BusinessException.class).hasMessage("Trusted workspace reviewer context is required")
+                .satisfies(error->assertThat(((BusinessException)error).errorCode()).isEqualTo(ErrorCode.OPERATOR_AUTH_REQUIRED));
+        assertThatThrownBy(()->contracts.proposalDetail(proposalId,invalid))
+                .isInstanceOf(BusinessException.class).hasMessage("Trusted workspace reviewer context is required");
+        assertProposalIntegrity(proposalId);
+        assertThatThrownBy(()->contracts.proposalDetail(UUID.randomUUID(),reviewer))
+                .isInstanceOf(BusinessException.class).hasMessage("Patch proposal not found")
+                .satisfies(error->assertThat(((BusinessException)error).errorCode()).isEqualTo(ErrorCode.RESOURCE_NOT_FOUND));
+    }
+    @Test void proposalDetailRejectsForeignAndTamperedStoredBindings() throws Exception {
+        PatchFixture fixture=patchFixture();
+        PatchFixture other=patchFixture();
+        UUID proposalId=fixture.stored().patchProposalId();
+        String originalProof=jdbcTemplate.queryForObject("select validation_json::text from patch_proposals where id=?",String.class,proposalId);
+        String originalDiff=jdbcTemplate.queryForObject("select policy_diff_json::text from patch_proposals where id=?",String.class,proposalId);
+        jdbcTemplate.update("update patch_proposals set base_contract_version_id=null where id=?",proposalId);
+        assertProposalIntegrity(proposalId);
+        jdbcTemplate.update("update patch_proposals set base_contract_version_id=? where id=?",other.base().id(),proposalId);
+        assertProposalIntegrity(proposalId);
+        jdbcTemplate.update("update patch_proposals set base_contract_version_id=? where id=?",fixture.base().id(),proposalId);
+        jdbcTemplate.update("update patch_proposals set validation_json='{}'::jsonb where id=?",proposalId);
+        assertProposalIntegrity(proposalId);
+        jdbcTemplate.update("update patch_proposals set validation_json=cast(? as jsonb) where id=?",originalProof,proposalId);
+        jdbcTemplate.update("update patch_proposals set validation_json=jsonb_set(validation_json,'{candidateVersionId}',to_jsonb(cast(? as text))) where id=?",
+                other.validated().id().toString(),proposalId);
+        assertProposalIntegrity(proposalId);
+        jdbcTemplate.update("update patch_proposals set validation_json=cast(? as jsonb) where id=?",originalProof,proposalId);
+        jdbcTemplate.update("update patch_proposals set policy_diff_json='[{\"kind\":\"Unknown\",\"value\":{}}]'::jsonb where id=?",proposalId);
+        assertProposalIntegrity(proposalId);
+        jdbcTemplate.update("update patch_proposals set policy_diff_json=cast(? as jsonb) where id=?",originalDiff,proposalId);
+        jdbcTemplate.update("update patch_proposals set state='APPROVED' where id=?",proposalId);
+        assertProposalIntegrity(proposalId);
+        jdbcTemplate.update("update patch_proposals set state='PROPOSED' where id=?",proposalId);
+        jdbcTemplate.update("update patch_proposals set generation_model_meta_json='{\"generation\":{\"provider\":\"fake\"}}'::jsonb where id=?",proposalId);
+        assertProposalIntegrity(proposalId);
+        jdbcTemplate.update("update patch_proposals set generation_model_meta_json='{}'::jsonb where id=?",proposalId);
+        jdbcTemplate.update("update safety_contract_versions set policy_hash=? where id=?",HASH_A,fixture.validated().id());
+        assertProposalIntegrity(proposalId);
+    }
+    @Test void proposalDetailRejectsSecretInOtherwiseBoundedNarrative() throws Exception {
+        PatchFixture fixture=patchFixture();
+        UUID proposalId=fixture.stored().patchProposalId();
+        String secret="sk-ABCDEFGHIJKLMNOPQRST";
+        jdbcTemplate.update("""
+            update patch_proposals set root_cause=?,
+                validation_json=jsonb_set(validation_json,'{decision,acceptedProposal,rootCause}',to_jsonb(cast(? as text)))
+            where id=?
+            """,secret,secret,proposalId);
+        assertProposalIntegrity(proposalId);
+    }
+    private void assertProposalIntegrity(UUID proposalId) {
+        assertThatThrownBy(()->contracts.proposalDetail(proposalId,reviewer))
+                .isInstanceOf(BusinessException.class).hasMessage("Patch proposal integrity check failed")
+                .satisfies(error->assertThat(((BusinessException)error).errorCode()).isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE));
+    }
     @Test void approvedPolicyInvalidatesPriorDecisionWithoutDeletingEvidence() throws Exception {
         Seed s=seed("SEED",false,false);
         var proposal=assurance.evaluate(s.releaseId(),"reviewer");

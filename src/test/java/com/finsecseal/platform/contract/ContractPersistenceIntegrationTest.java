@@ -339,6 +339,38 @@ class ContractPersistenceIntegrationTest {
         assertThat(json.readTree(cookieResult.body()).at("/data/id").stringValue()).isEqualTo(cookieProposal.toString());
     }
 
+    @Test void proposalDetailRouteRequiresReviewerAndHidesCorruptStoredNarrative() throws Exception {
+        UUID proposalId=pendingProposal();
+        String path="/api/v1/patch-proposals/"+proposalId;
+        assertThat(api("GET",path,null,Map.of()).statusCode()).isEqualTo(403);
+        assertThat(api("GET",path,null,Map.of("X-Contract-Reviewer-Key","wrong")).statusCode()).isEqualTo(403);
+        assertThat(api("GET",path,null,Map.of("X-Contract-Reviewer-Key",KEY,"X-Actor-Id","forged")).statusCode()).isEqualTo(403);
+        assertThat(api("GET",path,null,Map.of("Cookie",expiredReviewerCookie())).statusCode()).isEqualTo(403);
+        assertThat(api("GET","/api/v1/%70atch-proposals/"+proposalId,null,
+                Map.of("X-Contract-Reviewer-Key",KEY)).statusCode()).isEqualTo(400);
+        assertThat(api("GET",path+";bad",null,Map.of("X-Contract-Reviewer-Key",KEY)).statusCode()).isEqualTo(400);
+        assertThat(api("GET","/api/v1/patch-proposals/not-a-uuid",null,
+                Map.of("X-Contract-Reviewer-Key",KEY)).statusCode()).isEqualTo(400);
+        assertThat(api("GET","/api/v1/patch-proposals/"+UUID.randomUUID(),null,
+                Map.of("X-Contract-Reviewer-Key",KEY)).statusCode()).isEqualTo(404);
+
+        // This #91 fixture intentionally has no accepted C proof; its reviewer-visible failure is fixed.
+        var invalid=api("GET",path,null,Map.of("X-Contract-Reviewer-Key",KEY));
+        assertThat(invalid.statusCode()).withFailMessage(invalid.body()).isEqualTo(409);
+        assertThat(json.readTree(invalid.body()).path("code").stringValue()).isEqualTo("EVIDENCE_INCOMPLETE");
+        assertThat(invalid.body()).contains("Patch proposal integrity check failed")
+                .doesNotContain("Excessive scope","recommended_rule_json","patch_proposals","select p.");
+
+        var issued=api("GET","/api/v1/reviewer-session",null,Map.of("X-Contract-Reviewer-Key",KEY));
+        String cookie=issued.headers().firstValue("Set-Cookie").orElseThrow().split(";",2)[0];
+        String csrf=json.readTree(issued.body()).at("/data/csrfToken").stringValue();
+        assertThat(api("GET",path,null,Map.of("Cookie",cookie)).statusCode()).isEqualTo(409);
+        String sessionId=json.readTree(issued.body()).at("/data/sessionId").stringValue();
+        assertThat(api("DELETE","/api/v1/reviewer-session/"+sessionId,null,
+                Map.of("Cookie",cookie,"X-CSRF-Token",csrf,"Idempotency-Key",UUID.randomUUID().toString())).statusCode()).isEqualTo(204);
+        assertThat(api("GET",path,null,Map.of("Cookie",cookie)).statusCode()).isEqualTo(403);
+    }
+
     private UUID pendingProposal() throws Exception {
         UUID releaseId=release();
         var base=service.create(releaseId,fixture("loan-review-safety-contract.json"),reviewer);

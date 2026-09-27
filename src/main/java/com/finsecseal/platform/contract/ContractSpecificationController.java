@@ -69,6 +69,19 @@ public class ContractSpecificationController {
                 ContractController.reviewer(request)), TraceIdFilter.currentTraceId());
     }
 
+    @GetMapping("/patch-proposals/{id}")
+    ApiResponse<JsonNode> proposalDetail(@PathVariable String id, HttpServletRequest request) {
+        UUID proposalId;
+        try {
+            proposalId = UUID.fromString(id);
+            if (!proposalId.toString().equalsIgnoreCase(id)) throw new IllegalArgumentException();
+        } catch (IllegalArgumentException exception) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Patch proposal ID must be a UUID");
+        }
+        return ApiResponse.success(service.proposalDetail(proposalId, ContractController.reviewer(request)),
+                TraceIdFilter.currentTraceId());
+    }
+
     @GetMapping("/contract-versions/{id}/approved")
     ApiResponse<?> approved(@PathVariable UUID id, @RequestParam UUID releaseId, HttpServletRequest request) {
         return ApiResponse.success(service.approved(releaseId, id, ContractController.reviewer(request)), TraceIdFilter.currentTraceId());

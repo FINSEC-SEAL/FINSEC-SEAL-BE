@@ -11,17 +11,22 @@ import com.finsecseal.contract.SafetyContractPatchOperation;
 import com.finsecseal.contract.ReleaseToolCatalogContractAdapter;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy;
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.*;
+import com.finsecseal.evidence.RedactionService;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import com.finsecseal.release.ReleaseService;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.*;
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ArrayNode;
+import tools.jackson.databind.node.ObjectNode;
 
 /** A owns persistence and source integrity; C owns every validation/approval decision. */
 @Service
@@ -38,13 +43,16 @@ public class ContractPersistenceService {
     private final PatchSourceService patchSources;
     private final SafetyContractPatchProposalPolicy patchPolicy;
     private final ReleaseToolCatalogContractAdapter catalogs;
+    private final RedactionService redaction;
     public ContractPersistenceService(JdbcTemplate db, ObjectMapper json, SafetyContractCanonicalizer canonicalizer,
             SafetyContractLifecyclePolicy lifecycle, CanonicalJsonService canonical, DigestService digest,
             AuditService audit, ReleaseService releases, PatchSourceService patchSources,
-            SafetyContractPatchProposalPolicy patchPolicy, ReleaseToolCatalogContractAdapter catalogs) {
+            SafetyContractPatchProposalPolicy patchPolicy, ReleaseToolCatalogContractAdapter catalogs,
+            RedactionService redaction) {
         this.db=db;this.json=json;this.canonicalizer=canonicalizer;this.lifecycle=lifecycle;
         this.canonical=canonical;this.digest=digest;this.audit=audit;this.releases=releases;
         this.patchSources=patchSources;this.patchPolicy=patchPolicy;this.catalogs=catalogs;
+        this.redaction=redaction;
     }
     public record Version(UUID id, UUID workspaceId, UUID releaseId, String contractKey, int version,
             String state, JsonNode policy, String policyHash, String resourceHash, String basePolicyHash,
@@ -52,6 +60,15 @@ public class ContractPersistenceService {
     public record ApprovedContract(Version version, String agentArtifactFingerprint, String releaseFingerprint) {}
     private record ReleaseState(UUID workspaceId, String policyHash, String artifact, String fingerprint, String state) {}
     private record PatchReview(UUID findingId, UUID baseVersionId, String state, UUID releaseId) {}
+    private record ProposalScope(UUID findingId, UUID releaseId, UUID workspaceId) {}
+    private record ProposalEvidence(UUID findingId, UUID releaseId, UUID baseVersionId, String state,
+            String rootCause, String recommendedRule, String diff, String impact, String rollback,
+            String generation, String validation, String sourceEvidenceDigest, String violatedInvariant,
+            Instant createdAt, Instant updatedAt) {}
+    private record ProposalReview(UUID candidateId, String decision, String actorId, String comment,
+            String baseHash, String resultHash, Instant decidedAt) {}
+    private record GenerationEvidence(UUID operationId, UUID versionId, String metadata, String metadataHash,
+            UUID workspaceId, UUID releaseId, String kind, String status, String outcome, String source) {}
 
     public record History(List<JsonNode> items, String nextCursor) {}
 
@@ -235,6 +252,250 @@ public class ContractPersistenceService {
 
     public record StoredPatch(UUID patchProposalId, Version candidate) {}
     public record RejectedPatch(UUID id, UUID findingId, UUID baseContractVersionId, String state, Instant decidedAt) {}
+
+    /** Historical reviewer detail from one snapshot; current Finding eligibility is not re-evaluated. */
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public JsonNode proposalDetail(UUID proposalId, ReviewerContext reviewer) {
+        // The first read contains only ownership metadata, never narratives or model metadata.
+        var scopes = db.query("""
+            select p.finding_id,f.release_id,a.workspace_id
+            from patch_proposals p join findings f on f.id=p.finding_id
+            join agent_releases r on r.id=f.release_id join agents a on a.id=r.agent_id
+            where p.id=?
+            """, (rs,n) -> new ProposalScope(rs.getObject(1,UUID.class), rs.getObject(2,UUID.class),
+                    rs.getObject(3,UUID.class)), proposalId);
+        if (scopes.isEmpty()) fail(ErrorCode.RESOURCE_NOT_FOUND, "Patch proposal not found");
+        ProposalScope scope = scopes.getFirst();
+        requireReviewer(reviewer, scope.workspaceId());
+        try {
+            return readProposalDetail(proposalId, scope, reviewer);
+        } catch (DataAccessException exception) {
+            throw exception;
+        } catch (RuntimeException exception) {
+            throw proposalIntegrity();
+        }
+    }
+
+    private JsonNode readProposalDetail(UUID proposalId, ProposalScope scope, ReviewerContext reviewer) {
+        var rows = db.query("""
+            select p.finding_id,f.release_id,p.base_contract_version_id,p.state,p.root_cause,
+                   p.recommended_rule_json::text,p.policy_diff_json::text,
+                   p.normal_workflow_impact_json::text,p.rollback_json::text,
+                   p.generation_model_meta_json::text,p.validation_json::text,
+                   o.evidence_digest,f.violated_invariant,p.created_at,p.updated_at
+            from patch_proposals p join findings f on f.id=p.finding_id
+            join oracle_results o on o.id=f.source_oracle_result_id where p.id=?
+            """, (rs,n) -> new ProposalEvidence(rs.getObject(1,UUID.class),rs.getObject(2,UUID.class),
+                    rs.getObject(3,UUID.class),rs.getString(4),rs.getString(5),rs.getString(6),rs.getString(7),
+                    rs.getString(8),rs.getString(9),rs.getString(10),rs.getString(11),rs.getString(12),
+                    rs.getString(13),rs.getTimestamp(14).toInstant(),rs.getTimestamp(15).toInstant()), proposalId);
+        if (rows.size()!=1) throw proposalIntegrity();
+        ProposalEvidence row = rows.getFirst();
+        if (!scope.findingId().equals(row.findingId()) || !scope.releaseId().equals(row.releaseId())
+                || row.baseVersionId()==null || !Set.of("PROPOSED","APPROVED","REJECTED").contains(row.state()))
+            throw proposalIntegrity();
+        Version base = find(row.baseVersionId(), reviewer);
+        JsonNode proof = parse(row.validation());
+        UUID candidateId = proposalUuid(proof.path("candidateVersionId"));
+        Version candidate = find(candidateId, reviewer);
+        if (!scope.workspaceId().equals(base.workspaceId()) || !scope.workspaceId().equals(candidate.workspaceId())
+                || !scope.releaseId().equals(base.releaseId()) || !scope.releaseId().equals(candidate.releaseId())
+                || !base.contractKey().equals(candidate.contractKey()) || candidate.version()!=base.version()+1
+                || !candidate.policyHash().equals(canonicalizer.canonicalizeAndHash(parse(row.recommendedRule())).policyHash()))
+            throw proposalIntegrity();
+
+        JsonNode decision = proof.path("decision");
+        JsonNode accepted = decision.path("acceptedProposal");
+        JsonNode source = accepted.path("source");
+        JsonNode catalog = accepted.path("catalogBinding");
+        JsonNode narrowing = decision.path("narrowing");
+        JsonNode semantic = decision.path("semantic");
+        if (!"PROPOSED".equals(proposalText(decision,"status")) || !decision.path("issues").isArray()
+                || !decision.path("issues").isEmpty() || !accepted.isObject()
+                || !scope.findingId().equals(proposalUuid(source.path("findingId")))
+                || !scope.workspaceId().equals(proposalUuid(source.path("workspaceId")))
+                || !scope.releaseId().equals(proposalUuid(source.path("releaseId")))
+                || !Set.of("OPEN","TRIAGED").contains(proposalText(source,"findingStatus"))
+                || !Set.of("SEED","MUTATION").contains(proposalText(source,"sourcePartition"))
+                || !source.path("hiddenFromPatchGenerator").isBoolean()
+                || source.path("hiddenFromPatchGenerator").booleanValue()
+                || !proposalDigest(source,"evidenceDigest").equals(proposalDigest(row.sourceEvidenceDigest()))
+                || !proposalText(source,"violatedInvariant").equals(row.violatedInvariant())
+                || !base.id().equals(proposalUuid(accepted.path("baseIdentity").path("versionId")))
+                || !base.workspaceId().equals(proposalUuid(accepted.path("baseIdentity").path("workspaceId")))
+                || !base.releaseId().equals(proposalUuid(accepted.path("baseIdentity").path("releaseId")))
+                || !base.contractKey().equals(proposalText(accepted.path("baseIdentity"),"contractKey"))
+                || base.version()!=proposalInteger(accepted.path("baseIdentity"),"version")
+                || !base.policyHash().equals(proposalDigest(accepted,"basePolicyHash"))
+                || !candidate.policyHash().equals(proposalDigest(accepted.path("resultPolicy"),"policyHash"))
+                || !canonicalizer.canonicalizeAndHash(parse(proposalText(accepted.path("resultPolicy"),"canonicalJson")))
+                    .policyHash().equals(candidate.policyHash())
+                || !scope.releaseId().equals(proposalUuid(catalog.path("releaseId")))
+                || !narrowing.path("valid").isBoolean() || !narrowing.path("valid").booleanValue()
+                || !narrowing.path("issues").isArray() || !narrowing.path("issues").isEmpty()
+                || !Set.of("VALID","WARN").contains(proposalText(semantic,"status")))
+            throw proposalIntegrity();
+        proposalText(catalog,"manifestSchemaVersion");
+        proposalDigest(catalog,"agentArtifactFingerprint");
+        proposalDigest(catalog,"releaseFingerprint");
+        proposalDigest(catalog,"serverToolCatalogHash");
+
+        String impact = proposalString(parse(row.impact()));
+        String rollback = proposalString(parse(row.rollback()));
+        if (!proposalText(accepted,"rootCause").equals(row.rootCause())
+                || !proposalText(accepted,"normalWorkflowImpact").equals(impact)
+                || !proposalText(accepted,"rollback").equals(rollback)) throw proposalIntegrity();
+        JsonNode storedDiff = parse(row.diff());
+        if (!storedDiff.isArray() || storedDiff.isEmpty() || storedDiff.size()>100) throw proposalIntegrity();
+        List<SafetyContractPatchOperation> operations = new ArrayList<>();
+        ArrayNode diff = json.createArrayNode();
+        for (JsonNode entry : storedDiff) {
+            String kind = proposalText(entry,"kind");
+            Class<? extends SafetyContractPatchOperation> type = switch (kind) {
+                case "AddConstraint" -> SafetyContractPatchOperation.AddConstraint.class;
+                case "NarrowSet" -> SafetyContractPatchOperation.NarrowSet.class;
+                case "LowerLimit" -> SafetyContractPatchOperation.LowerLimit.class;
+                case "DenyTool" -> SafetyContractPatchOperation.DenyTool.class;
+                case "SetHumanOnly" -> SafetyContractPatchOperation.SetHumanOnly.class;
+                default -> throw proposalIntegrity();
+            };
+            SafetyContractPatchOperation operation = json.treeToValue(entry.path("value"), type);
+            operations.add(operation);
+            diff.addObject().put("type", operation.type().name()).put("jsonPointer", operation.jsonPointer())
+                    .set("value", json.valueToTree(operation));
+        }
+        if (!json.valueToTree(operations).equals(accepted.path("operations"))
+                || !narrowing.path("validatedPatch").path("operations").equals(accepted.path("operations"))
+                || !base.policyHash().equals(proposalDigest(narrowing.path("validatedPatch"),"basePolicyHash"))
+                || !candidate.policyHash().equals(proposalDigest(narrowing.path("validatedPatch"),"resultPolicyHash")))
+            throw proposalIntegrity();
+
+        var reviews = db.query("""
+            select resulting_contract_version_id,decision,reviewer_actor_id,comment,base_hash,result_hash,decided_at
+            from patch_approvals where patch_proposal_id=?
+            """, (rs,n) -> new ProposalReview(rs.getObject(1,UUID.class),rs.getString(2),rs.getString(3),
+                    rs.getString(4),rs.getString(5),rs.getString(6),rs.getTimestamp(7).toInstant()), proposalId);
+        if (reviews.size()>1 || ("PROPOSED".equals(row.state()) != reviews.isEmpty())) throw proposalIntegrity();
+        ProposalReview review = reviews.isEmpty() ? null : reviews.getFirst();
+        if (review!=null && (!row.state().equals(review.decision())
+                || !base.policyHash().equals(proposalDigest(review.baseHash()))
+                || ("APPROVED".equals(row.state())
+                    ? !candidate.id().equals(review.candidateId()) || !candidate.policyHash().equals(proposalDigest(review.resultHash()))
+                        || !"APPROVED".equals(candidate.state())
+                        || !proposalId.equals(proposalUuid(candidate.review().path("patchProposalId")))
+                    : review.candidateId()!=null || review.resultHash()!=null || "APPROVED".equals(candidate.state()))))
+            throw proposalIntegrity();
+        if (review==null && "APPROVED".equals(candidate.state())) throw proposalIntegrity();
+
+        JsonNode generation = verifiedGeneration(proposalId, scope, row, base, candidate, source, catalog);
+        ObjectNode detail = json.createObjectNode();
+        detail.put("id",proposalId.toString()).put("findingId",scope.findingId().toString())
+                .put("releaseId",scope.releaseId().toString()).put("baseContractVersionId",base.id().toString())
+                .put("candidateContractVersionId",candidate.id().toString()).put("basePolicyHash",base.policyHash())
+                .put("candidatePolicyHash",candidate.policyHash()).put("state",row.state())
+                .put("rootCause",row.rootCause()).put("normalWorkflowImpact",impact).put("rollback",rollback)
+                .put("createdAt",row.createdAt().toString()).put("updatedAt",row.updatedAt().toString());
+        detail.set("diff",diff);
+        ObjectNode validation = detail.putObject("validation");
+        validation.put("status","PROPOSED").put("narrowingValid",true)
+                .put("semanticStatus",proposalText(semantic,"status"));
+        ArrayNode issues = validation.putArray("issues");
+        JsonNode semanticIssues = semantic.path("issues");
+        if (!semanticIssues.isArray() || semanticIssues.size()>100) throw proposalIntegrity();
+        for (JsonNode issue : semanticIssues) {
+            String code = proposalText(issue,"code");
+            String pointer = proposalText(issue,"jsonPointer");
+            if (!code.matches("[A-Z0-9_]{1,100}") || !pointer.startsWith("/") || pointer.length()>300
+                    || !"WARNING".equals(proposalText(issue,"severity"))) throw proposalIntegrity();
+            issues.addObject().put("code",code).put("jsonPointer",pointer).put("severity","WARNING");
+        }
+        if (("VALID".equals(proposalText(semantic,"status")) != issues.isEmpty())) throw proposalIntegrity();
+        detail.putObject("source").put("partition",proposalText(source,"sourcePartition"))
+                .put("evidenceDigest",proposalDigest(source,"evidenceDigest"))
+                .put("violatedInvariant",row.violatedInvariant());
+        detail.putObject("catalogBinding").put("manifestSchemaVersion",proposalText(catalog,"manifestSchemaVersion"))
+                .put("agentArtifactFingerprint",proposalDigest(catalog,"agentArtifactFingerprint"))
+                .put("releaseFingerprint",proposalDigest(catalog,"releaseFingerprint"))
+                .put("serverToolCatalogHash",proposalDigest(catalog,"serverToolCatalogHash"));
+        if (generation==null) detail.putNull("generation"); else detail.set("generation",generation);
+        if (review==null) detail.putNull("review");
+        else detail.putObject("review").put("decision",review.decision()).put("reviewerActorId",review.actorId())
+                .put("comment",review.comment()).put("decidedAt",review.decidedAt().toString());
+        return redaction.redact(detail).redacted();
+    }
+
+    private JsonNode verifiedGeneration(UUID proposalId, ProposalScope scope, ProposalEvidence row,
+            Version base, Version candidate, JsonNode source, JsonNode catalog) {
+        JsonNode metadata = parse(row.generation());
+        var records = db.query("""
+            select g.operation_id,g.version_id,g.metadata_json::text,g.metadata_hash,
+                   o.workspace_id,o.release_id,o.kind,o.status,o.outcome,o.source_json::text
+            from contract_generation_records g join generation_operations o on o.id=g.operation_id
+            where g.patch_proposal_id=?
+            """, (rs,n) -> new GenerationEvidence(rs.getObject(1,UUID.class),rs.getObject(2,UUID.class),
+                    rs.getString(3),rs.getString(4),rs.getObject(5,UUID.class),rs.getObject(6,UUID.class),
+                    rs.getString(7),rs.getString(8),rs.getString(9),rs.getString(10)), proposalId);
+        if (records.isEmpty() && metadata.isObject() && metadata.isEmpty()) return null;
+        if (records.size()!=1 || !metadata.isObject() || metadata.isEmpty()) throw proposalIntegrity();
+        GenerationEvidence record = records.getFirst();
+        JsonNode committed = parse(record.metadata());
+        if (!metadata.equals(committed) || !digest.sha256(canonical.canonicalize(committed)).equals(proposalDigest(record.metadataHash()))
+                || !candidate.id().equals(record.versionId()) || !scope.workspaceId().equals(record.workspaceId())
+                || !scope.releaseId().equals(record.releaseId()) || !"PATCH".equals(record.kind())
+                || !"SUCCEEDED".equals(record.status()) || !"PROPOSED".equals(record.outcome())
+                || !parse(record.source()).equals(committed.path("source"))
+                || !source.equals(committed.path("source").path("finding"))
+                || !catalog.equals(committed.path("source").path("catalog"))
+                || !scope.findingId().equals(proposalUuid(committed.path("source").path("findingId")))
+                || !base.id().equals(proposalUuid(committed.path("source").path("baseVersionId")))
+                || !base.policyHash().equals(proposalDigest(committed.path("source"),"basePolicyHash"))
+                || !candidate.id().equals(proposalUuid(committed.path("reservedIdentity").path("versionId")))
+                || !candidate.workspaceId().equals(proposalUuid(committed.path("reservedIdentity").path("workspaceId")))
+                || !candidate.releaseId().equals(proposalUuid(committed.path("reservedIdentity").path("releaseId")))
+                || !candidate.contractKey().equals(proposalText(committed.path("reservedIdentity"),"contractKey"))
+                || candidate.version()!=proposalInteger(committed.path("reservedIdentity"),"version")
+                || !"PROPOSED".equals(proposalText(committed,"outcome"))) throw proposalIntegrity();
+        JsonNode model = committed.path("generation");
+        if (!model.path("latencyMs").isIntegralNumber() || !model.path("latencyMs").canConvertToLong()
+                || model.path("latencyMs").longValue()<0
+                || !proposalDigest(model,"sourceEvidenceDigest").equals(proposalDigest(source,"evidenceDigest")))
+            throw proposalIntegrity();
+        ObjectNode result = json.createObjectNode();
+        result.put("operationId",record.operationId().toString())
+                .put("templateKey",proposalText(model,"templateKey"))
+                .put("promptVersion",proposalText(model,"promptVersion"))
+                .put("promptDigest",proposalDigest(model,"promptDigest"))
+                .put("provider",proposalText(model,"provider"))
+                .put("model",proposalText(model,"model"))
+                .put("latencyMs",model.path("latencyMs").longValue())
+                .put("sourceEvidenceDigest",proposalDigest(model,"sourceEvidenceDigest"))
+                .put("redactedEvidenceDigest",proposalDigest(model,"redactedEvidenceDigest"))
+                .put("metadataHash",proposalDigest(record.metadataHash()));
+        return result;
+    }
+
+    private static String proposalText(JsonNode node, String field) { return proposalString(node.path(field)); }
+    private static String proposalString(JsonNode node) {
+        if (!node.isString() || node.stringValue().isBlank()) throw proposalIntegrity();
+        return node.stringValue();
+    }
+    private static String proposalDigest(JsonNode node, String field) { return proposalDigest(proposalText(node,field)); }
+    private static String proposalDigest(String value) {
+        if (value==null || !value.matches("sha256:[0-9a-f]{64}")) throw proposalIntegrity();
+        return value;
+    }
+    private static UUID proposalUuid(JsonNode node) {
+        try { return UUID.fromString(proposalString(node)); }
+        catch (IllegalArgumentException exception) { throw proposalIntegrity(); }
+    }
+    private static int proposalInteger(JsonNode node, String field) {
+        JsonNode value = node.path(field);
+        if (!value.isIntegralNumber() || !value.canConvertToInt()) throw proposalIntegrity();
+        return value.intValue();
+    }
+    private static BusinessException proposalIntegrity() {
+        return new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE,"Patch proposal integrity check failed");
+    }
 
     /** Reject the proposal without changing its candidate Contract or the Release's effective policy. */
     @Transactional
