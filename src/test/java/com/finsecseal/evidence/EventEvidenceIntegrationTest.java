@@ -3,6 +3,7 @@ package com.finsecseal.evidence;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.finsecseal.audit.AuditDto;
 import com.finsecseal.audit.AuditService;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
@@ -10,13 +11,19 @@ import com.finsecseal.common.domain.ExecutionEventType;
 import com.finsecseal.common.domain.TestCaseRunStatus;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.common.domain.TestRunStatus;
+import com.finsecseal.common.persistence.UuidV7;
+import com.finsecseal.release.CanonicalJsonService;
+import com.finsecseal.release.DigestService;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.sql.Timestamp;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -33,6 +40,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ObjectNode;
 
 @Testcontainers
@@ -52,6 +60,12 @@ class EventEvidenceIntegrationTest {
 
     @Autowired
     ObjectMapper objectMapper;
+
+    @Autowired
+    CanonicalJsonService canonicalJsonService;
+
+    @Autowired
+    DigestService digestService;
 
     @Autowired
     TestRunPersistenceService runPersistenceService;
@@ -253,6 +267,126 @@ class EventEvidenceIntegrationTest {
     }
 
     @Test
+    void rejectsEveryPublicEventWriteWithoutChangingEvidence() throws Exception {
+        Seed seed = seedRun();
+        URI eventsUri = URI.create("http://localhost:" + port + "/api/v1/test-runs/" + seed.runId() + "/events");
+        HttpClient client = HttpClient.newHttpClient();
+        long headBefore = eventService.history(seed.runId(), 0, 100).headSequence();
+        int eventsBefore = jdbcTemplate.queryForObject(
+                "select count(*) from execution_events where run_id = ?", Integer.class, seed.runId());
+        int counterRowsBefore = jdbcTemplate.queryForObject(
+                "select count(*) from run_event_counters where run_id = ?", Integer.class, seed.runId());
+        assertThat(counterRowsBefore).isZero();
+        int outboxBefore = jdbcTemplate.queryForObject(
+                "select count(*) from event_outbox where run_id = ?", Integer.class, seed.runId());
+        int auditsBefore = jdbcTemplate.queryForObject(
+                "select count(*) from audit_records where action = 'EXECUTION_EVENT_APPENDED'",
+                Integer.class);
+        int idempotencyBefore = jdbcTemplate.queryForObject(
+                "select count(*) from api_idempotency_records where request_path = ?",
+                Integer.class, eventsUri.getPath());
+
+        for (ExecutionEventType eventType : ExecutionEventType.values()) {
+            assertPublicEventPostForbidden(client, eventsUri,
+                    "{\"traceId\":\"" + UUID.randomUUID() + "\",\"eventType\":\""
+                            + eventType.name() + "\",\"metadata\":{}}");
+        }
+        assertPublicEventPostForbidden(client, eventsUri,
+                "{\"traceId\":\"" + UUID.randomUUID() + "\",\"eventType\":\"FUTURE_EVENT\"}");
+        assertPublicEventPostForbidden(client, eventsUri, "{malformed-json");
+        String proposal = "{\"traceId\":\"" + UUID.randomUUID() + "\",\"eventType\":\"TOOL_PROPOSED\"}";
+        assertPublicEventPostForbidden(client, eventsUri, proposal, "event-forbidden-" + UUID.randomUUID());
+        assertPublicEventPostForbidden(client, eventsUri, proposal, "invalid key");
+
+        assertThat(eventService.history(seed.runId(), 0, 100).headSequence()).isEqualTo(headBefore);
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from execution_events where run_id = ?", Integer.class, seed.runId()))
+                .isEqualTo(eventsBefore);
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from run_event_counters where run_id = ?", Integer.class, seed.runId()))
+                .isEqualTo(counterRowsBefore);
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from event_outbox where run_id = ?", Integer.class, seed.runId()))
+                .isEqualTo(outboxBefore);
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from audit_records where action = 'EXECUTION_EVENT_APPENDED'", Integer.class))
+                .isEqualTo(auditsBefore);
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from api_idempotency_records where request_path = ?",
+                Integer.class, eventsUri.getPath()))
+                .isEqualTo(idempotencyBefore);
+
+        ExecutionEventDto.Event internal = eventService.append(seed.runId(),
+                new ExecutionEventDto.AppendRequest(null, UUID.randomUUID(), ExecutionEventType.RUN_STARTED,
+                        null, null, null, null, null, objectMapper.createObjectNode()), "runtime-b");
+        assertThat(internal.sequence()).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject(
+                "select last_sequence from run_event_counters where run_id = ?", Long.class, seed.runId()))
+                .isEqualTo(1L);
+        HttpResponse<String> history = client.send(HttpRequest.newBuilder(URI.create("http://localhost:" + port
+                        + "/api/v1/test-runs/" + seed.runId() + "/event-history"))
+                        .GET().build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(history.statusCode()).isEqualTo(200);
+        assertThat(objectMapper.readTree(history.body()).path("data").path("items").size()).isEqualTo(1);
+    }
+
+    private void assertPublicEventPostForbidden(HttpClient client, URI uri, String body) throws Exception {
+        assertPublicEventPostForbidden(client, uri, body, null);
+    }
+
+    private void assertPublicEventPostForbidden(HttpClient client, URI uri, String body, String idempotencyKey)
+            throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(uri)
+                .header("Content-Type", "application/json")
+                .header("X-Actor-Id", "runtime-b");
+        if (idempotencyKey != null) {
+            request.header("Idempotency-Key", idempotencyKey);
+        }
+        HttpResponse<String> response = client.send(request.POST(HttpRequest.BodyPublishers.ofString(body)).build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).isEqualTo(403);
+        JsonNode problem = objectMapper.readTree(response.body());
+        assertThat(problem.path("code").asString()).isEqualTo("EXECUTION_EVENT_INGEST_FORBIDDEN");
+        assertThat(problem.path("retryable").isBoolean()).isTrue();
+        assertThat(problem.path("retryable").booleanValue()).isFalse();
+    }
+
+    @Test
+    void keepsIdempotencyAdmissionOnOtherRunMutations() throws Exception {
+        HttpClient client = HttpClient.newHttpClient();
+        URI startUri = URI.create("http://localhost:" + port + "/api/v1/test-runs");
+        HttpResponse<String> missingKey = client.send(HttpRequest.newBuilder(startUri)
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString("{}"))
+                        .build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(missingKey.statusCode()).isEqualTo(400);
+        assertThat(objectMapper.readTree(missingKey.body()).path("code").asString())
+                .isEqualTo("VALIDATION_ERROR");
+
+        String key = "run-start-" + UUID.randomUUID();
+        HttpResponse<String> admitted = client.send(HttpRequest.newBuilder(startUri)
+                        .header("Content-Type", "application/json")
+                        .header("Idempotency-Key", key)
+                        .POST(HttpRequest.BodyPublishers.ofString("{}"))
+                        .build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(admitted.statusCode()).isEqualTo(400);
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from api_idempotency_records
+                 where request_path = ? and idempotency_key = ?
+                """, Integer.class, startUri.getPath(), key)).isEqualTo(1);
+
+        URI malformedRunEvents = URI.create("http://localhost:" + port
+                + "/api/v1/test-runs/not-a-uuid/events");
+        HttpResponse<String> malformedPath = client.send(HttpRequest.newBuilder(malformedRunEvents)
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString("{}"))
+                        .build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(malformedPath.statusCode()).isEqualTo(400);
+        assertThat(objectMapper.readTree(malformedPath.body()).path("code").asString())
+                .isEqualTo("VALIDATION_ERROR");
+    }
+
+    @Test
     void replaysSseFromLastEventIdWithoutRawSensitiveValues() throws Exception {
         Seed seed = seedRun();
         UUID traceId = UUID.randomUUID();
@@ -309,6 +443,107 @@ class EventEvidenceIntegrationTest {
                 .contains("[SYNTH_ID:")
                 .doesNotContain("id:1\n")
                 .doesNotContain("sse-raw-customer");
+    }
+
+    @Test
+    void browserAfterStartsAtSelectedCursorAndReconnectHeaderTakesPrecedence() throws Exception {
+        Seed seed = seedRun();
+        UUID traceId = UUID.randomUUID();
+        eventService.append(seed.runId(), new ExecutionEventDto.AppendRequest(
+                null, traceId, ExecutionEventType.RUN_STARTED, null,
+                null, null, null, null, objectMapper.createObjectNode()
+        ), "runtime-b");
+        eventService.append(seed.runId(), new ExecutionEventDto.AppendRequest(
+                null, traceId, ExecutionEventType.MODEL_REQUEST, null,
+                null, null, null, null, objectMapper.createObjectNode()
+        ), "runtime-b");
+
+        assertThat(firstSseEvent(seed.runId(), "?after=1", null))
+                .contains("id:2\n", "event:trace.event")
+                .doesNotContain("id:1\n");
+        assertThat(firstSseEvent(seed.runId(), "?after=0", "1"))
+                .contains("id:2\n", "event:trace.event")
+                .doesNotContain("id:1\n");
+        assertThat(firstSseEvent(seed.runId(), "", null))
+                .contains("id:1\n", "event:run.status");
+    }
+
+    @Test
+    void rejectsMalformedBrowserCursorBeforeOpeningAStream() throws Exception {
+        Seed seed = seedRun();
+        String base = "http://localhost:" + port + "/api/v1/test-runs/" + seed.runId() + "/events";
+        for (String query : List.of("?after=", "?after=-1", "?after=abc",
+                "?after=1&after=2", "?after=9223372036854775808")) {
+            HttpResponse<String> response = HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create(base + query))
+                            .header("Accept", "text/event-stream")
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString()
+            );
+            assertThat(response.statusCode()).as(query).isEqualTo(400);
+            assertThat(response.body()).as(query).contains("VALIDATION_ERROR");
+        }
+        HttpResponse<String> invalidHeader = HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create(base + "?after=0"))
+                        .header("Accept", "text/event-stream")
+                        .header("Last-Event-ID", "not-a-sequence")
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString()
+        );
+        assertThat(invalidHeader.statusCode()).isEqualTo(400);
+        assertThat(invalidHeader.body()).contains("VALIDATION_ERROR");
+    }
+
+    @Test
+    void expiresOldSseCursorWhileKeepingIntactCanonicalHistory() throws Exception {
+        Seed seed = seedRun();
+        UUID oldEventId = insertOldStartedEvent(seed.runId());
+        assertThat(eventService.verifyChain(seed.runId()).valid()).isTrue();
+        assertThat(eventService.history(seed.runId(), 0, 10).items())
+                .extracting(ExecutionEventDto.Event::eventId)
+                .containsExactly(oldEventId);
+
+        String base = "http://localhost:" + port + "/api/v1/test-runs/" + seed.runId();
+        HttpResponse<String> canonical = HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create(base + "/event-history?after=0&limit=10"))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString()
+        );
+        assertThat(canonical.statusCode()).isEqualTo(200);
+        assertThat(canonical.body()).contains(oldEventId.toString());
+
+        HttpResponse<String> expired = HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create(base + "/events"))
+                        .header("Accept", "text/event-stream")
+                        .header("Last-Event-ID", "0")
+                        .timeout(Duration.ofSeconds(5))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString()
+        );
+        assertThat(expired.statusCode()).isEqualTo(410);
+        assertThat(expired.body()).contains("STREAM_CURSOR_EXPIRED");
+        HttpResponse<String> expiredQuery = HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create(base + "/events?after=0"))
+                        .header("Accept", "text/event-stream")
+                        .timeout(Duration.ofSeconds(5))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString()
+        );
+        assertThat(expiredQuery.statusCode()).isEqualTo(410);
+        assertThat(expiredQuery.body()).contains("STREAM_CURSOR_EXPIRED");
+        assertThat(eventService.streamReplayHistory(seed.runId(), 1, 10).items()).isEmpty();
+
+        Seed newRun = seedRun();
+        assertThat(eventService.streamReplayHistory(newRun.runId(), 0, 10).items()).isEmpty();
+    }
+
+    @Test
+    void streamReplayCountWindowKeepsExactlyTenThousandEvents() {
+        assertThat(ExecutionEventService.firstStreamReplaySequence(1L, 10_000, null)).isEqualTo(1);
+        assertThat(ExecutionEventService.firstStreamReplaySequence(1L, 10_001, null)).isEqualTo(2);
+        assertThat(ExecutionEventService.firstStreamReplaySequence(1L, 10_001, 8_000L)).isEqualTo(8_001);
+        assertThat(ExecutionEventService.firstStreamReplaySequence(9_000L, 10_001, null)).isEqualTo(9_000);
+        assertThat(ExecutionEventService.firstStreamReplaySequence(null, 0, null)).isEqualTo(1);
     }
 
     @RepeatedTest(10)
@@ -412,6 +647,194 @@ class EventEvidenceIntegrationTest {
                 "update audit_records set action = 'MUTATED' where id = ?",
                 auditId
         ));
+        assertSqlState("55000", () -> jdbcTemplate.update(
+                "delete from audit_records where id = ?",
+                auditId
+        ));
+    }
+
+    @Test
+    void redactsAuditMetadataBeforeStorageAndReadback() throws Exception {
+        Seed seed = seedRun();
+        ObjectNode rawMetadata = objectMapper.createObjectNode()
+                .put("accountNumber", "SYNTH-ACCT-9911")
+                .put("email", "audit-borrower@example.test")
+                .put("customerId", "audit-customer-9911")
+                .put("purpose", "integration-check");
+
+        AuditDto.Record appended = auditService.append(
+                WORKSPACE_ID, "audit-tester", "METADATA_PRIVACY_CHECK", "TEST_RUN", seed.runId(),
+                HASH_A, HASH_B, rawMetadata
+        );
+        assertThat(appended.afterDigest()).isEqualTo(HASH_B);
+        assertThat(appended.actorId()).isEqualTo("audit-tester");
+        assertThat(appended.metadata().path("accountNumber").asString()).isEqualTo("[REDACTED:FINANCIAL]");
+        assertThat(appended.metadata().path("email").asString()).isEqualTo("[REDACTED:SENSITIVE_PII]");
+        String customerToken = appended.metadata().path("customerId").asString();
+        assertThat(customerToken).matches("\\[SYNTH_ID:[0-9a-f]{12}]");
+        assertThat(appended.metadata().path("purpose").asString()).isEqualTo("integration-check");
+        assertThat(rawMetadata.path("accountNumber").asString()).isEqualTo("SYNTH-ACCT-9911");
+
+        String stored = jdbcTemplate.queryForObject(
+                "select metadata_json::text from audit_records where id = ?", String.class, appended.id()
+        );
+        assertThat(stored)
+                .contains("[REDACTED:FINANCIAL]", "[REDACTED:SENSITIVE_PII]", customerToken)
+                .doesNotContain("SYNTH-ACCT-9911", "audit-borrower@example.test", "audit-customer-9911");
+        assertThat(jdbcTemplate.queryForObject(
+                "select after_digest from audit_records where id = ?", String.class, appended.id()
+        )).isEqualTo(HASH_B);
+        AuditDto.Record found = auditService.find("TEST_RUN", seed.runId(), 25).stream()
+                .filter(record -> record.id().equals(appended.id()))
+                .findFirst().orElseThrow();
+        assertThat(found.metadata()).isEqualTo(appended.metadata());
+        assertThat(found.afterDigest()).isEqualTo(HASH_B);
+
+        HttpResponse<String> response = HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create("http://localhost:" + port
+                        + "/api/v1/audit-records?resourceType=TEST_RUN&resourceId=" + seed.runId()))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString()
+        );
+        assertThat(response.statusCode()).isEqualTo(200);
+        assertThat(response.body())
+                .doesNotContain("SYNTH-ACCT-9911", "audit-borrower@example.test", "audit-customer-9911");
+        JsonNode httpRecord = null;
+        for (JsonNode candidate : objectMapper.readTree(response.body()).path("data")) {
+            if (appended.id().toString().equals(candidate.path("id").asString())) {
+                httpRecord = candidate;
+                break;
+            }
+        }
+        assertThat(httpRecord).isNotNull();
+        assertThat(httpRecord.path("metadata")).isEqualTo(appended.metadata());
+        assertThat(httpRecord.path("afterDigest").asString()).isEqualTo(HASH_B);
+
+        AuditDto.Record empty = auditService.append(
+                WORKSPACE_ID, "audit-tester", "METADATA_NULL_CHECK", "TEST_RUN", seed.runId(),
+                null, null, null
+        );
+        assertThat(empty.metadata().isObject()).isTrue();
+        assertThat(empty.metadata().isEmpty()).isTrue();
+        assertThat(jdbcTemplate.queryForObject(
+                "select metadata_json::text from audit_records where id = ?", String.class, empty.id()
+        )).isEqualTo("{}");
+    }
+
+    @Test
+    void rejectsSecretAuditMetadataAndActorBeforeInsertion() {
+        Seed seed = seedRun();
+        ObjectNode secretMetadata = objectMapper.createObjectNode()
+                .put("clientSecret", "audit-secret-canary");
+        assertThatThrownBy(() -> auditService.append(
+                WORKSPACE_ID, "audit-tester", "PRIVACY_REJECTED", "TEST_RUN", seed.runId(),
+                null, null, secretMetadata
+        )).isInstanceOfSatisfying(BusinessException.class, exception -> {
+            assertThat(exception.errorCode()).isEqualTo(ErrorCode.SECRET_DETECTED);
+            assertThat(exception.getMessage()).doesNotContain("audit-secret-canary");
+        });
+        String secretActor = "Bearer audit-actor-secret-canary";
+        assertThatThrownBy(() -> auditService.append(
+                WORKSPACE_ID, secretActor, "PRIVACY_REJECTED", "TEST_RUN", seed.runId(),
+                null, null, objectMapper.createObjectNode()
+        )).isInstanceOfSatisfying(BusinessException.class, exception -> {
+            assertThat(exception.errorCode()).isEqualTo(ErrorCode.SECRET_DETECTED);
+            assertThat(exception.getMessage()).doesNotContain(secretActor);
+        });
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from audit_records
+                 where action = 'PRIVACY_REJECTED' and resource_id = ?
+                """, Integer.class, seed.runId())).isZero();
+    }
+
+    @Test
+    void rejectsForeignWorkspaceSuiteBeforeRunInsertWhileKeepingDatabaseScopeGuard() {
+        Seed seed = seedRun();
+        UUID releaseId = jdbcTemplate.queryForObject(
+                "select release_id from test_runs where id = ?", UUID.class, seed.runId()
+        );
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from test_runs where id = ?", Integer.class, seed.runId()
+        )).isEqualTo(1);
+
+        UUID foreignWorkspace = UUID.randomUUID();
+        UUID foreignSuite = UuidV7.generate();
+        jdbcTemplate.update(
+                "insert into workspaces (id, name, mode) values (?, ?, 'DEMO')",
+                foreignWorkspace, "Foreign Run Suite " + foreignSuite
+        );
+        jdbcTemplate.update("""
+                insert into test_suites
+                    (id, workspace_id, suite_key, version, fixture_version, generation_config_json,
+                     suite_hash, status)
+                values (?, ?, ?, '1.0.0', 'foreign-v1', '{}'::jsonb, ?, 'BUILDING')
+                """, foreignSuite, foreignWorkspace, "foreign-suite-" + foreignSuite, HASH_A);
+        jdbcTemplate.update("update test_suites set status = 'READY' where id = ?", foreignSuite);
+
+        int runsBefore = jdbcTemplate.queryForObject(
+                "select count(*) from test_runs where release_id = ?", Integer.class, releaseId
+        );
+        int auditsBefore = jdbcTemplate.queryForObject("""
+                select count(*) from audit_records
+                 where workspace_id = ? and action = 'TEST_RUN_REGISTERED'
+                """, Integer.class, WORKSPACE_ID);
+        assertThatThrownBy(() -> runPersistenceService.register(
+                new TestRunPersistenceDto.RegisterRequest(
+                        releaseId, foreignSuite, null, TestRunMode.BASELINE, null,
+                        objectMapper.createObjectNode(), HASH_A, HASH_B, 42L, 1
+                ),
+                "orchestrator-b"
+        )).isInstanceOfSatisfying(BusinessException.class, exception -> {
+            assertThat(exception.errorCode()).isEqualTo(ErrorCode.RESOURCE_NOT_FOUND);
+            assertThat(exception.getMessage())
+                    .doesNotContain(foreignSuite.toString(), foreignWorkspace.toString());
+        });
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from test_runs where release_id = ?", Integer.class, releaseId
+        )).isEqualTo(runsBefore);
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from audit_records
+                 where workspace_id = ? and action = 'TEST_RUN_REGISTERED'
+                """, Integer.class, WORKSPACE_ID)).isEqualTo(auditsBefore);
+
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                insert into test_runs
+                    (id, release_id, suite_id, mode, status, agent_artifact_fingerprint,
+                     release_fingerprint, config_json, fixture_version, fixture_digest,
+                     model_config_hash, total_cases)
+                select ?, release_id, ?, mode, 'QUEUED', agent_artifact_fingerprint,
+                       release_fingerprint, '{}'::jsonb, fixture_version, fixture_digest,
+                       model_config_hash, 1
+                  from test_runs where id = ?
+                """, UuidV7.generate(), foreignSuite, seed.runId()));
+    }
+
+    private String firstSseEvent(UUID runId, String query, String lastEventId) throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(
+                        "http://localhost:" + port + "/api/v1/test-runs/" + runId + "/events" + query))
+                .header("Accept", "text/event-stream")
+                .timeout(Duration.ofSeconds(5));
+        if (lastEventId != null) {
+            request.header("Last-Event-ID", lastEventId);
+        }
+        HttpResponse<java.io.InputStream> response = HttpClient.newHttpClient().send(
+                request.GET().build(), HttpResponse.BodyHandlers.ofInputStream()
+        );
+        assertThat(response.statusCode()).isEqualTo(200);
+        StringBuilder first = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(response.body()))) {
+            for (int lines = 0; lines < 12; lines++) {
+                String line = reader.readLine();
+                if (line == null) {
+                    break;
+                }
+                first.append(line).append('\n');
+                if (line.startsWith("data:")) {
+                    break;
+                }
+            }
+        }
+        return first.toString();
     }
 
     private Seed seedRun() {
@@ -467,6 +890,36 @@ class EventEvidenceIntegrationTest {
                 "orchestrator-b"
         );
         return new Seed(registered.runId(), caseId);
+    }
+
+    private UUID insertOldStartedEvent(UUID runId) {
+        UUID eventId = UuidV7.generate();
+        UUID traceId = UUID.randomUUID();
+        Instant occurredAt = Instant.now().minus(Duration.ofDays(8)).truncatedTo(ChronoUnit.MICROS);
+        ObjectNode canonical = objectMapper.createObjectNode();
+        canonical.put("schemaVersion", "1.0");
+        canonical.put("eventId", eventId.toString());
+        canonical.put("traceId", traceId.toString());
+        canonical.put("runId", runId.toString());
+        canonical.putNull("testCaseRunId");
+        canonical.put("sequence", 1);
+        canonical.put("occurredAt", occurredAt.toString());
+        canonical.put("eventType", "RUN_STARTED");
+        canonical.putNull("toolName");
+        canonical.putNull("input");
+        canonical.putNull("output");
+        canonical.put("payloadDigest", HASH_A);
+        canonical.putNull("policyDecision");
+        canonical.putNull("reasonCode");
+        canonical.set("metadata", objectMapper.createObjectNode());
+        String eventHash = digestService.sha256(canonicalJsonService.canonicalize(canonical));
+        jdbcTemplate.update("""
+                insert into execution_events
+                    (id, workspace_id, run_id, trace_id, sequence, occurred_at, event_type,
+                     payload_digest, metadata_json, event_hash)
+                values (?, ?, ?, ?, 1, ?, 'RUN_STARTED', ?, '{}'::jsonb, ?)
+                """, eventId, WORKSPACE_ID, runId, traceId, Timestamp.from(occurredAt), HASH_A, eventHash);
+        return eventId;
     }
 
     private record Seed(UUID runId, UUID caseId) {

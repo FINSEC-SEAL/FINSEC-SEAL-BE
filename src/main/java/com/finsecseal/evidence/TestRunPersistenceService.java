@@ -121,7 +121,7 @@ public class TestRunPersistenceService {
                        suite.fixture_version, suite.status suite_status
                   from agent_releases release
                   join agents agent on agent.id = release.agent_id
-                  join test_suites suite on suite.id = ?
+                  join test_suites suite on suite.id = ? and suite.workspace_id = agent.workspace_id
                  where release.id = ?
                  for update of release, suite
                 """, (resultSet, rowNumber) -> new RegistrationSnapshot(

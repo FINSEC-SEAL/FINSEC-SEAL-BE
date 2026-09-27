@@ -35,6 +35,10 @@ management:
         enabled: true
 
 finsec:
+  generation:
+    worker-enabled: ${FINSEC_GENERATION_WORKER_ENABLED:true}
+    poll-ms: ${FINSEC_GENERATION_POLL_MS:1000}
+    lease-seconds: ${FINSEC_GENERATION_LEASE_SECONDS:180}
   contract-access:
     key: ${FINSEC_CONTRACT_ACCESS_KEY:}
     actor: ${FINSEC_CONTRACT_ACCESS_ACTOR:}

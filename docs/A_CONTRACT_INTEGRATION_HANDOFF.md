@@ -28,6 +28,7 @@
 | GET `/contract-versions/{id}/approved?releaseId=…` | 현재 승인본과 Agent artifact / Release fingerprint |
 | GET `/platform/patch-sources/{findingId}` | 적격 Finding facts와 digest 검증된 Oracle evidence |
 | GET `/reviewer-session` | 아래 검토자 자격을 세션으로 교환하거나 현재 세션의 CSRF 토큰 조회 |
+| DELETE `/reviewer-session/{sessionId}` | 현재 서명된 세션만 폐기하고 브라우저 쿠키 삭제 |
 
 이전 `/platform/contracts/{id}` 및 `:validate`, `:approve`, `:reject`, `/approved` 경로는 기존 호출자 호환용이다.
 새 호출자는 원 명세 경로를 사용한다. 두 경로 모두 같은 저장 로직·권한·If-Match·감사를 사용한다.
@@ -49,9 +50,12 @@ FINSEC_CONTRACT_ACCESS_WORKSPACE=<workspace UUID>
 브라우저 세션 절차:
 
 1. 신뢰된 검토자가 `GET /api/v1/reviewer-session`에 `X-Contract-Reviewer-Key`를 보낸다.
-2. 서버가 30분 유효한 `__Host-FINSEC_REVIEWER` 쿠키(`HttpOnly; Secure; SameSite=Lax; Path=/`)와 `{csrfToken,expiresAt,actorId,workspaceId,role}`를 반환한다. 응답은 `Cache-Control: no-store`다.
+2. 서버가 30분 유효한 `__Host-FINSEC_REVIEWER` 쿠키(`HttpOnly; Secure; SameSite=Lax; Path=/`)와 `{csrfToken,expiresAt,actorId,workspaceId,role,sessionId}`를 반환한다. 응답은 `Cache-Control: no-store`다.
 3. 이후 요청은 쿠키를 보내며, POST에는 `X-CSRF-Token`을 추가한다. 브라우저 연결에는 HTTPS와 허용 Origin 설정이 필요하다. 쿠키를 쓰는 fetch는 `credentials: 'include'`를 사용한다.
 4. 새로고침 후 같은 GET을 세션 쿠키로 호출하면 CSRF 토큰을 다시 받을 수 있다. 만료 시 검토자 자격으로 재발급한다.
+5. 종료할 때 `DELETE /api/v1/reviewer-session/{sessionId}`에 현재 쿠키, `X-CSRF-Token`, `Idempotency-Key`를 보낸다. 서버는 해당 세션만 DB에서 폐기하고 `Max-Age=0` 쿠키를 반환한다. 같은 요청을 같은 키나 새 키로 재시도해도 쿠키가 지워진다. 폐기된 쿠키는 일반 계약 API에 사용할 수 없다.
+
+만료·폐기·손상된 쿠키를 가진 클라이언트는 정확히 `GET /api/v1/reviewer-session`에서만 유효한 검토자 키로 새 세션을 발급받을 수 있다. 일반 계약 API는 쿠키가 있으면 키만으로 우회할 수 없다. 폐기 기록에는 서명된 쿠키나 CSRF 값 대신 세션 식별자의 단방향 digest와 만료 시각만 저장한다.
 
 세션은 서명된 서버 Actor/workspace/만료 시각을 검증한다. 키 또는 Actor/workspace 설정을 변경하면 기존 세션은 무효가 된다.
 서버 간 호출 및 로컬 CLI는 Cookie 없이 `X-Contract-Reviewer-Key`를 직접 사용할 수도 있다.
@@ -86,6 +90,10 @@ A가 DB에서 출처·base·catalog를 다시 읽고 C의 `SafetyContractPatchPr
 패치 출처는 OPEN/TRIAGED Finding → ATTACK_SUCCESS Oracle → 완료된 BASELINE/SEAL_REPLAY Run의 SEED/MUTATION만 허용한다.
 증거 본문을 읽기 전에 workspace·suite·Release와 부모 계보를 확인한다. HELD_OUT·숨김·숨김 원본의 파생·외부 workspace·순환 계보는 제외한다.
 통과한 Oracle evidence도 canonical digest를 검사한다. 불허 출처와 미존재 ID는 모두 404다.
+
+## 생성 비동기 연결 갱신 (2026-09-08)
+
+A의202 접수·예약·worker·결과/메타데이터 저장·상태 조회는 [A→C 비동기 인계](A_TO_C_GENERATION_HANDOFF.md)에 구현 기준을 정리했다. 아래 최초 인계의 미연결 항목보다 새 문서를 우선한다.
 
 ## 별도 팀 연결 범위
 

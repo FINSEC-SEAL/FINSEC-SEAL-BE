@@ -7,6 +7,11 @@
 
 ## Implemented
 
+### 생성 작업 접수·상태·저장 (2026-09-08)
+
+원 명세의 초기/패치 생성202 접수와 GET 작업 상태, 인증된 identity 예약, C worker 호출, 생성 당시 출처 재검증, 모델 메타데이터와 후보의 원자적 저장을 연결했다. [설계 결정](A_GENERATION_ASYNC_DESIGN.md), [C 인계 계약](A_TO_C_GENERATION_HANDOFF.md)을 따른다.
+
+
 ### 계약 저장·승인 및 패치 출처 연결
 
 C의 검증·승인 규칙을 호출하는 인증된 계약 영속화 API, 현재 승인본 조회, Release 반영 및 감사 기록, HELD_OUT/숨김 계보를 제외한 패치 출처 조회를 구현했다. 원 명세의 `/contract-versions`와 계약별 `/contracts/{id}/versions` 경로, 검증 응답과 cursor 목록, reviewer session/CSRF 및 patchProposalId 승인 연결도 제공한다. 설정과 API 계약은 [A_CONTRACT_INTEGRATION_HANDOFF.md](A_CONTRACT_INTEGRATION_HANDOFF.md)를 따른다.

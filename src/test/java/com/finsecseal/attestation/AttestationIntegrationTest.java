@@ -7,6 +7,9 @@ import com.finsecseal.agent.AgentDto;
 import com.finsecseal.agent.AgentService;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
+import com.finsecseal.common.domain.ExecutionEventType;
+import com.finsecseal.evidence.ExecutionEventDto;
+import com.finsecseal.evidence.ExecutionEventService;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import com.finsecseal.release.ReleaseDto;
@@ -65,6 +68,9 @@ class AttestationIntegrationTest {
 
     @Autowired
     DigestService digestService;
+
+    @Autowired
+    ExecutionEventService eventService;
 
     @Autowired
     DataSource dataSource;
@@ -202,6 +208,96 @@ class AttestationIntegrationTest {
                 Integer.class,
                 seed.decisionId()
         )).isZero();
+    }
+
+    @Test
+    void attestsObservedEffectCountsFromFailedAttackRunWithoutChangingLegacyShape() throws Exception {
+        Seed seed = effectDecision("observed-effects", counts -> { });
+        ObjectNode forged = projectionDocument(seed, false);
+        ((ObjectNode) forged.path("observedEffectCounts").get(0)).put("value", 99);
+        String forgedHash = digestService.sha256(canonicalJsonService.canonicalize(forged));
+        String forgedHtml = "%s %s %s %s %s".formatted(
+                AttestationService.DISCLAIMER_KO, AttestationService.DISCLAIMER_EN,
+                seed.releaseId(), "BLOCKED", forgedHash);
+        assertSqlState("23514", () -> jdbcTemplate.update("""
+                insert into release_attestations
+                    (id, release_decision_id, format_version, document_json, document_hash,
+                     html_content, generated_at, disclaimer_version)
+                values (?, ?, '1.0', ?::jsonb, ?, ?, ?, 'finsec-internal/v1')
+                """, UUID.randomUUID(), seed.decisionId(), json(forged), forgedHash, forgedHtml,
+                Timestamp.from(seed.confirmedAt())));
+
+        AttestationDto.View attestation = attestationService.findOrCreate(seed.releaseId(), "governance-reviewer");
+        assertThat(canonicalJsonService.canonicalize(attestation.document().path("observedEffectCounts")))
+                .isEqualTo(canonicalJsonService.canonicalize(seed.snapshot().path("observedEffectCounts")));
+        assertThat(attestationService.findOrCreate(seed.releaseId(), "governance-reviewer").id())
+                .isEqualTo(attestation.id());
+        assertThat(attestation.document().at("/observedEffectCounts/0/value").longValue()).isEqualTo(2);
+        assertThat(attestation.document().at("/observedEffectCounts/1/value").longValue()).isZero();
+        assertThat(attestation.documentHash())
+                .isEqualTo(digestService.sha256(canonicalJsonService.canonicalize(attestation.document())));
+        assertThat(new String(attestationService.export(seed.releaseId(), "html", "report-viewer").content(),
+                java.nio.charset.StandardCharsets.UTF_8)).contains("observedEffectCounts");
+
+        Seed legacy = seedDecision("legacy-no-effect-counts", false);
+        assertThat(attestationService.findOrCreate(legacy.releaseId(), "governance-reviewer")
+                .document().path("observedEffectCounts").isMissingNode()).isTrue();
+    }
+
+    @Test
+    void rejectsMalformedCountEvidenceEvenWhenDecisionDigestIsRecomputed() throws Exception {
+        Seed stringValue = effectDecision("string-effect-count", counts -> {
+            ObjectNode first = (ObjectNode) counts.get(0);
+            first.put("value", "2");
+            refreshCountDigest(first);
+        });
+        assertIncompleteAttestation(stringValue);
+
+        Seed staleInnerDigest = effectDecision("stale-inner-effect-digest", counts ->
+                ((ObjectNode) counts.get(0)).put("value", 3));
+        assertIncompleteAttestation(staleInnerDigest);
+
+        Seed malformedNa = effectDecision("malformed-na-effect-count", counts ->
+                ((ObjectNode) counts.get(1)).put("status", "N_A").put("reason", "EVIDENCE_INCOMPLETE"));
+        assertIncompleteAttestation(malformedNa);
+
+        Seed duplicateSource = effectDecision("duplicate-effect-source", counts -> {
+            ObjectNode first = (ObjectNode) counts.get(0);
+            ((ArrayNode) first.path("sourceTestRunIds")).add(first.at("/sourceTestRunIds/0").asString());
+            refreshCountDigest(first);
+        });
+        assertIncompleteAttestation(duplicateSource);
+
+        Seed runningSource = seedDecision("running-effect-source", false, snapshot -> {
+            UUID run = effectSourceRun(snapshot, "RUNNING");
+            availableEffects(snapshot, run);
+        });
+        assertIncompleteAttestation(runningSource);
+    }
+
+    @Test
+    void rejectsForeignEffectSourceWithBothInnerAndOuterDigestsValid() throws Exception {
+        Seed foreign = seedDecision("foreign-effect-source-owner", false, snapshot ->
+                effectSourceRun(snapshot, "FAILED"));
+        UUID foreignRun = jdbcTemplate.queryForObject("select id from test_runs where release_id = ?",
+                UUID.class, foreign.releaseId());
+        Seed target = seedDecision("foreign-effect-source-target", false, snapshot ->
+                availableEffects(snapshot, foreignRun));
+        assertIncompleteAttestation(target);
+    }
+
+    @Test
+    void preservesExplicitNaEffectCountWithoutInventingZero() throws Exception {
+        Seed seed = effectDecision("na-effect-count", counts -> {
+            ObjectNode second = (ObjectNode) counts.get(1);
+            second.remove("value");
+            second.remove("evidenceDigest");
+            second.put("status", "N_A").put("reason", "EFFECT_EVIDENCE_INCOMPLETE_OR_NO_CONCLUSIVE_TRIALS");
+            second.putArray("sourceTestRunIds");
+        });
+        var document = attestationService.findOrCreate(seed.releaseId(), "governance-reviewer").document();
+        assertThat(document.at("/observedEffectCounts/1/status").asString()).isEqualTo("N_A");
+        assertThat(document.at("/observedEffectCounts/1/value").isMissingNode()).isTrue();
     }
 
     @Test
@@ -450,13 +546,23 @@ class AttestationIntegrationTest {
                 insert into test_suites
                     (id, workspace_id, suite_key, version, fixture_version,
                      generation_config_json, suite_hash, status, created_at, updated_at)
-                values (?, ?, ?, '1.0.0', 'fixture-v1', '{}'::jsonb, ?, 'READY', now(), now())
+                values (?, ?, ?, '1.0.0', 'fixture-v1', '{}'::jsonb, ?, 'BUILDING', now(), now())
                 """,
                 suiteId,
                 AgentService.DEMO_WORKSPACE_ID,
                 "attestation-suite-" + suiteId.toString().substring(0, 8),
                 HASH_A
         );
+        jdbcTemplate.update("""
+                insert into test_cases
+                    (id, suite_id, case_key, case_type, partition_name, category, severity,
+                     delivery_channel, target_tool, payload_hash, preconditions_json, expected_invariant,
+                     oracle_type, generation_source, expected_result_json, trial_policy_json)
+                values (?, ?, 'ATTESTATION-ATTACK-1', 'ATTACK', 'SEED', 'FA-01', 'HIGH',
+                        'DIRECT', 'DOCUMENT_READER', ?, '{}'::jsonb, 'NO_UNAUTHORIZED_EXPOSURE',
+                        'CROSS_CUSTOMER', 'CURATED', '{}'::jsonb, '{}'::jsonb)
+                """, UUID.randomUUID(), suiteId, HASH_A);
+        jdbcTemplate.update("update test_suites set status = 'READY' where id = ?", suiteId);
         snapshot.set("testSuite", objectMapper.createObjectNode()
                 .put("id", suiteId.toString())
                 .put("version", "1.0.0")
@@ -494,6 +600,98 @@ class AttestationIntegrationTest {
         snapshot.set("decision", decision);
         snapshot.put("testedAt", testedAt.toString());
         return snapshot;
+    }
+
+    private UUID effectSourceRun(ObjectNode snapshot, String terminalStatus) {
+        UUID releaseId = UUID.fromString(snapshot.at("/release/id").asString());
+        UUID suiteId = UUID.fromString(snapshot.at("/testSuite/id").asString());
+        UUID caseId = jdbcTemplate.queryForObject(
+                "select id from test_cases where suite_id = ? and case_key = 'ATTESTATION-ATTACK-1'",
+                UUID.class, suiteId);
+        UUID runId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                insert into test_runs
+                    (id, release_id, suite_id, mode, status, agent_artifact_fingerprint,
+                     release_fingerprint, config_json, fixture_version, fixture_digest,
+                     model_config_hash, total_cases)
+                values (?, ?, ?, 'BASELINE', 'QUEUED', ?, ?, '{}'::jsonb, ?, ?, ?, 1)
+                """, runId, releaseId, suiteId, snapshot.at("/release/agentArtifactFingerprint").asString(),
+                snapshot.at("/release/fingerprint").asString(), snapshot.at("/sandbox/fixtureVersion").asString(),
+                snapshot.at("/sandbox/fixtureDigest").asString(), HASH_A);
+        jdbcTemplate.update("insert into run_event_counters (run_id, last_sequence) values (?, 0)", runId);
+        UUID traceId = UUID.randomUUID();
+        eventService.append(runId, new ExecutionEventDto.AppendRequest(null, traceId,
+                ExecutionEventType.RUN_STARTED, null, null, null, null, "RUN_STARTED",
+                objectMapper.createObjectNode()), "attestation-test");
+        jdbcTemplate.update("update test_runs set status = 'PREPARING' where id = ?", runId);
+        jdbcTemplate.update("update test_runs set status = 'RUNNING', started_at = now() where id = ?", runId);
+        UUID caseRunId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                insert into test_case_runs (id, test_run_id, test_case_id, trial_index, status, variant_hash)
+                values (?, ?, ?, 0, 'EXECUTING', ?)
+                """, caseRunId, runId, caseId, HASH_A);
+        if ("FAILED".equals(terminalStatus)) {
+            jdbcTemplate.update("""
+                    update test_case_runs set status = 'ERROR', error_code = 'PROVIDER_TIMEOUT', completed_at = now()
+                     where id = ?
+                    """, caseRunId);
+            eventService.append(runId, new ExecutionEventDto.AppendRequest(caseRunId, traceId,
+                    ExecutionEventType.RUN_FAILED, null, null, null, null, "PROVIDER_TIMEOUT",
+                    objectMapper.createObjectNode()), "attestation-test");
+            jdbcTemplate.update("""
+                    update test_runs set status = 'FAILED', completed_cases = 1,
+                                         operational_error_count = 1, completed_at = now()
+                     where id = ?
+                    """, runId);
+        } else if ("COMPLETED".equals(terminalStatus)) {
+            jdbcTemplate.update("update test_case_runs set status = 'PASSED', completed_at = now() where id = ?",
+                    caseRunId);
+            eventService.append(runId, new ExecutionEventDto.AppendRequest(null, traceId,
+                    ExecutionEventType.RUN_COMPLETED, null, null, null, null, "RUN_COMPLETED",
+                    objectMapper.createObjectNode()), "attestation-test");
+            jdbcTemplate.update("""
+                    update test_runs set status = 'COMPLETED', completed_cases = 1, completed_at = now()
+                     where id = ?
+                    """, runId);
+        }
+        return runId;
+    }
+
+    private ObjectNode effectCount(String metric, long value, UUID sourceRunId) {
+        ObjectNode count = objectMapper.createObjectNode()
+                .put("metric", metric).put("calculatorVersion", "mvp-metrics/1")
+                .put("status", "AVAILABLE").put("value", value);
+        count.putArray("sourceTestRunIds").add(sourceRunId.toString());
+        count.put("evidenceDigest", digestService.sha256(canonicalJsonService.canonicalize(count)));
+        return count;
+    }
+
+    private ArrayNode availableEffects(ObjectNode snapshot, UUID sourceRunId) {
+        ArrayNode counts = snapshot.putArray("observedEffectCounts");
+        counts.add(effectCount("UnauthorizedRecordExposureCount", 2, sourceRunId));
+        counts.add(effectCount("ExfiltrationSuccessCount", 0, sourceRunId));
+        return counts;
+    }
+
+    private Seed effectDecision(String suffix, Consumer<ArrayNode> mutation) throws IOException {
+        return seedDecision(suffix, false, snapshot -> {
+            UUID sourceRunId = effectSourceRun(snapshot, "FAILED");
+            mutation.accept(availableEffects(snapshot, sourceRunId));
+        });
+    }
+
+    private void refreshCountDigest(ObjectNode count) {
+        count.remove("evidenceDigest");
+        count.put("evidenceDigest", digestService.sha256(canonicalJsonService.canonicalize(count)));
+    }
+
+    private void assertIncompleteAttestation(Seed seed) {
+        assertThatThrownBy(() -> attestationService.findOrCreate(seed.releaseId(), "governance-reviewer"))
+                .isInstanceOfSatisfying(BusinessException.class, exception ->
+                        assertThat(exception.errorCode()).isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE));
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from release_attestations where release_decision_id = ?",
+                Integer.class, seed.decisionId())).isZero();
     }
 
     private void invalidateAndChangeContract(Seed seed) {
@@ -539,6 +737,9 @@ class AttestationIntegrationTest {
                 "testSuite", "sandbox", "results", "metrics", "remainingFindings", "approvedPatch"
         }) {
             document.set(field, snapshot.path(field).deepCopy());
+        }
+        if (snapshot.has("observedEffectCounts")) {
+            document.set("observedEffectCounts", snapshot.path("observedEffectCounts").deepCopy());
         }
         if (forgeMetric) {
             ((ObjectNode) document.path("metrics").get(0)).put("reason", "forged metric evidence");
