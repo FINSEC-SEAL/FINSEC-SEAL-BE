@@ -125,7 +125,50 @@ class ContractPersistenceIntegrationTest {
         }
         var unauthenticated=HttpRequest.newBuilder(URI.create("http://localhost:"+port+"/api/v1/platform/contracts?releaseId="+UUID.randomUUID()))
                 .header("Origin","http://localhost:5173").GET().build();
-        assertThat(HttpClient.newHttpClient().send(unauthenticated,HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(403);
+        var denied=HttpClient.newHttpClient().send(unauthenticated,HttpResponse.BodyHandlers.ofString());
+        assertThat(denied.statusCode()).isEqualTo(403);
+        assertAllowedCors(denied);
+    }
+    @Test void preservesCorsForAuthenticationAndIdempotencyFailuresWithoutReservingRequests() throws Exception {
+        String path="/api/v1/platform/contracts";
+        String key=UUID.randomUUID().toString();
+        var denied=api("POST",path,"{}",Map.of("Origin","http://localhost:5173",
+                "Idempotency-Key",key,"X-Contract-Reviewer-Key","wrong"));
+        assertThat(denied.statusCode()).isEqualTo(403);
+        assertThat(json.readTree(denied.body()).path("code").stringValue()).isEqualTo("CONTRACT_AUTH_REQUIRED");
+        assertAllowedCors(denied);
+        assertThat(db.queryForObject("select count(*) from api_idempotency_records where idempotency_key=?",Integer.class,key)).isZero();
+
+        var invalidKey=api("POST",path,"{}",Map.of("Origin","http://localhost:5173",
+                "Idempotency-Key","invalid key","X-Contract-Reviewer-Key",KEY));
+        assertThat(invalidKey.statusCode()).isEqualTo(400);
+        assertThat(json.readTree(invalidKey.body()).path("code").stringValue()).isEqualTo("VALIDATION_ERROR");
+        assertAllowedCors(invalidKey);
+    }
+    @Test void rechecksOriginBeforeReturningAnIdempotentContractResponse() throws Exception {
+        UUID release=release();
+        String path="/api/v1/platform/contracts";
+        String key=UUID.randomUUID().toString();
+        String body=json.createObjectNode().put("releaseId",release.toString())
+                .set("policy",fixture("loan-review-safety-contract.json")).toString();
+        var headers=Map.of("Origin","http://localhost:5173","Idempotency-Key",key,"X-Contract-Reviewer-Key",KEY);
+        var first=api("POST",path,body,headers);
+        assertThat(first.statusCode()).withFailMessage(first.body()).isEqualTo(201);
+        assertAllowedCors(first);
+
+        var untrusted=api("POST",path,body,Map.of("Origin","https://untrusted.invalid",
+                "Idempotency-Key",key,"X-Contract-Reviewer-Key",KEY));
+        assertThat(untrusted.statusCode()).isEqualTo(403);
+        assertThat(untrusted.headers().firstValue("Access-Control-Allow-Origin")).isEmpty();
+        assertThat(untrusted.headers().firstValue("Idempotent-Replayed")).isEmpty();
+        assertThat(untrusted.body()).doesNotContain("policyHash","resourceHash");
+
+        var replay=api("POST",path,body,headers);
+        assertThat(replay.statusCode()).isEqualTo(201);
+        assertThat(replay.body()).isEqualTo(first.body());
+        assertThat(replay.headers().firstValue("Idempotent-Replayed")).contains("true");
+        assertAllowedCors(replay);
+        assertThat(db.queryForObject("select count(*) from safety_contract_versions v join safety_contracts c on c.id=v.contract_id where c.release_id=?",Integer.class,release)).isEqualTo(1);
     }
     @Test void specificationPathsReturnValidationResultAndContractScopedHistory() throws Exception {
         UUID release=release();
@@ -507,6 +550,13 @@ class ContractPersistenceIntegrationTest {
                     ("FINSEC_REVIEWER_SESSION_V1:"+encoded).getBytes(java.nio.charset.StandardCharsets.UTF_8)));
             return ContractReviewerCredentials.COOKIE+"="+encoded+"."+signature;
         } catch (java.security.GeneralSecurityException exception) {throw new IllegalStateException(exception);}
+    }
+
+    private void assertAllowedCors(HttpResponse<?> response) {
+        assertThat(response.headers().allValues("Access-Control-Allow-Origin")).containsExactly("http://localhost:5173");
+        assertThat(response.headers().firstValue("Access-Control-Allow-Credentials")).contains("true");
+        assertThat(response.headers().firstValue("Access-Control-Expose-Headers").orElseThrow())
+                .contains("X-Trace-Id","Location","Idempotent-Replayed");
     }
 
     private HttpResponse<String> api(String method,String path,String body,Map<String,String> headers) throws Exception {
