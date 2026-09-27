@@ -16,8 +16,8 @@ import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.common.domain.TestRunStatus;
+import com.finsecseal.evidence.AuthenticatedTestRunRegistrationService;
 import com.finsecseal.evidence.TestRunPersistenceDto;
-import com.finsecseal.evidence.TestRunPersistenceService;
 import com.finsecseal.release.AgentReleaseEntity;
 import com.finsecseal.release.AgentReleaseRepository;
 import com.finsecseal.release.FingerprintService;
@@ -39,6 +39,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import tools.jackson.databind.ObjectMapper;
@@ -67,12 +68,13 @@ class TestRunStartServiceTest {
                 new CaseRow(second, "SEED", false), new CaseRow(first, "MUTATION", false)));
 
         TestRunPersistenceDto.Registered registered = fixture.service.start(
-                fixture.request(TestRunMode.BASELINE, List.of(first, second)), ACTOR);
+                fixture.request(TestRunMode.BASELINE, List.of(first, second)), fixture.httpRequest);
 
         assertThat(registered.runId()).isEqualTo(fixture.runId);
+        assertThat(fixture.httpRequest.getHeader("X-Actor-Id")).isNotEqualTo(ACTOR);
         ArgumentCaptor<TestRunPersistenceDto.RegisterRequest> registration =
                 ArgumentCaptor.forClass(TestRunPersistenceDto.RegisterRequest.class);
-        verify(fixture.persistence).register(registration.capture(), eq(ACTOR));
+        verify(fixture.admission).register(registration.capture(), eq(fixture.httpRequest));
         assertThat(registration.getValue().totalCases()).isEqualTo(2);
         assertThat(fixture.db.caseQueryCount).isEqualTo(2);
         verifyNoInteractions(fixture.executor, fixture.dispatch);
@@ -90,7 +92,7 @@ class TestRunStartServiceTest {
         UUID normal = UUID.randomUUID();
         for (List<UUID> selection : Arrays.<List<UUID>>asList(null, List.of())) {
             Fixture fixture = new Fixture(List.of(new CaseRow(normal, "NORMAL", false)));
-            fixture.service.start(fixture.request(TestRunMode.BASELINE, selection), ACTOR);
+            fixture.service.start(fixture.request(TestRunMode.BASELINE, selection), fixture.httpRequest);
             afterCommitTask(fixture.executor).run();
             verify(fixture.dispatch).execute(fixture.runId, normal, ACTOR);
             assertThat(fixture.db.caseQueryCount).isEqualTo(2);
@@ -108,11 +110,12 @@ class TestRunStartServiceTest {
                 List.of(one, one),
                 IntStream.range(0, 10_001).mapToObj(index -> new UUID(0, index)).toList());
         for (List<UUID> selection : invalid) {
-            assertInvalid(() -> fixture.service.start(fixture.request(TestRunMode.BASELINE, selection), ACTOR));
+            assertInvalid(() -> fixture.service.start(
+                    fixture.request(TestRunMode.BASELINE, selection), fixture.httpRequest));
         }
         assertInvalid(() -> fixture.service.start(
-                fixture.request(TestRunMode.HELD_OUT, List.of(one)), ACTOR));
-        verifyNoInteractions(fixture.persistence, fixture.executor, fixture.dispatch);
+                fixture.request(TestRunMode.HELD_OUT, List.of(one)), fixture.httpRequest));
+        verifyNoInteractions(fixture.admission, fixture.executor, fixture.dispatch);
         verifyNoInteractions(fixture.lifecycle);
         assertThat(fixture.db.caseQueryCount).isZero();
     }
@@ -122,14 +125,14 @@ class TestRunStartServiceTest {
         UUID chosen = UUID.randomUUID();
         Fixture hidden = new Fixture(List.of(new CaseRow(chosen, "HELD_OUT", true)));
         assertInvalid(() -> hidden.service.start(
-                hidden.request(TestRunMode.BASELINE, List.of(chosen)), ACTOR));
-        verifyNoInteractions(hidden.persistence, hidden.executor, hidden.dispatch);
+                hidden.request(TestRunMode.BASELINE, List.of(chosen)), hidden.httpRequest));
+        verifyNoInteractions(hidden.admission, hidden.executor, hidden.dispatch);
         verifyNoInteractions(hidden.lifecycle);
 
         Fixture foreign = new Fixture(List.of());
         assertInvalid(() -> foreign.service.start(
-                foreign.request(TestRunMode.BASELINE, List.of(chosen)), ACTOR));
-        verifyNoInteractions(foreign.persistence, foreign.executor, foreign.dispatch);
+                foreign.request(TestRunMode.BASELINE, List.of(chosen)), foreign.httpRequest));
+        verifyNoInteractions(foreign.admission, foreign.executor, foreign.dispatch);
         verifyNoInteractions(foreign.lifecycle);
     }
 
@@ -140,10 +143,42 @@ class TestRunStartServiceTest {
         fixture.db.changeOnSecondCaseQuery = true;
 
         assertInvalid(() -> fixture.service.start(
-                fixture.request(TestRunMode.BASELINE, List.of(chosen)), ACTOR));
-        verify(fixture.persistence).register(any(), eq(ACTOR));
+                fixture.request(TestRunMode.BASELINE, List.of(chosen)), fixture.httpRequest));
+        verify(fixture.admission).register(any(), eq(fixture.httpRequest));
         verifyNoInteractions(fixture.executor, fixture.dispatch);
         verifyNoInteractions(fixture.lifecycle);
+        assertThat(TransactionSynchronizationManager.getSynchronizations()).isEmpty();
+    }
+
+    @Test
+    void admissionFailureDoesNotScheduleOrTrustCallerHeader() {
+        UUID chosen = UUID.randomUUID();
+        Fixture fixture = new Fixture(List.of(new CaseRow(chosen, "NORMAL", false)));
+        when(fixture.admission.register(any(), eq(fixture.httpRequest)))
+                .thenThrow(new BusinessException(ErrorCode.OPERATOR_AUTH_REQUIRED,
+                        "A valid reviewer session is required"));
+
+        assertThatThrownBy(() -> fixture.service.start(
+                fixture.request(TestRunMode.BASELINE, List.of(chosen)), fixture.httpRequest))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        error -> assertThat(error.errorCode()).isEqualTo(ErrorCode.OPERATOR_AUTH_REQUIRED));
+        verifyNoInteractions(fixture.executor, fixture.dispatch, fixture.lifecycle);
+        assertThat(TransactionSynchronizationManager.getSynchronizations()).isEmpty();
+    }
+
+    @Test
+    void incompleteAdmissionFailsClosedBeforeScheduling() {
+        UUID chosen = UUID.randomUUID();
+        Fixture fixture = new Fixture(List.of(new CaseRow(chosen, "NORMAL", false)));
+        when(fixture.admission.register(any(), eq(fixture.httpRequest)))
+                .thenReturn(new AuthenticatedTestRunRegistrationService.Admission(null, ACTOR));
+
+        assertThatThrownBy(() -> fixture.service.start(
+                fixture.request(TestRunMode.BASELINE, List.of(chosen)), fixture.httpRequest))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        error -> assertThat(error.errorCode()).isEqualTo(ErrorCode.INTERNAL_ERROR))
+                .hasMessage("Authenticated TestRun admission was incomplete");
+        verifyNoInteractions(fixture.executor, fixture.dispatch, fixture.lifecycle);
         assertThat(TransactionSynchronizationManager.getSynchronizations()).isEmpty();
     }
 
@@ -151,7 +186,7 @@ class TestRunStartServiceTest {
     void executorRejectionAfterCommitFailsExactRegisteredRunWithoutRawMessage() {
         UUID chosen = UUID.randomUUID();
         Fixture fixture = new Fixture(List.of(new CaseRow(chosen, "NORMAL", false)));
-        fixture.service.start(fixture.request(TestRunMode.BASELINE, List.of(chosen)), ACTOR);
+        fixture.service.start(fixture.request(TestRunMode.BASELINE, List.of(chosen)), fixture.httpRequest);
         doThrow(new RejectedExecutionException("secret-canary queue full"))
                 .when(fixture.executor).execute(any(Runnable.class));
 
@@ -162,7 +197,7 @@ class TestRunStartServiceTest {
                         .isEqualTo(ErrorCode.INTERNAL_ERROR))
                 .hasMessage("TestRun scheduling was rejected")
                 .hasMessageNotContaining("secret-canary");
-        verify(fixture.persistence).register(any(), eq(ACTOR));
+        verify(fixture.admission).register(any(), eq(fixture.httpRequest));
         verify(fixture.lifecycle).rejectScheduling(eq(fixture.runId), any(UUID.class), eq(ACTOR));
         verifyNoInteractions(fixture.dispatch);
     }
@@ -171,7 +206,7 @@ class TestRunStartServiceTest {
     void schedulingFailureHandlerErrorIsNotSwallowed() {
         UUID chosen = UUID.randomUUID();
         Fixture fixture = new Fixture(List.of(new CaseRow(chosen, "NORMAL", false)));
-        fixture.service.start(fixture.request(TestRunMode.BASELINE, List.of(chosen)), ACTOR);
+        fixture.service.start(fixture.request(TestRunMode.BASELINE, List.of(chosen)), fixture.httpRequest);
         doThrow(new RejectedExecutionException("queue full"))
                 .when(fixture.executor).execute(any(Runnable.class));
         IllegalStateException persistenceFailure = new IllegalStateException("write failed");
@@ -209,7 +244,9 @@ class TestRunStartServiceTest {
         final AgentReleaseRepository releases = mock(AgentReleaseRepository.class);
         final FingerprintService fingerprints = mock(FingerprintService.class);
         final SandboxFixtureService fixtures = mock(SandboxFixtureService.class);
-        final TestRunPersistenceService persistence = mock(TestRunPersistenceService.class);
+        final AuthenticatedTestRunRegistrationService admission =
+                mock(AuthenticatedTestRunRegistrationService.class);
+        final MockHttpServletRequest httpRequest = new MockHttpServletRequest();
         final ExecutionDispatchService dispatch = mock(ExecutionDispatchService.class);
         final RunExecutionLifecycleService lifecycle = mock(RunExecutionLifecycleService.class);
         final Executor executor = mock(Executor.class);
@@ -218,17 +255,19 @@ class TestRunStartServiceTest {
 
         Fixture(List<CaseRow> rows) {
             db = new FakeJdbcTemplate(rows);
+            httpRequest.addHeader("X-Actor-Id", "forged-header-actor");
             AgentReleaseEntity release = mock(AgentReleaseEntity.class);
             when(releases.findById(releaseId)).thenReturn(Optional.of(release));
             when(release.getManifestJson()).thenReturn(new ObjectMapper().createObjectNode());
             when(fingerprints.hash(any())).thenReturn(HASH);
             when(fixtures.fixtureDigest("golden-v1")).thenReturn(HASH);
-            when(persistence.register(any(), eq(ACTOR))).thenReturn(
-                    new TestRunPersistenceDto.Registered(runId, TestRunStatus.QUEUED,
-                            "/api/v1/test-runs/" + runId,
-                            "/api/v1/test-runs/" + runId + "/events"));
+            when(admission.register(any(), eq(httpRequest))).thenReturn(
+                    new AuthenticatedTestRunRegistrationService.Admission(
+                            new TestRunPersistenceDto.Registered(runId, TestRunStatus.QUEUED,
+                                    "/api/v1/test-runs/" + runId,
+                                    "/api/v1/test-runs/" + runId + "/events"), ACTOR));
             service = new TestRunStartService(releases, fingerprints, fixtures,
-                    persistence, dispatch, lifecycle, db, executor);
+                    admission, dispatch, lifecycle, db, executor);
         }
 
         TestRunStartService.Request request(TestRunMode mode, List<UUID> ids) {

@@ -14,6 +14,7 @@ import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.mock.web.MockHttpServletRequest;
 
 class TestRunExecutionControllerTest {
 
@@ -27,7 +28,8 @@ class TestRunExecutionControllerTest {
         UUID firstCaseId = UUID.randomUUID();
         UUID secondCaseId = UUID.randomUUID();
         UUID runId = UUID.randomUUID();
-        String actorId = "frontend-b";
+        MockHttpServletRequest httpRequest = new MockHttpServletRequest();
+        httpRequest.addHeader("X-Actor-Id", "untrusted-client-header");
 
         TestRunExecutionController.StartRequest request =
                 new TestRunExecutionController.StartRequest(
@@ -56,11 +58,11 @@ class TestRunExecutionControllerTest {
                         List.of(firstCaseId, secondCaseId),
                         1234L
                 ),
-                actorId
+                httpRequest
         )).thenReturn(registered);
 
         ResponseEntity<ApiResponse<TestRunPersistenceDto.Registered>> response =
-                controller.start(request, actorId);
+                controller.start(request, httpRequest);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
         assertThat(response.getBody()).isNotNull();
@@ -75,7 +77,7 @@ class TestRunExecutionControllerTest {
                         List.of(firstCaseId, secondCaseId),
                         1234L
                 ),
-                actorId
+                httpRequest
         );
     }
 }

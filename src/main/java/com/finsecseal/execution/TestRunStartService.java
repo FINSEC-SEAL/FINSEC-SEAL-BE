@@ -3,12 +3,14 @@ package com.finsecseal.execution;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.TestRunMode;
+import com.finsecseal.common.domain.TestRunStatus;
+import com.finsecseal.evidence.AuthenticatedTestRunRegistrationService;
 import com.finsecseal.evidence.TestRunPersistenceDto;
-import com.finsecseal.evidence.TestRunPersistenceService;
 import com.finsecseal.release.AgentReleaseEntity;
 import com.finsecseal.release.AgentReleaseRepository;
 import com.finsecseal.release.FingerprintService;
 import com.finsecseal.sandbox.SandboxFixtureService;
+import jakarta.servlet.http.HttpServletRequest;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -43,7 +45,7 @@ public class TestRunStartService {
     private final AgentReleaseRepository releaseRepository;
     private final FingerprintService fingerprintService;
     private final SandboxFixtureService fixtureService;
-    private final TestRunPersistenceService persistenceService;
+    private final AuthenticatedTestRunRegistrationService admissionService;
     private final ExecutionDispatchService dispatchService;
     private final RunExecutionLifecycleService lifecycleService;
     private final JdbcTemplate jdbcTemplate;
@@ -53,7 +55,7 @@ public class TestRunStartService {
             AgentReleaseRepository releaseRepository,
             FingerprintService fingerprintService,
             SandboxFixtureService fixtureService,
-            TestRunPersistenceService persistenceService,
+            AuthenticatedTestRunRegistrationService admissionService,
             ExecutionDispatchService dispatchService,
             RunExecutionLifecycleService lifecycleService,
             JdbcTemplate jdbcTemplate,
@@ -62,7 +64,7 @@ public class TestRunStartService {
         this.releaseRepository = releaseRepository;
         this.fingerprintService = fingerprintService;
         this.fixtureService = fixtureService;
-        this.persistenceService = persistenceService;
+        this.admissionService = admissionService;
         this.dispatchService = dispatchService;
         this.lifecycleService = lifecycleService;
         this.jdbcTemplate = jdbcTemplate;
@@ -70,7 +72,7 @@ public class TestRunStartService {
     }
 
     @Transactional
-    public TestRunPersistenceDto.Registered start(Request request, String actorId) {
+    public TestRunPersistenceDto.Registered start(Request request, HttpServletRequest httpRequest) {
         if (request == null
                 || request.releaseId() == null
                 || request.suiteId() == null
@@ -98,7 +100,7 @@ public class TestRunStartService {
                 release.getManifestJson().path("model")
         );
 
-        TestRunPersistenceDto.Registered registered = persistenceService.register(
+        AuthenticatedTestRunRegistrationService.Admission admission = admissionService.register(
                 new TestRunPersistenceDto.RegisterRequest(
                         request.releaseId(),
                         request.suiteId(),
@@ -111,8 +113,19 @@ public class TestRunStartService {
                         request.randomSeed(),
                         caseIds.size()
                 ),
-                actorId
+                httpRequest
         );
+        if (admission == null || admission.run() == null || admission.run().runId() == null
+                || admission.run().status() != TestRunStatus.QUEUED
+                || admission.actorId() == null || admission.actorId().isBlank()
+                || admission.actorId().length() > 120
+                || !admission.actorId().equals(admission.actorId().strip())) {
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR,
+                    "Authenticated TestRun admission was incomplete");
+        }
+        TestRunPersistenceDto.Registered registered = admission.run();
+        UUID admittedRunId = registered.runId();
+        String admittedActorId = admission.actorId();
 
         if (!caseIds.equals(selectCaseIds(request.suiteId(), request.mode(), requestedCaseIds))) {
             throw new BusinessException(ErrorCode.RESOURCE_CONFLICT,
@@ -129,11 +142,11 @@ public class TestRunStartService {
                 try {
                     executor.execute(() -> {
                         for (UUID caseId : executionCaseIds) {
-                            dispatchService.execute(registered.runId(), caseId, actorId);
+                            dispatchService.execute(admittedRunId, caseId, admittedActorId);
                         }
                     });
                 } catch (RejectedExecutionException rejected) {
-                    lifecycleService.rejectScheduling(registered.runId(), UUID.randomUUID(), actorId);
+                    lifecycleService.rejectScheduling(admittedRunId, UUID.randomUUID(), admittedActorId);
                     throw new BusinessException(ErrorCode.INTERNAL_ERROR,
                             "TestRun scheduling was rejected");
                 }
