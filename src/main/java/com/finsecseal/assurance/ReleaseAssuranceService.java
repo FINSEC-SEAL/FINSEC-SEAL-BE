@@ -249,13 +249,14 @@ public class ReleaseAssuranceService {
         ReplayAssessment replay = assessReplay(release.id(), Set.copyOf(evidence.runIds()));
         List<TrialEvaluation> trials = comparableTrials(loadedTrials, replay);
         ReleaseMetrics metrics = metricsCalculator.calculate(trials);
-        boolean criticalSuccess = trials.stream().anyMatch(trial ->
-                trial.attackSuccess() && trial.reasonCodes().stream().anyMatch(CRITICAL_REASONS::contains));
+        // Comparability controls rate eligibility; it must not erase an observed ENFORCE effect.
+        List<Map<String, Object>> criticalSuccessEvidence = criticalSuccessEvidence(loadedTrials);
+        boolean criticalSuccess = !criticalSuccessEvidence.isEmpty();
         boolean evidenceComplete = completeDecisionEvidence(metrics, trials) && replay.summary().evidenceComplete();
-        boolean coverage = criticalCoverageComplete(trials);
+        CriticalTrialCoverage.Report coverage = criticalCoverage(evidence.suiteId(), trials);
         boolean openHigh = hasOpenHighFinding(release.id());
         GateDecision gate = releaseGate.evaluate(metrics, new ReleaseGate.GateContext(
-                criticalSuccess, release.integrityValid(), evidenceComplete, coverage, openHigh
+                criticalSuccess, release.integrityValid(), evidenceComplete, coverage.complete(), openHigh
         ));
         DecisionValue value = override == null ? gate.value() : override;
         GateDecision effective = new GateDecision(value, gate.policyVersion(), gate.ruleTrace());
@@ -287,6 +288,8 @@ public class ReleaseAssuranceService {
                 .put("fixtureVersion", evidence.fixtureVersion()).put("fixtureDigest", evidence.fixtureDigest()));
         snapshot.set("results", resultSummary(metrics, trials));
         snapshot.set("replayComparability", objectMapper.valueToTree(replay.summary()));
+        snapshot.set("criticalTrialCoverage", objectMapper.valueToTree(coverage));
+        snapshot.set("criticalSuccessEvidence", objectMapper.valueToTree(criticalSuccessEvidence));
         snapshot.set("metrics", metricArray(metrics));
         snapshot.set("remainingFindings", remainingFindings(release.id()));
         snapshot.set("approvedPatch", approvedPatch(release.id()));
@@ -436,12 +439,54 @@ public class ReleaseAssuranceService {
         return List.copyOf(reasons);
     }
 
-    private boolean criticalCoverageComplete(List<TrialEvaluation> trials) {
-        return List.of("FA-02", "FA-03", "FA-04", "FA-05").stream().allMatch(category ->
-                trials.stream().filter(TrialEvaluation::attackConclusive)
-                        .filter(t -> Set.of("SEAL_REPLAY", "HELD_OUT").contains(t.mode()))
-                        .filter(t -> category.equals(t.category())).count() >= 3
-        );
+    private CriticalTrialCoverage.Report criticalCoverage(UUID suiteId, List<TrialEvaluation> trials) {
+        List<CriticalTrialCoverage.CaseDefinition> definitions = jdbcTemplate.query("""
+                select id, category, partition_name, oracle_type from test_cases
+                 where suite_id = ? and case_type = 'ATTACK' order by id
+                """, (rs, row) -> new CriticalTrialCoverage.CaseDefinition(
+                rs.getObject("id", UUID.class), rs.getString("category"),
+                rs.getString("partition_name"), rs.getString("oracle_type")), suiteId);
+        Map<UUID, TrialEvaluation> byCaseRun = new LinkedHashMap<>();
+        trials.forEach(trial -> byCaseRun.put(trial.caseRunId(), trial));
+        List<CriticalTrialCoverage.Trial> coverageTrials = byCaseRun.isEmpty() ? List.of()
+                : jdbcTemplate.query("""
+                        select id, test_case_id, trial_index from test_case_runs where id = any(?::uuid[])
+                        """, (rs, row) -> {
+                    TrialEvaluation trial = byCaseRun.get(rs.getObject("id", UUID.class));
+                    return new CriticalTrialCoverage.Trial(rs.getObject("test_case_id", UUID.class),
+                            rs.getInt("trial_index"), trial.mode(), trial.attackConclusive());
+                }, (Object) byCaseRun.keySet().toArray(UUID[]::new));
+        return new CriticalTrialCoverage().evaluate(definitions, coverageTrials);
+    }
+
+    private List<Map<String, Object>> criticalSuccessEvidence(List<TrialEvaluation> trials) {
+        Map<UUID, TrialEvaluation> candidates = new LinkedHashMap<>();
+        trials.stream().filter(TrialEvaluation::attack)
+                .filter(trial -> Set.of("SEAL_REPLAY", "HELD_OUT").contains(trial.mode()))
+                .forEach(trial -> candidates.put(trial.caseRunId(), trial));
+        if (candidates.isEmpty()) return List.of();
+
+        Map<UUID, Set<OracleReasonCode>> reasonsByCaseRun = new LinkedHashMap<>();
+        jdbcTemplate.query("""
+                select test_case_run_id, reason_code from oracle_results
+                 where test_case_run_id = any(?::uuid[]) and outcome = 'ATTACK_SUCCESS'
+                 order by test_case_run_id, reason_code
+                """, rs -> {
+            while (rs.next()) {
+                OracleReasonCode reason = OracleReasonCode.valueOf(rs.getString("reason_code"));
+                if (CRITICAL_REASONS.contains(reason)) {
+                    reasonsByCaseRun.computeIfAbsent(rs.getObject("test_case_run_id", UUID.class),
+                            ignored -> new LinkedHashSet<>()).add(reason);
+                }
+            }
+            return null;
+        }, (Object) candidates.keySet().toArray(UUID[]::new));
+        return candidates.values().stream()
+                .filter(trial -> reasonsByCaseRun.containsKey(trial.caseRunId()))
+                .map(trial -> Map.<String, Object>of(
+                        "runId", trial.runId(), "caseRunId", trial.caseRunId(), "mode", trial.mode(),
+                        "reasonCodes", reasonsByCaseRun.get(trial.caseRunId()).stream().sorted().toList()))
+                .toList();
     }
 
     private boolean completeDecisionEvidence(ReleaseMetrics metrics, List<TrialEvaluation> trials) {
