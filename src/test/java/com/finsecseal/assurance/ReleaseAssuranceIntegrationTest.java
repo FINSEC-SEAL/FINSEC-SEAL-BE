@@ -88,6 +88,10 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(snapshotEffectCount(proposal, "UnauthorizedRecordExposureCount").path("status").asString())
                 .isEqualTo("N_A");
         assertThat(proposal.inputSnapshot().at("/criticalTrialCoverage/complete").asBoolean()).isFalse();
+        assertThat(proposal.inputSnapshot().at("/criticalTrialCoverage/status").asString())
+                .isEqualTo("N_A");
+        assertThat(proposal.inputSnapshot().at("/criticalTrialCoverage/reason").asString())
+                .isEqualTo("REQUIRED_COHORT_CERTIFICATION_UNAVAILABLE");
         assertThat(proposal.inputSnapshot().at("/criticalTrialCoverage/cases/0/requiredTrials").asInt())
                 .isEqualTo(3);
         assertThat(proposal.inputSnapshot().at("/criticalTrialCoverage/cases/0/conclusiveTrials").asInt())
@@ -170,6 +174,12 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(threeCoverage.path("requiredTrials").asInt()).isEqualTo(3);
         assertThat(threeCoverage.path("conclusiveTrials").asInt()).isEqualTo(3);
         assertThat(threeCoverage.path("complete").asBoolean()).isTrue();
+        assertThat(threeProposal.inputSnapshot().at("/criticalTrialCoverage/complete").asBoolean())
+                .isFalse();
+        assertThat(threeProposal.inputSnapshot().at("/criticalTrialCoverage/status").asString())
+                .isEqualTo("N_A");
+        assertThat(threeProposal.inputSnapshot().at("/criticalTrialCoverage/reason").asString())
+                .isEqualTo("REQUIRED_COHORT_CERTIFICATION_UNAVAILABLE");
         assertThat(threeProposal.inputSnapshot().at("/replayComparability/comparableCount").asInt())
                 .isEqualTo(3);
         assertThat(threeProposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
@@ -200,6 +210,22 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(matchingCoverage.path("requiredTrials").asInt()).isEqualTo(3);
         assertThat(matchingCoverage.path("conclusiveTrials").asInt()).isEqualTo(3);
         assertThat(matchingCoverage.path("complete").asBoolean()).isTrue();
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from test_runs
+                 where release_id = ? and config_json = '{}'::jsonb
+                """, Long.class, matching.releaseId())).isEqualTo(1L);
+        assertThat(matchingProposal.inputSnapshot().at("/criticalTrialCoverage/complete").asBoolean())
+                .isFalse();
+        assertThat(matchingProposal.inputSnapshot().at("/criticalTrialCoverage/observedRequirementMet")
+                .asBoolean()).isFalse(); // One observed category is not the full P0 cohort.
+        assertThat(matchingProposal.inputSnapshot().at("/criticalTrialCoverage/status").asString())
+                .isEqualTo("N_A");
+        assertThat(matchingProposal.inputSnapshot().at("/criticalTrialCoverage/reason").asString())
+                .isEqualTo("REQUIRED_COHORT_CERTIFICATION_UNAVAILABLE");
+        assertThat(matchingProposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+        assertThat(matchingProposal.inputSnapshot().at("/decision/ruleTrace").valueStream()
+                .filter(rule -> "REVIEW_INSUFFICIENT_COVERAGE".equals(rule.path("ruleId").asString()))
+                .findFirst().orElseThrow().path("triggered").asBoolean()).isTrue();
 
         for (RequiredOracleCohort cohort : List.of(wrongType, wrongInvariant, missing, inconclusive)) {
             var proposal = assuranceService.evaluate(cohort.releaseId(), "role-d");
