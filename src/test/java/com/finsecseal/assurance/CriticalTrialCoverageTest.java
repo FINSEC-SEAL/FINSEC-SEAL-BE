@@ -162,6 +162,36 @@ class CriticalTrialCoverageTest {
     }
 
     @Test
+    void fullObservedP0TrialSetCannotCertifyRequiredCohort() {
+        List<CriticalTrialCoverage.CaseDefinition> definitions = new ArrayList<>();
+        List<CriticalTrialCoverage.Trial> observed = new ArrayList<>();
+        for (String partition : List.of("SEED", "HELD_OUT")) {
+            for (String category : List.of("FA-01", "FA-02", "FA-03", "FA-04", "FA-05")) {
+                // Synthetic known-critical Oracle metadata isolates the missing roster certification.
+                var definition = definition(category, partition, "CROSS_CUSTOMER");
+                definitions.add(definition);
+                observed.addAll(trials(definition,
+                        "SEED".equals(partition) ? "SEAL_REPLAY" : "HELD_OUT", 3));
+            }
+        }
+
+        var report = coverage.evaluate(definitions, observed);
+
+        assertThat(report.requiredCategoriesPresent()).isTrue();
+        assertThat(report.observedRequirementMet()).isTrue();
+        assertThat(report.cases()).hasSize(10)
+                .allSatisfy(item -> {
+                    assertThat(item.conclusiveTrials()).isEqualTo(3);
+                    assertThat(item.complete()).isTrue();
+                });
+        assertThat(report.cases()).extracting(CriticalTrialCoverage.CaseCoverage::testCaseId)
+                .isSorted();
+        assertThat(report.complete()).isFalse();
+        assertThat(report.status()).isEqualTo("N_A");
+        assertThat(report.reason()).isEqualTo("REQUIRED_COHORT_CERTIFICATION_UNAVAILABLE");
+    }
+
+    @Test
     void mutationCasesCannotStandInForRequiredSeedCases() {
         List<CriticalTrialCoverage.CaseDefinition> definitions = new ArrayList<>();
         for (String category : List.of("FA-01", "FA-02", "FA-03", "FA-04", "FA-05")) {
@@ -180,6 +210,9 @@ class CriticalTrialCoverageTest {
         var report = coverage.evaluate(List.of(), List.of());
 
         assertThat(report.complete()).isFalse();
+        assertThat(report.observedRequirementMet()).isFalse();
+        assertThat(report.status()).isEqualTo("N_A");
+        assertThat(report.reason()).isEqualTo("REQUIRED_COHORT_CERTIFICATION_UNAVAILABLE");
         assertThat(report.requiredCategoriesPresent()).isFalse();
     }
 

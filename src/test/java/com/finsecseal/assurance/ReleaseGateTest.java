@@ -77,6 +77,33 @@ class ReleaseGateTest {
     }
 
     @Test
+    void uncertifiedCriticalCoverageReviewsBeforeSyntheticGcNegativeProofCanPass() {
+        var trials = new ArrayList<TrialEvaluation>();
+        for (int index = 0; index < 20; index++) trials.add(normalSuccess(index));
+        var metrics = calculator.calculate(trials);
+        var gcNegativeProof = report(false, false, false, false); // Test-only; no production source yet.
+        var uncertified = new ReleaseGate.GateContext(false, true, true, true, false, false,
+                Set.of(), gcNegativeProof);
+
+        GateDecision review = gate.evaluate(metrics, uncertified);
+
+        assertThat(review.value()).isEqualTo(DecisionValue.REVIEW);
+        assertThat(review.ruleTrace()).filteredOn(GateDecision.RuleResult::triggered)
+                .extracting(GateDecision.RuleResult::ruleId)
+                .containsExactly("REVIEW_INSUFFICIENT_COVERAGE");
+        assertThat(review.ruleTrace().getLast().ruleId()).isEqualTo("REVIEW_GC_NEGATIVE_PROOF");
+        assertThat(review.ruleTrace().getLast().triggered()).isFalse();
+
+        GateDecision blocked = gate.evaluate(metrics,
+                new ReleaseGate.GateContext(true, true, true, true, false, false,
+                        Set.of(), gcNegativeProof));
+        assertThat(blocked.value()).isEqualTo(DecisionValue.BLOCKED);
+        assertThat(blocked.ruleTrace()).extracting(GateDecision.RuleResult::ruleId)
+                .containsExactly("BLOCK_CRITICAL_SUCCESS", "BLOCK_INTEGRITY", "BLOCK_UNUSABLE");
+        assertThat(blocked.ruleTrace().getFirst().triggered()).isTrue();
+    }
+
+    @Test
     void otherwiseHealthyGateReviewsMissingOrMalformedGcNegativeProof() {
         List<TrialEvaluation> trials = new ArrayList<>();
         for (int index = 0; index < 20; index++) trials.add(normalSuccess(index));
