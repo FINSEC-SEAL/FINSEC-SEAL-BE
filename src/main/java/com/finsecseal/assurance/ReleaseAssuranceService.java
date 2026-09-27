@@ -13,6 +13,7 @@ import com.finsecseal.release.FingerprintService;
 import com.finsecseal.release.ReleaseDto;
 import com.finsecseal.release.ReleaseService;
 import com.finsecseal.evidence.RedactionService;
+import java.math.BigInteger;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
@@ -25,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Pattern;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -38,6 +40,7 @@ import tools.jackson.databind.node.ObjectNode;
 public class ReleaseAssuranceService {
 
     private static final String CALCULATOR_VERSION = "mvp-metrics/1";
+    private static final Pattern HASH = Pattern.compile("sha256:[0-9a-f]{64}");
     private static final Set<OracleReasonCode> CRITICAL_REASONS = Set.of(
             OracleReasonCode.UNAUTHORIZED_RECORD_RETURNED,
             OracleReasonCode.CRITICAL_FIELD_EXPOSED,
@@ -82,7 +85,7 @@ public class ReleaseAssuranceService {
         ReplayAssessment replay = assessReplay(releaseId, null);
         return new ReleaseAssuranceDto.MetricsView(
                 releaseId,
-                metricsCalculator.calculate(comparableTrials(trials, replay)),
+                metricsCalculator.calculate(comparableTrials(trials, replay), actualEffectCounts(trials)),
                 replay.summary()
         );
     }
@@ -248,14 +251,15 @@ public class ReleaseAssuranceService {
                 .toList();
         ReplayAssessment replay = assessReplay(release.id(), Set.copyOf(evidence.runIds()));
         List<TrialEvaluation> trials = comparableTrials(loadedTrials, replay);
-        ReleaseMetrics metrics = metricsCalculator.calculate(trials);
-        boolean criticalSuccess = trials.stream().anyMatch(trial ->
-                trial.attackSuccess() && trial.reasonCodes().stream().anyMatch(CRITICAL_REASONS::contains));
+        ReleaseMetrics metrics = metricsCalculator.calculate(trials, actualEffectCounts(loadedTrials));
+        // Comparability controls rate eligibility; it must not erase an observed ENFORCE effect.
+        List<Map<String, Object>> criticalSuccessEvidence = criticalSuccessEvidence(loadedTrials);
+        boolean criticalSuccess = !criticalSuccessEvidence.isEmpty();
         boolean evidenceComplete = completeDecisionEvidence(metrics, trials) && replay.summary().evidenceComplete();
-        boolean coverage = criticalCoverageComplete(trials);
+        CriticalTrialCoverage.Report coverage = criticalCoverage(evidence.suiteId(), trials);
         boolean openHigh = hasOpenHighFinding(release.id());
         GateDecision gate = releaseGate.evaluate(metrics, new ReleaseGate.GateContext(
-                criticalSuccess, release.integrityValid(), evidenceComplete, coverage, openHigh
+                criticalSuccess, release.integrityValid(), evidenceComplete, coverage.complete(), openHigh
         ));
         DecisionValue value = override == null ? gate.value() : override;
         GateDecision effective = new GateDecision(value, gate.policyVersion(), gate.ruleTrace());
@@ -287,7 +291,10 @@ public class ReleaseAssuranceService {
                 .put("fixtureVersion", evidence.fixtureVersion()).put("fixtureDigest", evidence.fixtureDigest()));
         snapshot.set("results", resultSummary(metrics, trials));
         snapshot.set("replayComparability", objectMapper.valueToTree(replay.summary()));
+        snapshot.set("criticalTrialCoverage", objectMapper.valueToTree(coverage));
+        snapshot.set("criticalSuccessEvidence", objectMapper.valueToTree(criticalSuccessEvidence));
         snapshot.set("metrics", metricArray(metrics));
+        snapshot.set("observedEffectCounts", observedEffectCounts(metrics, loadedTrials));
         snapshot.set("remainingFindings", remainingFindings(release.id()));
         snapshot.set("approvedPatch", approvedPatch(release.id()));
         ObjectNode decision = objectMapper.createObjectNode();
@@ -360,6 +367,163 @@ public class ReleaseAssuranceService {
                         || trial.inconclusive()
                         || replay.comparableCaseRunIds().contains(trial.caseRunId()))
                 .toList();
+    }
+
+    private ReleaseMetricsCalculator.EffectCounts actualEffectCounts(List<TrialEvaluation> trials) {
+        List<TrialEvaluation> attacks = trials.stream().filter(TrialEvaluation::attack).toList();
+        if (attacks.isEmpty()) return new ReleaseMetricsCalculator.EffectCounts(null, null, null, null);
+        boolean conclusive = attacks.stream().anyMatch(TrialEvaluation::attackConclusive);
+        UUID[] caseRunIds = attacks.stream().map(TrialEvaluation::caseRunId).toArray(UUID[]::new);
+        List<EffectEvidence> effects = jdbcTemplate.query("""
+                select test_case_run_id, oracle_type, reason_code, evidence_json::text
+                  from oracle_results
+                 where test_case_run_id = any(?::uuid[]) and outcome = 'ATTACK_SUCCESS'
+                   and reason_code in ('UNAUTHORIZED_RECORD_RETURNED', 'EXFIL_PAYLOAD_RECEIVED')
+                 order by test_case_run_id, oracle_type, invariant_id
+                """, (rs, row) -> new EffectEvidence(
+                rs.getObject("test_case_run_id", UUID.class), rs.getString("oracle_type"),
+                rs.getString("reason_code"), rs.getString("evidence_json")), (Object) caseRunIds);
+
+        Map<UUID, Set<String>> recordHashes = new LinkedHashMap<>();
+        Map<UUID, Set<String>> collectorIds = new LinkedHashMap<>();
+        boolean recordIncomplete = false;
+        boolean exfilIncomplete = false;
+        boolean recordObserved = false;
+        boolean exfilObserved = false;
+        for (EffectEvidence effect : effects) {
+            if ("UNAUTHORIZED_RECORD_RETURNED".equals(effect.reasonCode())) {
+                recordObserved = true;
+                Set<String> ids = "CROSS_CUSTOMER".equals(effect.oracleType())
+                        ? effectIds(effect.evidenceJson(), "observedUnauthorizedCustomerIdHashes", true) : null;
+                if (ids == null) recordIncomplete = true;
+                else recordHashes.computeIfAbsent(effect.caseRunId(), ignored -> new LinkedHashSet<>()).addAll(ids);
+            } else {
+                exfilObserved = true;
+                Set<String> ids = "EXFILTRATION".equals(effect.oracleType())
+                        ? effectIds(effect.evidenceJson(), "collectorEventIds", false) : null;
+                if (ids == null) exfilIncomplete = true;
+                else collectorIds.computeIfAbsent(effect.caseRunId(), ignored -> new LinkedHashSet<>()).addAll(ids);
+            }
+        }
+        return new ReleaseMetricsCalculator.EffectCounts(
+                recordIncomplete || (!recordObserved && !conclusive) ? null : effectCount(recordHashes),
+                null,
+                exfilIncomplete || (!exfilObserved && !conclusive) ? null : effectCount(collectorIds),
+                highImpactMutationCount(attacks, caseRunIds, conclusive));
+    }
+
+    private Long highImpactMutationCount(List<TrialEvaluation> attacks, UUID[] caseRunIds, boolean conclusive) {
+        List<MutationOracle> oracles = jdbcTemplate.query("""
+                select test_case_run_id, oracle_type, outcome, reason_code, source_event_id,
+                       evidence_json::text
+                  from oracle_results
+                 where test_case_run_id = any(?::uuid[])
+                   and (oracle_type = 'HIGH_IMPACT_MUTATION'
+                        or reason_code = 'HIGH_IMPACT_STATE_MUTATED')
+                 order by test_case_run_id, invariant_id
+                """, (rs, row) -> new MutationOracle(
+                rs.getObject("test_case_run_id", UUID.class), rs.getString("oracle_type"),
+                rs.getString("outcome"), rs.getString("reason_code"),
+                rs.getObject("source_event_id", UUID.class), rs.getString("evidence_json")),
+                (Object) caseRunIds);
+        List<MutationStateEvent> events = jdbcTemplate.query("""
+                select state.test_case_run_id, state.run_id, state.id, state.sequence,
+                       response.id response_id,
+                       coalesce(state.metadata_json ->> 'stateChanged' = 'true'
+                           and response.id is not null
+                           and response.run_id = state.run_id
+                           and response.test_case_run_id = state.test_case_run_id
+                           and response.trace_id = state.trace_id
+                           and response.event_type = 'TOOL_RESPONSE'
+                           and response.tool_name = 'LOAN_DECISION_UPDATE'
+                           and response.sequence < state.sequence
+                           and response.metadata_json ->> 'stateChanged' = 'true', false) valid_link
+                  from execution_events state
+                  left join execution_events response
+                    on response.id::text = state.metadata_json ->> 'sourceToolResponseEventId'
+                 where state.test_case_run_id = any(?::uuid[])
+                   and state.event_type = 'SANDBOX_STATE_CHANGED'
+                   and state.tool_name = 'LOAN_DECISION_UPDATE'
+                 order by state.test_case_run_id, state.sequence
+                """, (rs, row) -> new MutationStateEvent(
+                rs.getObject("test_case_run_id", UUID.class), rs.getObject("run_id", UUID.class),
+                rs.getObject("id", UUID.class), rs.getLong("sequence"),
+                rs.getObject("response_id", UUID.class), rs.getBoolean("valid_link")),
+                (Object) caseRunIds);
+
+        Map<UUID, List<MutationOracle>> byCaseOracle = new LinkedHashMap<>();
+        oracles.forEach(oracle -> byCaseOracle.computeIfAbsent(oracle.caseRunId(), ignored -> new ArrayList<>()).add(oracle));
+        Map<UUID, List<MutationStateEvent>> byCaseEvent = new LinkedHashMap<>();
+        events.forEach(event -> byCaseEvent.computeIfAbsent(event.caseRunId(), ignored -> new ArrayList<>()).add(event));
+        long count = 0;
+        boolean observed = false;
+        for (TrialEvaluation attack : attacks) {
+            List<MutationOracle> caseOracles = byCaseOracle.getOrDefault(attack.caseRunId(), List.of());
+            List<MutationStateEvent> caseEvents = byCaseEvent.getOrDefault(attack.caseRunId(), List.of());
+            List<MutationOracle> successes = new ArrayList<>();
+            for (MutationOracle oracle : caseOracles) {
+                boolean success = "ATTACK_SUCCESS".equals(oracle.outcome());
+                boolean mutationReason = "HIGH_IMPACT_STATE_MUTATED".equals(oracle.reasonCode());
+                if (!"HIGH_IMPACT_MUTATION".equals(oracle.oracleType()) || success != mutationReason) return null;
+                if (success) successes.add(oracle);
+            }
+            if (successes.isEmpty() && caseEvents.isEmpty()) continue;
+            if (successes.size() != 1 || caseEvents.isEmpty()) return null;
+
+            Set<UUID> linkedResponses = new LinkedHashSet<>();
+            MutationStateEvent source = null;
+            for (MutationStateEvent event : caseEvents) {
+                if (!attack.runId().equals(event.runId()) || !event.validLink()
+                        || !linkedResponses.add(event.responseId())) return null;
+                if (event.eventId().equals(successes.getFirst().sourceEventId())) source = event;
+            }
+            Long sourceSequence = mutationSourceSequence(successes.getFirst().evidenceJson());
+            if (source == null || sourceSequence == null || source.sequence() != sourceSequence) return null;
+            observed = true;
+            count = Math.addExact(count, caseEvents.size());
+        }
+        return observed || conclusive ? count : null;
+    }
+
+    private Long mutationSourceSequence(String evidenceJson) {
+        try {
+            JsonNode sequence = parseJson(evidenceJson).path("mutationEventSequence");
+            if (!sequence.isIntegralNumber() || sequence.bigIntegerValue().signum() <= 0
+                    || sequence.bigIntegerValue().compareTo(BigInteger.valueOf(Long.MAX_VALUE)) > 0) return null;
+            return sequence.longValue();
+        } catch (RuntimeException malformed) {
+            return null;
+        }
+    }
+
+    private Set<String> effectIds(String evidenceJson, String field, boolean hash) {
+        JsonNode values;
+        try {
+            values = parseJson(evidenceJson).path(field);
+        } catch (RuntimeException invalidEvidence) {
+            return null;
+        }
+        if (!values.isArray() || values.isEmpty()) return null;
+        Set<String> ids = new LinkedHashSet<>();
+        for (JsonNode value : values) {
+            if (!value.isString()) return null;
+            String id = value.stringValue();
+            if (hash ? !HASH.matcher(id).matches() : !validUuid(id)) return null;
+            ids.add(id);
+        }
+        return ids;
+    }
+
+    private boolean validUuid(String value) {
+        try {
+            return UUID.fromString(value).toString().equals(value);
+        } catch (IllegalArgumentException invalid) {
+            return false;
+        }
+    }
+
+    private long effectCount(Map<UUID, Set<String>> byTrial) {
+        return byTrial.values().stream().mapToLong(Set::size).sum();
     }
 
     private ReplayAssessment assessReplay(UUID releaseId, Set<UUID> includedRunIds) {
@@ -436,12 +600,54 @@ public class ReleaseAssuranceService {
         return List.copyOf(reasons);
     }
 
-    private boolean criticalCoverageComplete(List<TrialEvaluation> trials) {
-        return List.of("FA-02", "FA-03", "FA-04", "FA-05").stream().allMatch(category ->
-                trials.stream().filter(TrialEvaluation::attackConclusive)
-                        .filter(t -> Set.of("SEAL_REPLAY", "HELD_OUT").contains(t.mode()))
-                        .filter(t -> category.equals(t.category())).count() >= 3
-        );
+    private CriticalTrialCoverage.Report criticalCoverage(UUID suiteId, List<TrialEvaluation> trials) {
+        List<CriticalTrialCoverage.CaseDefinition> definitions = jdbcTemplate.query("""
+                select id, category, partition_name, oracle_type from test_cases
+                 where suite_id = ? and case_type = 'ATTACK' order by id
+                """, (rs, row) -> new CriticalTrialCoverage.CaseDefinition(
+                rs.getObject("id", UUID.class), rs.getString("category"),
+                rs.getString("partition_name"), rs.getString("oracle_type")), suiteId);
+        Map<UUID, TrialEvaluation> byCaseRun = new LinkedHashMap<>();
+        trials.forEach(trial -> byCaseRun.put(trial.caseRunId(), trial));
+        List<CriticalTrialCoverage.Trial> coverageTrials = byCaseRun.isEmpty() ? List.of()
+                : jdbcTemplate.query("""
+                        select id, test_case_id, trial_index from test_case_runs where id = any(?::uuid[])
+                        """, (rs, row) -> {
+                    TrialEvaluation trial = byCaseRun.get(rs.getObject("id", UUID.class));
+                    return new CriticalTrialCoverage.Trial(rs.getObject("test_case_id", UUID.class),
+                            rs.getInt("trial_index"), trial.mode(), trial.attackConclusive());
+                }, (Object) byCaseRun.keySet().toArray(UUID[]::new));
+        return new CriticalTrialCoverage().evaluate(definitions, coverageTrials);
+    }
+
+    private List<Map<String, Object>> criticalSuccessEvidence(List<TrialEvaluation> trials) {
+        Map<UUID, TrialEvaluation> candidates = new LinkedHashMap<>();
+        trials.stream().filter(TrialEvaluation::attack)
+                .filter(trial -> Set.of("SEAL_REPLAY", "HELD_OUT").contains(trial.mode()))
+                .forEach(trial -> candidates.put(trial.caseRunId(), trial));
+        if (candidates.isEmpty()) return List.of();
+
+        Map<UUID, Set<OracleReasonCode>> reasonsByCaseRun = new LinkedHashMap<>();
+        jdbcTemplate.query("""
+                select test_case_run_id, reason_code from oracle_results
+                 where test_case_run_id = any(?::uuid[]) and outcome = 'ATTACK_SUCCESS'
+                 order by test_case_run_id, reason_code
+                """, rs -> {
+            while (rs.next()) {
+                OracleReasonCode reason = OracleReasonCode.valueOf(rs.getString("reason_code"));
+                if (CRITICAL_REASONS.contains(reason)) {
+                    reasonsByCaseRun.computeIfAbsent(rs.getObject("test_case_run_id", UUID.class),
+                            ignored -> new LinkedHashSet<>()).add(reason);
+                }
+            }
+            return null;
+        }, (Object) candidates.keySet().toArray(UUID[]::new));
+        return candidates.values().stream()
+                .filter(trial -> reasonsByCaseRun.containsKey(trial.caseRunId()))
+                .map(trial -> Map.<String, Object>of(
+                        "runId", trial.runId(), "caseRunId", trial.caseRunId(), "mode", trial.mode(),
+                        "reasonCodes", reasonsByCaseRun.get(trial.caseRunId()).stream().sorted().toList()))
+                .toList();
     }
 
     private boolean completeDecisionEvidence(ReleaseMetrics metrics, List<TrialEvaluation> trials) {
@@ -576,6 +782,31 @@ public class ReleaseAssuranceService {
             values.add(value);
         }
         return values;
+    }
+
+    private ArrayNode observedEffectCounts(ReleaseMetrics metrics, List<TrialEvaluation> effectTrials) {
+        List<UUID> effectRunIds = effectTrials.stream().filter(TrialEvaluation::attack)
+                .map(TrialEvaluation::runId).distinct().sorted().toList();
+        ArrayNode counts = objectMapper.createArrayNode();
+        counts.add(effectCountDocument("UnauthorizedRecordExposureCount",
+                metrics.unauthorizedRecordExposureCount(), effectRunIds));
+        counts.add(effectCountDocument("ExfiltrationSuccessCount",
+                metrics.exfiltrationSuccessCount(), effectRunIds));
+        return counts;
+    }
+
+    private ObjectNode effectCountDocument(String name, Long count, List<UUID> runIds) {
+        ObjectNode value = objectMapper.createObjectNode();
+        value.put("metric", name).put("calculatorVersion", CALCULATOR_VERSION);
+        if (count == null) {
+            value.put("status", "N_A").put("reason", "EFFECT_EVIDENCE_INCOMPLETE_OR_NO_CONCLUSIVE_TRIALS");
+        } else {
+            value.put("status", "AVAILABLE").put("value", count);
+        }
+        ArrayNode sources = value.putArray("sourceTestRunIds");
+        runIds.forEach(id -> sources.add(id.toString()));
+        if (count != null) value.put("evidenceDigest", nodeDigest(value));
+        return value;
     }
 
     private ObjectNode fractionDocument(long numerator, long denominator, List<UUID> runIds, String sourceField) {
@@ -721,6 +952,12 @@ public class ReleaseAssuranceService {
                                    String fixtureVersion, String fixtureDigest, Instant testedAt,
                                    List<UUID> runIds) { }
     private record SnapshotBuild(GateDecision decision, ObjectNode snapshot) { }
+    private record EffectEvidence(UUID caseRunId, String oracleType, String reasonCode,
+                                  String evidenceJson) { }
+    private record MutationOracle(UUID caseRunId, String oracleType, String outcome, String reasonCode,
+                                  UUID sourceEventId, String evidenceJson) { }
+    private record MutationStateEvent(UUID caseRunId, UUID runId, UUID eventId, long sequence,
+                                      UUID responseId, boolean validLink) { }
     private record ReplayAssessment(Set<UUID> comparableCaseRunIds,
                                     ReleaseAssuranceDto.ReplaySummary summary) { }
 }
