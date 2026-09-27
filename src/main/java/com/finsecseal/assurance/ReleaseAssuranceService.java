@@ -116,13 +116,14 @@ public class ReleaseAssuranceService {
         TrialSuccessDistributionCalculator.Report distribution =
                 trialSuccessDistribution(trials, replay.comparableCaseRunIds());
         Set<UUID> heldOutCaseRunIds = partitionVerifiedHeldOutCaseRunIds(distribution);
+        CompletionEvidence completion = completionEvidence(release, null);
         return new ReleaseAssuranceDto.MetricsView(
                 releaseId,
                 metricsCalculator.calculate(comparableTrials(trials, replay), actualEffectCounts(trials),
-                        replay.comparableCaseRunIds(), heldOutCaseRunIds),
+                        replay.comparableCaseRunIds(), heldOutCaseRunIds, completion.operationalRuns()),
                 replay.summary(),
                 policyLatency(releaseId, terminalRunIds(releaseId)),
-                completionRate(release, null),
+                completion.rate(),
                 distribution,
                 attackRateBreakdownCalculator.calculate(distribution),
                 criticalInvariantAnySuccess(trials)
@@ -293,8 +294,9 @@ public class ReleaseAssuranceService {
         TrialSuccessDistributionCalculator.Report distribution =
                 trialSuccessDistribution(loadedTrials, replay.comparableCaseRunIds());
         Set<UUID> heldOutCaseRunIds = partitionVerifiedHeldOutCaseRunIds(distribution);
+        CompletionEvidence completion = completionEvidence(release, evidence);
         ReleaseMetrics metrics = metricsCalculator.calculate(trials, actualEffectCounts(loadedTrials),
-                replay.comparableCaseRunIds(), heldOutCaseRunIds);
+                replay.comparableCaseRunIds(), heldOutCaseRunIds, completion.operationalRuns());
         // Comparability controls rate eligibility; it must not erase an observed ENFORCE effect.
         List<Map<String, Object>> criticalSuccessEvidence = criticalSuccessEvidence(loadedTrials);
         boolean criticalSuccess = !criticalSuccessEvidence.isEmpty();
@@ -302,7 +304,6 @@ public class ReleaseAssuranceService {
                 criticalInvariantAnySuccess(loadedTrials);
         boolean evidenceComplete = completeDecisionEvidence(metrics, trials) && replay.summary().evidenceComplete();
         CriticalTrialCoverage.Report coverage = criticalCoverage(evidence.suiteId(), trials);
-        CompletionEvidence completion = completionEvidence(release, evidence);
         boolean openHigh = hasOpenHighFinding(release.id());
         GateDecision gate = releaseGate.evaluate(metrics, new ReleaseGate.GateContext(
                 criticalSuccess, release.integrityValid(), evidenceComplete,
@@ -440,11 +441,6 @@ public class ReleaseAssuranceService {
         return policyLatencyCalculator.calculate(events);
     }
 
-    private CompletionRateCalculator.CompletionRate completionRate(ReleaseRow release,
-                                                                   EvidenceContext evidence) {
-        return completionEvidence(release, evidence).rate();
-    }
-
     private CompletionEvidence completionEvidence(ReleaseRow release, EvidenceContext evidence) {
         String cohortFilter = evidence == null ? "" : """
                    and run.suite_id = ? and run.fixture_version = ? and run.fixture_digest = ?
@@ -459,7 +455,12 @@ public class ReleaseAssuranceService {
                        count(case_run.id) materialized_cases,
                        count(case_run.id) filter (where case_run.status in
                            ('PASSED', 'FAILED_SECURITY', 'FAILED_FUNCTIONAL', 'ERROR')) terminal_non_cancelled,
-                       count(case_run.id) filter (where case_run.status = 'CANCELLED') cancelled_cases
+                       count(case_run.id) filter (where case_run.status = 'CANCELLED') cancelled_cases,
+                       count(case_run.id) filter (where case_run.status = 'ERROR' or exists (
+                           select 1 from oracle_results oracle
+                            where oracle.test_case_run_id = case_run.id
+                              and oracle.outcome = 'INCONCLUSIVE'
+                       )) error_or_inconclusive
                   from test_runs run
                   left join test_case_runs case_run on case_run.test_run_id = run.id
                  where run.release_id = ?
@@ -471,12 +472,16 @@ public class ReleaseAssuranceService {
                 new CompletionRateCalculator.RunCounts(
                         rs.getObject("id", UUID.class), rs.getLong("total_cases"),
                         rs.getLong("materialized_cases"), rs.getLong("terminal_non_cancelled"),
-                        rs.getLong("cancelled_cases"))), arguments);
+                        rs.getLong("cancelled_cases")),
+                new OperationalErrorRateCalculator.RunCounts(
+                        rs.getObject("id", UUID.class), rs.getLong("total_cases"),
+                        rs.getLong("materialized_cases"), rs.getLong("error_or_inconclusive"))), arguments);
         CompletionRateCalculator.CompletionRate rate = completionRateCalculator.calculate(
                 runs.stream().map(CompletionRun::counts).toList());
         boolean allParentsCompleted = !runs.isEmpty()
                 && runs.stream().allMatch(run -> "COMPLETED".equals(run.status()));
-        return new CompletionEvidence(rate, allParentsCompleted);
+        return new CompletionEvidence(rate,
+                runs.stream().map(CompletionRun::operationalCounts).toList(), allParentsCompleted);
     }
 
     private TrialSuccessDistributionCalculator.Report trialSuccessDistribution(
@@ -1219,6 +1224,10 @@ public class ReleaseAssuranceService {
                     metric.denominator() == null ? 0 : metric.denominator(),
                     metric.sourceRunIds(), "sourceTestRunIds"
             );
+            if (metric.status() == MetricValue.Status.N_A) {
+                value.put("reason", metric.reason());
+                value.putNull("numerator").putNull("denominator").putNull("value");
+            }
             value.put("metric", metric.name());
             value.put("calculatorVersion", CALCULATOR_VERSION);
             if (metric.status() == MetricValue.Status.AVAILABLE) {
@@ -1396,8 +1405,10 @@ public class ReleaseAssuranceService {
     private record EvidenceContext(UUID suiteId, String suiteVersion, String suiteHash,
                                    String fixtureVersion, String fixtureDigest, Instant testedAt,
                                    List<UUID> runIds) { }
-    private record CompletionRun(String status, CompletionRateCalculator.RunCounts counts) { }
+    private record CompletionRun(String status, CompletionRateCalculator.RunCounts counts,
+                                 OperationalErrorRateCalculator.RunCounts operationalCounts) { }
     private record CompletionEvidence(CompletionRateCalculator.CompletionRate rate,
+                                      List<OperationalErrorRateCalculator.RunCounts> operationalRuns,
                                       boolean allParentsCompleted) {
         private boolean scheduledEvidenceComplete() {
             return allParentsCompleted
