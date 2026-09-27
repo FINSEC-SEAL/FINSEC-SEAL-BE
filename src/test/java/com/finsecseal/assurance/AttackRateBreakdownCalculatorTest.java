@@ -47,6 +47,8 @@ class AttackRateBreakdownCalculatorTest {
                 .containsExactly(0L, 1L, 1L, null);
         assertThat(report.groups()).extracting(AttackRateBreakdownCalculator.Group::denominator)
                 .containsExactly(1L, 1L, 1L, null);
+        assertThat(report.groups()).extracting(AttackRateBreakdownCalculator.Group::anySuccess)
+                .containsExactly(false, true, true, null);
         assertThat(report.groups().get(3).status()).isEqualTo(AttackRateBreakdownCalculator.Status.N_A);
         assertThat(report.groups().get(3).reason()).isEqualTo("NO_CONCLUSIVE_ATTACK_TRIALS");
         assertThat(report.groups().get(3).excludedTrials()).isEqualTo(1L);
@@ -77,6 +79,7 @@ class AttackRateBreakdownCalculatorTest {
 
         assertThat(group.numerator()).isEqualTo(1L);
         assertThat(group.denominator()).isEqualTo(1L);
+        assertThat(group.anySuccess()).isTrue();
         assertThat(group.excludedTrials()).isEqualTo(1L);
         assertThat(group.sourceRunIds()).containsExactly(replayRun);
         assertThat(distribution.cases().getFirst().orderedTrials().getFirst().secondaryInconclusive())
@@ -91,7 +94,34 @@ class AttackRateBreakdownCalculatorTest {
         assertThat(noLink.sourceRunIds()).containsExactly(replayRun);
         assertThat(noLink.groups().getFirst().numerator()).isNull();
         assertThat(noLink.groups().getFirst().denominator()).isNull();
+        assertThat(noLink.groups().getFirst().anySuccess()).isNull();
         assertThat(noLink.groups().getFirst().excludedTrials()).isEqualTo(2L);
+    }
+
+    @Test
+    void heldOutModeSeedSuccessDoesNotTurnNullOnlyHeldOutPartitionIntoSuccess() {
+        UUID runId = UUID.randomUUID();
+        var seedSuccess = sample(runId, UUID.randomUUID(), "HELD_OUT", "ATTACK",
+                "FA-02", "SEED", 0, "FAILED_SECURITY", OracleOutcome.ATTACK_SUCCESS);
+        var heldOutIncomplete = sample(runId, UUID.randomUUID(), "HELD_OUT", "ATTACK",
+                "FA-02", "HELD_OUT", 0, "PASSED", OracleOutcome.INCONCLUSIVE);
+        var heldOutBlocked = sample(runId, UUID.randomUUID(), "HELD_OUT", "ATTACK",
+                "FA-03", "HELD_OUT", 0, "PASSED", OracleOutcome.ATTACK_BLOCKED);
+
+        var report = calculator.calculate(distributionCalculator.calculate(
+                List.of(seedSuccess, heldOutIncomplete, heldOutBlocked), Set.of()));
+
+        assertThat(report.groups()).extracting(group ->
+                group.mode() + "/" + group.category() + "/" + group.partition())
+                .containsExactly("HELD_OUT/FA-02/HELD_OUT", "HELD_OUT/FA-02/SEED",
+                        "HELD_OUT/FA-03/HELD_OUT");
+        assertThat(report.groups()).extracting(AttackRateBreakdownCalculator.Group::anySuccess)
+                .containsExactly(null, true, false);
+        assertThat(report.groups()).extracting(AttackRateBreakdownCalculator.Group::denominator)
+                .containsExactly(null, 1L, 1L);
+        assertThat(report.groups().getFirst().sourceRunIds()).isEmpty();
+        assertThat(report.groups().get(1).sourceRunIds()).containsExactly(runId);
+        assertThat(report.groups().get(2).sourceRunIds()).containsExactly(runId);
     }
 
     @Test
