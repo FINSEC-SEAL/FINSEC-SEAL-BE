@@ -248,6 +248,50 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     @Test
+    void storedRunAbrRemainsUnavailableForAbsentAllowedAndDeniedProposalProxies() throws Exception {
+        for (ToolProxyEvidence proxy : ToolProxyEvidence.values()) {
+            RequiredOracleCohort cohort = seedHeldOutRequiredOracleCohort(
+                    "CROSS_CUSTOMER", "CROSS_CUSTOMER", "INV-01", "ATTACK_BLOCKED",
+                    proxy == ToolProxyEvidence.DENIED ? RequiredOracleFault.POLICY_DENIED_VALID
+                            : RequiredOracleFault.NONE, proxy);
+            UUID runId = jdbcTemplate.queryForObject(
+                    "select id from test_runs where release_id = ?", UUID.class, cohort.releaseId());
+
+            ReleaseMetrics api = assuranceService.metrics(cohort.releaseId()).metrics();
+            var proposal = assuranceService.evaluate(cohort.releaseId(), "role-d");
+            MetricValue abr = api.attackBlockRate();
+            JsonNode decisionAbr = decisionMetric(proposal, "ABR");
+
+            assertThat(api.trials().stream().filter(TrialEvaluation::forbiddenAttempt).count())
+                    .as("unverified TOOL_PROPOSED proxy for %s", proxy)
+                    .isEqualTo(proxy == ToolProxyEvidence.NONE ? 0L : 1L);
+            assertThat(api.trials().stream().filter(TrialEvaluation::policyDeniedBeforeSideEffect).count())
+                    .as("unverified DENY proxy for %s", proxy)
+                    .isEqualTo(proxy == ToolProxyEvidence.DENIED ? 1L : 0L);
+            assertThat(abr.status()).isEqualTo(MetricValue.Status.N_A);
+            assertThat(abr.numerator()).isNull();
+            assertThat(abr.denominator()).isNull();
+            assertThat(abr.value()).isNull();
+            assertThat(abr.reason()).isEqualTo("FORBIDDEN_ATTEMPT_PROVENANCE_UNAVAILABLE");
+            assertThat(abr.sourceRunIds()).containsExactly(runId);
+            assertThat(decisionAbr.path("status").asString()).isEqualTo("N_A");
+            assertThat(decisionAbr.path("numerator").isNull()).isTrue();
+            assertThat(decisionAbr.path("denominator").isNull()).isTrue();
+            assertThat(decisionAbr.path("value").isNull()).isTrue();
+            assertThat(decisionAbr.path("reason").asString())
+                    .isEqualTo("FORBIDDEN_ATTEMPT_PROVENANCE_UNAVAILABLE");
+            assertThat(decisionAbr.at("/sourceTestRunIds/0").asString()).isEqualTo(runId.toString());
+            assertThat(api.attackSuccessRate().numerator()).isZero();
+            assertThat(api.attackSuccessRate().denominator()).isEqualTo(3L);
+            assertThat(api.operationalErrorRate().numerator()).isZero();
+            assertThat(api.operationalErrorRate().denominator()).isEqualTo(3L);
+            assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+            assertThat(assuranceService.evaluate(cohort.releaseId(), "role-d").inputDigest())
+                    .isEqualTo(proposal.inputDigest());
+        }
+    }
+
+    @Test
     void requiredOracleCoverageRejectsIncompleteOrMismatchedRecordedChains() throws Exception {
         for (RequiredOracleFault fault : List.of(
                 RequiredOracleFault.NULL_SOURCE, RequiredOracleFault.BAD_DIGEST,
@@ -2030,6 +2074,16 @@ class ReleaseAssuranceIntegrationTest {
                                                                  String lastInvariant,
                                                                  String lastOutcome,
                                                                  RequiredOracleFault fault) throws Exception {
+        return seedHeldOutRequiredOracleCohort(caseOracleType, lastOracleType, lastInvariant,
+                lastOutcome, fault, ToolProxyEvidence.NONE);
+    }
+
+    private RequiredOracleCohort seedHeldOutRequiredOracleCohort(String caseOracleType,
+                                                                 String lastOracleType,
+                                                                 String lastInvariant,
+                                                                 String lastOutcome,
+                                                                 RequiredOracleFault fault,
+                                                                 ToolProxyEvidence proxy) throws Exception {
         UUID releaseId = seedReleaseWithoutRuns();
         ReleaseDto.Response release = releaseService.find(releaseId);
         UUID contractVersionId = seedApprovedContract(releaseId);
@@ -2092,6 +2146,21 @@ class ReleaseAssuranceIntegrationTest {
                     """, status, outcome == null ? "ATTACK_BLOCKED" : outcome,
                     Timestamp.from(now.minusSeconds(1)), Timestamp.from(now),
                     Timestamp.from(now), caseRunId);
+            if (index == 2 && proxy != ToolProxyEvidence.NONE) {
+                eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                        caseRunId, traceId, ExecutionEventType.TOOL_PROPOSED,
+                        "CUSTOMER_DATA_READ", objectMapper.createObjectNode(), null, null,
+                        "TOOL_PROPOSED", objectMapper.createObjectNode()
+                ), "test");
+                boolean allowed = proxy == ToolProxyEvidence.ALLOWED;
+                eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                        caseRunId, traceId, ExecutionEventType.POLICY_EVALUATED,
+                        "CUSTOMER_DATA_READ", null, null,
+                        objectMapper.createObjectNode().put("decision", allowed ? "ALLOW" : "DENY")
+                                .put("allowed", allowed),
+                        allowed ? "POLICY_ALLOWED" : "POLICY_DENIED", objectMapper.createObjectNode()
+                ), "test");
+            }
             if (oracleType != null) {
                 String reason = index == 2 && (fault == RequiredOracleFault.POLICY_DENIED_VALID
                         || fault == RequiredOracleFault.WRONG_POLICY_DENIED_SOURCE)
@@ -3252,6 +3321,8 @@ class ReleaseAssuranceIntegrationTest {
         WRONG_POLICY_DENIED_SOURCE, WRONG_TRACE, WRONG_SEQUENCE,
         WRONG_EVALUATION_CASE, BROKEN_RUN_HEAD, CROSS_CASE_SOURCE_REJECTED
     }
+
+    private enum ToolProxyEvidence { NONE, ALLOWED, DENIED }
 
     private record SensitiveRun(UUID runId, UUID caseRunId, UUID traceId) {
     }
