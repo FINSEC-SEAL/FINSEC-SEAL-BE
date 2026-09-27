@@ -42,6 +42,9 @@ public class IdempotencyFilter extends OncePerRequestFilter {
     public record Admission(UUID recordId, String requestDigest) {}
     private static final Set<String> MUTATION_METHODS = Set.of("POST", "PUT", "PATCH", "DELETE");
     private static final Pattern KEY = Pattern.compile("^[A-Za-z0-9._:-]{1,128}$");
+    private static final Pattern FORBIDDEN_EVENT_POST = Pattern.compile(
+            "^/api/v1/test-runs/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                    + "[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/events$");
     private static final int MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 
     private final JdbcTemplate jdbcTemplate;
@@ -66,8 +69,11 @@ public class IdempotencyFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        return !request.getRequestURI().startsWith("/api/v1/")
-                || !MUTATION_METHODS.contains(request.getMethod());
+        String path = request.getRequestURI();
+        String method = request.getMethod();
+        return !path.startsWith("/api/v1/")
+                || !MUTATION_METHODS.contains(method)
+                || ("POST".equals(method) && FORBIDDEN_EVENT_POST.matcher(path).matches());
     }
 
     @Override
