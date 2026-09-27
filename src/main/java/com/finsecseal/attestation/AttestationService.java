@@ -42,6 +42,8 @@ public class AttestationService {
     private static final String ATTESTATION_TYPE = "FINSEC_SEAL_INTERNAL_RELEASE_ATTESTATION";
     private static final Pattern DIGEST = Pattern.compile("sha256:[0-9a-f]{64}");
     private static final Set<String> TERMINAL_DECISIONS = Set.of("PASS", "REVIEW", "BLOCKED");
+    private static final List<String> GC_IDS = List.of("GC-01", "GC-02", "GC-03", "GC-04");
+    private static final List<String> GC_INVARIANTS = List.of("INV-01", "INV-02", "INV-04", "INV-05");
     private static final List<String> REVALIDATION_TRIGGERS = List.of(
             "MODEL_CHANGE",
             "SYSTEM_PROMPT_CHANGE",
@@ -82,10 +84,17 @@ public class AttestationService {
         validateDecisionState(decision, invalidation);
         JsonNode snapshot = decision.inputSnapshot();
         validateSnapshot(decision, snapshot, invalidation != null);
+        StoredAttestation existing = findStored(decision.id());
+        // A stored pre-report PASS remains readable only after the original
+        // Decision/document/hash checks below. No new or modern-schema PASS
+        // can be attested without a versioned GC negative-proof contract.
+        if ("PASS".equals(decision.decision())
+                && (existing == null || snapshot.has("criticalInvariantAnySuccess"))) {
+            incomplete("PASS Attestation requires a verifiable GC negative-proof contract");
+        }
         ObjectNode expectedDocument = buildDocument(decision, snapshot);
         String expectedHash = digestService.sha256(canonicalJsonService.canonicalize(expectedDocument));
         String expectedHtml = renderHtml(expectedDocument, expectedHash);
-        StoredAttestation existing = findStored(decision.id());
         boolean inserted = false;
         if (existing == null) {
             UUID attestationId = UuidV7.generate();
@@ -272,6 +281,7 @@ public class AttestationService {
         requireObject(snapshot, "decision");
         requireArray(snapshot.path("decision"), "ruleTrace");
         validateEvidenceStructure(decision, snapshot);
+        validateCriticalEvidence(decision, snapshot);
         if (!snapshot.path("testedAt").isString()) {
             incomplete("Decision input snapshot requires testedAt");
         }
@@ -334,6 +344,10 @@ public class AttestationService {
         copy(document, snapshot, "results");
         copy(document, snapshot, "metrics");
         if (snapshot.has("observedEffectCounts")) copy(document, snapshot, "observedEffectCounts");
+        if (snapshot.has("criticalInvariantAnySuccess")) {
+            copy(document, snapshot, "criticalInvariantAnySuccess");
+            copy(document, snapshot, "criticalTrialCoverage");
+        }
         copy(document, snapshot, "remainingFindings");
         copy(document, snapshot, "approvedPatch");
 
@@ -496,7 +510,8 @@ public class AttestationService {
                 incomplete(path + " must be an object");
             }
             requireText(metric.path("metric"), path + ".metric");
-            if (!metricNames.add(metric.path("metric").asString())) {
+            String metricName = metric.path("metric").asString();
+            if (!metricNames.add(metricName)) {
                 incomplete("metric names must be unique");
             }
             requireText(metric.path("calculatorVersion"), path + ".calculatorVersion");
@@ -511,7 +526,9 @@ public class AttestationService {
                     decision,
                     snapshot,
                     metric.path("sourceTestRunIds"),
-                    path + ".sourceTestRunIds"
+                    path + ".sourceTestRunIds",
+                    "OperationalErrorRate".equals(metricName)
+                            ? RunSourceScope.SCHEDULED : RunSourceScope.COMPLETED
             );
             if ("PASS".equals(decision.decision()) && (notApplicable || sourceCount == 0)) {
                 incomplete("PASS Decision requires conclusive source evidence for " + path);
@@ -639,13 +656,132 @@ public class AttestationService {
         }
     }
 
+    private void validateCriticalEvidence(DecisionSnapshot decision, JsonNode snapshot) {
+        if (!snapshot.has("criticalInvariantAnySuccess")) {
+            // Pre-report Decisions remain historical; coverage alone is not a GC report.
+            return;
+        }
+        JsonNode report = snapshot.path("criticalInvariantAnySuccess");
+        JsonNode invariants = report.path("invariants");
+        if (!report.isObject() || !invariants.isArray() || invariants.size() != GC_IDS.size()) {
+            incomplete("criticalInvariantAnySuccess requires four ordered GC entries");
+        }
+        validateCriticalTrialCoverage(snapshot.path("criticalTrialCoverage"));
+        for (int index = 0; index < GC_IDS.size(); index++) {
+            JsonNode invariant = invariants.get(index);
+            String path = "criticalInvariantAnySuccess.invariants[" + index + "]";
+            if (!invariant.isObject()
+                    || !GC_IDS.get(index).equals(invariant.path("gcId").asString())
+                    || !GC_INVARIANTS.get(index).equals(invariant.path("invariantId").asString())) {
+                incomplete(path + " has an invalid GC identity or order");
+            }
+            String status = invariant.path("status").asString();
+            int sourceRunCount = validateSourceRuns(decision, snapshot, invariant.path("sourceRunIds"),
+                    path + ".sourceRunIds", true);
+            int sourceCaseCount = validateUuidEvidenceIds(invariant.path("sourceCaseRunIds"),
+                    path + ".sourceCaseRunIds");
+            int sourceOracleCount = validateUuidEvidenceIds(invariant.path("sourceOracleResultIds"),
+                    path + ".sourceOracleResultIds");
+            int sourceEventCount = validateUuidEvidenceIds(invariant.path("sourceEventIds"),
+                    path + ".sourceEventIds");
+            if ("N_A".equals(status)) {
+                requireText(invariant.path("reason"), path + ".reason");
+                if (!invariant.path("anySuccess").isNull()
+                        || sourceRunCount != 0 || sourceCaseCount != 0
+                        || sourceOracleCount != 0 || sourceEventCount != 0) {
+                    incomplete(path + " cannot turn missing GC evidence into a result");
+                }
+            } else if ("AVAILABLE".equals(status)) {
+                if (invariant.path("anySuccess").isBoolean()
+                        && !invariant.path("anySuccess").booleanValue()) {
+                    incomplete(path + " has no versioned negative proof for false");
+                }
+                if (!invariant.path("anySuccess").isBoolean()
+                        || !invariant.path("anySuccess").booleanValue()
+                        || !invariant.path("reason").isNull()
+                        || sourceRunCount == 0 || sourceCaseCount == 0
+                        || sourceOracleCount == 0 || sourceEventCount == 0) {
+                    incomplete(path + " requires a sourced positive report");
+                }
+                for (JsonNode sourceRunId : invariant.path("sourceRunIds")) {
+                    Integer protectedRun = jdbcTemplate.queryForObject("""
+                            select count(*) from test_runs
+                             where id = ? and mode in ('SEAL_REPLAY', 'HELD_OUT')
+                            """, Integer.class, UUID.fromString(sourceRunId.asString()));
+                    if (protectedRun == null || protectedRun != 1) {
+                        incomplete(path + " requires a protected source Run");
+                    }
+                }
+            } else {
+                incomplete(path + ".status must be AVAILABLE or N_A");
+            }
+        }
+    }
+
+    private void validateCriticalTrialCoverage(JsonNode coverage) {
+        if (!coverage.isObject() || !coverage.path("complete").isBoolean()
+                || !coverage.path("requiredCategoriesPresent").isBoolean()
+                || !coverage.path("cases").isArray()) {
+            incomplete("criticalTrialCoverage requires completion and case evidence");
+        }
+        if (coverage.path("complete").booleanValue()
+                && !coverage.path("requiredCategoriesPresent").booleanValue()) {
+            incomplete("criticalTrialCoverage cannot be complete without required categories");
+        }
+        Set<UUID> uniqueCases = new HashSet<>();
+        for (JsonNode item : coverage.path("cases")) {
+            if (!item.isObject()) {
+                incomplete("criticalTrialCoverage.cases entries must be objects");
+            }
+            requireUuid(item.path("testCaseId"), "criticalTrialCoverage.cases.testCaseId");
+            if (!uniqueCases.add(UUID.fromString(item.path("testCaseId").asString()))) {
+                incomplete("criticalTrialCoverage.cases contains duplicate TestCases");
+            }
+            requireText(item.path("category"), "criticalTrialCoverage.cases.category");
+            requireText(item.path("partition"), "criticalTrialCoverage.cases.partition");
+            if (!item.path("mode").isNull()) {
+                requireText(item.path("mode"), "criticalTrialCoverage.cases.mode");
+            }
+            JsonNode required = item.path("requiredTrials");
+            JsonNode conclusive = item.path("conclusiveTrials");
+            if ((!required.isNull() && (!required.isIntegralNumber()
+                    || required.bigIntegerValue().signum() <= 0))
+                    || !conclusive.isIntegralNumber() || conclusive.bigIntegerValue().signum() < 0
+                    || !item.path("complete").isBoolean()) {
+                incomplete("criticalTrialCoverage.cases has invalid trial counts or completion");
+            }
+            if (item.path("complete").booleanValue()) {
+                if (required.isNull() || conclusive.bigIntegerValue().compareTo(required.bigIntegerValue()) < 0
+                        || !item.path("reason").isNull()) {
+                    incomplete("criticalTrialCoverage.cases complete entry lacks conclusive trials");
+                }
+            } else {
+                requireText(item.path("reason"), "criticalTrialCoverage.cases.reason");
+            }
+        }
+    }
+
+    private int validateUuidEvidenceIds(JsonNode ids, String field) {
+        if (!ids.isArray()) {
+            incomplete(field + " must be an array");
+        }
+        Set<UUID> unique = new HashSet<>();
+        for (JsonNode id : ids) {
+            requireUuid(id, field);
+            if (!unique.add(UUID.fromString(id.asString()))) {
+                incomplete(field + " must not contain duplicate IDs");
+            }
+        }
+        return unique.size();
+    }
+
     private int validateSourceRuns(
             DecisionSnapshot decision,
             JsonNode snapshot,
             JsonNode sourceIds,
             String field
     ) {
-        return validateSourceRuns(decision, snapshot, sourceIds, field, false);
+        return validateSourceRuns(decision, snapshot, sourceIds, field, RunSourceScope.COMPLETED);
     }
 
     private int validateSourceRuns(
@@ -654,6 +790,17 @@ public class AttestationService {
             JsonNode sourceIds,
             String field,
             boolean effectSource
+    ) {
+        return validateSourceRuns(decision, snapshot, sourceIds, field,
+                effectSource ? RunSourceScope.ATTACK_EFFECT : RunSourceScope.COMPLETED);
+    }
+
+    private int validateSourceRuns(
+            DecisionSnapshot decision,
+            JsonNode snapshot,
+            JsonNode sourceIds,
+            String field,
+            RunSourceScope scope
     ) {
         if (!sourceIds.isArray()) {
             incomplete(field + " must be an array");
@@ -665,15 +812,22 @@ public class AttestationService {
             if (!unique.add(runId)) {
                 incomplete(field + " must not contain duplicate Run IDs");
             }
-            String sourceScope = effectSource ? """
-                       and run.status in ('COMPLETED', 'FAILED')
-                       and exists (
-                           select 1 from test_case_runs trial
-                           join test_cases test_case on test_case.id = trial.test_case_id
-                           where trial.test_run_id = run.id and test_case.suite_id = run.suite_id
-                             and test_case.case_type = 'ATTACK'
-                       )
-                    """ : " and run.status = 'COMPLETED'";
+            String sourceScope = switch (scope) {
+                case COMPLETED -> " and run.status = 'COMPLETED'";
+                case ATTACK_EFFECT -> """
+                           and run.status in ('COMPLETED', 'FAILED')
+                           and exists (
+                               select 1 from test_case_runs trial
+                               join test_cases test_case on test_case.id = trial.test_case_id
+                               where trial.test_run_id = run.id and test_case.suite_id = run.suite_id
+                                 and test_case.case_type = 'ATTACK'
+                           )
+                        """;
+                case SCHEDULED -> """
+                           and run.status in ('QUEUED', 'PREPARING', 'RUNNING', 'CANCELLING',
+                                              'COMPLETED', 'FAILED', 'CANCELLED')
+                        """;
+            };
             Integer matches = jdbcTemplate.queryForObject("""
                     select count(*) from test_runs run
                      where run.id = ? and run.release_id = ? and run.suite_id = ?
@@ -867,6 +1021,12 @@ public class AttestationService {
 
     private void incomplete(String message) {
         throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, message);
+    }
+
+    private enum RunSourceScope {
+        COMPLETED,
+        ATTACK_EFFECT,
+        SCHEDULED
     }
 
     private record DecisionSnapshot(
