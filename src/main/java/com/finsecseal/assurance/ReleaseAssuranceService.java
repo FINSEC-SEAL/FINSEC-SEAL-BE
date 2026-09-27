@@ -56,6 +56,7 @@ public class ReleaseAssuranceService {
     private final AuditService auditService;
     private final FingerprintService fingerprintService;
     private final RedactionService redactionService;
+    private final SensitiveFieldExposureCounter sensitiveFieldExposureCounter;
     private final ReleaseMetricsCalculator metricsCalculator = new ReleaseMetricsCalculator();
     private final ReleaseGate releaseGate = new ReleaseGate();
 
@@ -67,7 +68,8 @@ public class ReleaseAssuranceService {
             ReleaseService releaseService,
             AuditService auditService,
             FingerprintService fingerprintService,
-            RedactionService redactionService
+            RedactionService redactionService,
+            SensitiveFieldExposureCounter sensitiveFieldExposureCounter
     ) {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
@@ -77,6 +79,7 @@ public class ReleaseAssuranceService {
         this.auditService = auditService;
         this.fingerprintService = fingerprintService;
         this.redactionService = redactionService;
+        this.sensitiveFieldExposureCounter = sensitiveFieldExposureCounter;
     }
 
     public ReleaseAssuranceDto.MetricsView metrics(UUID releaseId) {
@@ -407,7 +410,7 @@ public class ReleaseAssuranceService {
         }
         return new ReleaseMetricsCalculator.EffectCounts(
                 recordIncomplete || (!recordObserved && !conclusive) ? null : effectCount(recordHashes),
-                null,
+                sensitiveFieldExposureCounter.count(attacks),
                 exfilIncomplete || (!exfilObserved && !conclusive) ? null : effectCount(collectorIds),
                 highImpactMutationCount(attacks, caseRunIds, conclusive));
     }
