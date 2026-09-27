@@ -51,6 +51,7 @@ import com.finsecseal.release.DigestService;
 import com.finsecseal.release.ReleaseService;
 import com.finsecseal.runtime.AgentRuntimeService;
 import com.finsecseal.runtime.AgentToolLoopService;
+import com.finsecseal.runtime.CustomerFieldDeliveryEvidence;
 import com.finsecseal.runtime.ToolInvocation;
 import com.finsecseal.runtime.ToolProposal;
 import com.finsecseal.runtime.ToolProposalValidator;
@@ -85,6 +86,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.mockito.ArgumentCaptor;
 import org.springframework.aop.support.AopUtils;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -139,6 +141,7 @@ class LoanReviewPolicyGatewayIntegrationTest {
     @Autowired GatewayPolicyFactsAssembler facts;
     @MockitoSpyBean StateChangingToolExecutionService mutations;
     @Autowired CustomerDataReadToolAdapter customer;
+    @Autowired CustomerFieldDeliveryEvidence customerEvidence;
     @Autowired SandboxFixtureService fixtures;
     @Autowired RedactionService redaction;
     @Autowired CanonicalJsonService canonical;
@@ -171,7 +174,9 @@ class LoanReviewPolicyGatewayIntegrationTest {
         assertThat(result.terminationReason()).isEqualTo(AgentToolLoopService.TerminationReason.FINAL_RESPONSE);
         assertThat(result.finalResponse().content()).isEqualTo("Conditional synthetic fixture complete");
         verify(ai).propose(any());
-        verify(ai).deliverToolResult(any());
+        ArgumentCaptor<AgentAiClient.ToolResultDeliveryRequest> delivery =
+                ArgumentCaptor.forClass(AgentAiClient.ToolResultDeliveryRequest.class);
+        verify(ai).deliverToolResult(delivery.capture());
         verify(ai, never()).executeStep(any());
         assertThat(adapter.calls).isEqualTo(1);
         assertThat(observations.begins).isEqualTo(1);
@@ -184,6 +189,30 @@ class LoanReviewPolicyGatewayIntegrationTest {
                 ExecutionEventType.MODEL_RESPONSE, ExecutionEventType.TOOL_PROPOSED, ExecutionEventType.POLICY_EVALUATED,
                 ExecutionEventType.TOOL_REQUEST, ExecutionEventType.TOOL_RESPONSE, ExecutionEventType.MODEL_REQUEST, ExecutionEventType.MODEL_RESPONSE);
         List<Event> stored = history(seed);
+        var delivered = delivery.getValue();
+        assertThat(delivered.runId()).isEqualTo(seed.runId());
+        assertThat(delivered.caseRunId()).isEqualTo(seed.caseRunId());
+        assertThat(delivered.traceId()).isEqualTo(seed.context().traceId());
+        assertThat(delivered.toolName()).isEqualTo(CUSTOMER_TOOL);
+        assertThat(delivered.sourceEventId()).isEqualTo(stored.get(6).eventId());
+        assertThat(delivered.sourceSequence()).isEqualTo(stored.get(6).sequence());
+        JsonNode deliveredRows = delivered.toolOutput().path("rows");
+        assertThat(delivered.toolOutput().path("status").asInt()).isEqualTo(200);
+        assertThat(deliveredRows.size()).isEqualTo(1);
+        assertThat(deliveredRows.get(0).path("customerId").asString()).isEqualTo(CUSTOMER);
+        assertThat(deliveredRows.get(0).path("fields").properties().stream().map(Map.Entry::getKey).toList())
+                .containsExactlyInAnyOrder("incomeBand", "employmentStatus");
+        JsonNode deliveryEvidence = stored.get(8).metadata().path("customerFieldDeliveryEvidence");
+        assertThat(deliveryEvidence.path("status").asString()).isEqualTo("AVAILABLE");
+        assertThat(deliveryEvidence.path("sourceToolResponseEventId").asString())
+                .isEqualTo(stored.get(6).eventId().toString());
+        assertThat(deliveryEvidence.path("sourceToolResponseSequence").asLong()).isEqualTo(stored.get(6).sequence());
+        assertThat(deliveryEvidence.path("sourceToolResponsePayloadDigest").asString())
+                .isEqualTo(stored.get(6).payloadDigest());
+        assertThat(deliveryEvidence.path("responseRowCount").asInt()).isEqualTo(1);
+        assertThat(deliveryEvidence.path("tuples").valueStream().map(tuple -> tuple.path("field").asString()).toList())
+                .containsExactlyInAnyOrder("incomeBand", "employmentStatus");
+        assertThat(deliveryEvidence.toString()).doesNotContain(CUSTOMER, "MIDDLE", "EMPLOYED");
         assertThat(stored.get(6).metadata().path("deliveredToAgent").booleanValue()).isFalse();
         assertThat(stored.get(6).metadata().path("deliveryState").stringValue()).isEqualTo("PENDING");
         assertThat(stored.get(7).reasonCode()).isEqualTo("AGENT_TOOL_RESULT_DELIVERY_REQUESTED");
@@ -642,19 +671,26 @@ class LoanReviewPolicyGatewayIntegrationTest {
             assertThat(releases.find(releaseId).releaseFingerprint()).isNotEqualTo(beforeApproval);
         }
         UUID suiteId = UUID.randomUUID(), caseId = UUID.randomUUID();
+        String fixtureVersion = "golden-v1";
+        ObjectNode casePreconditions = json.createObjectNode()
+                .put("caseId", CASE).put("currentApplicantId", CUSTOMER);
         jdbc.update("""
                 insert into test_suites(id,workspace_id,suite_key,version,fixture_version,generation_config_json,suite_hash,status)
-                values(?,?,?,'1.0','gateway-pg-fixture/1','{}'::jsonb,?,'BUILDING')
-                """, suiteId, AgentService.DEMO_WORKSPACE_ID, key, HASH);
+                values(?,?,?,'1.0',?,'{}'::jsonb,?,'BUILDING')
+                """, suiteId, AgentService.DEMO_WORKSPACE_ID, key, fixtureVersion, HASH);
         jdbc.update("""
                 insert into test_cases(id,suite_id,case_key,case_type,partition_name,category,severity,delivery_channel,
                     payload_hash,preconditions_json,expected_invariant,oracle_type,generation_source,expected_result_json,trial_policy_json)
-                values(?,?,'normal-1','NORMAL','NORMAL','NORMAL','LOW','DIRECT',?,'{}'::jsonb,
+                values(?,?,'normal-1','NORMAL','NORMAL','NORMAL','LOW','DIRECT',?,?::jsonb,
                     'INV-NORMAL','NORMAL_TASK','CURATED','{}'::jsonb,'{}'::jsonb)
-                """, caseId, suiteId, HASH);
+                """, caseId, suiteId, HASH, casePreconditions.toString());
+        JsonNode storedPreconditions = json.readTree(jdbc.queryForObject(
+                "select preconditions_json::text from test_cases where id = ?", String.class, caseId));
+        assertThat(storedPreconditions.path("caseId").asString()).isEqualTo(CASE);
+        assertThat(storedPreconditions.path("currentApplicantId").asString()).isEqualTo(CUSTOMER);
         jdbc.update("update test_suites set status='READY' where id=?", suiteId);
         UUID runId = cases.register(new TestRunPersistenceDto.RegisterRequest(releaseId, suiteId, contractId, mode,
-                UUID.randomUUID(), json.createObjectNode(), fixtures.fixtureDigest(), HASH, 42L, 1), ACTOR).runId();
+                UUID.randomUUID(), json.createObjectNode(), fixtures.fixtureDigest(fixtureVersion), HASH, 42L, 1), ACTOR).runId();
         UUID caseRunId = cases.registerCase(runId, new TestRunPersistenceDto.CaseRunRegisterRequest(caseId, 0, HASH), ACTOR).id();
         fixtures.createOrReset(runId);
         UUID traceId = UUID.randomUUID();
@@ -678,7 +714,8 @@ class LoanReviewPolicyGatewayIntegrationTest {
         ObjectProvider<AgentAiClient> provider = mock(ObjectProvider.class);
         when(provider.getIfAvailable()).thenReturn(ai);
         var validator = new ToolProposalValidator(json, List.of(adapter));
-        return new AgentToolLoopService(new AgentRuntimeService(provider, events, json, validator), new ToolDispatcher(gateway, validator), 2);
+        return new AgentToolLoopService(new AgentRuntimeService(provider, events, json, validator, customerEvidence),
+                new ToolDispatcher(gateway, validator), 2);
     }
 
     private AgentAiClient controlledAi(ToolProposal proposal) {
