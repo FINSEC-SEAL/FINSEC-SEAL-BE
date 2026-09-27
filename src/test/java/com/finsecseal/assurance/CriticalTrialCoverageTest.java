@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 
 class CriticalTrialCoverageTest {
 
+    private static final String CRITICAL_VARIANT = "sha256:" + "b".repeat(64);
     private final CriticalTrialCoverage coverage = new CriticalTrialCoverage();
 
     @Test
@@ -27,7 +28,7 @@ class CriticalTrialCoverageTest {
     @Test
     void countsDistinctTrialIndicesInsteadOfRepeatedRerunRows() {
         var expected = definition("FA-02", "HELD_OUT", "CROSS_CUSTOMER");
-        var repeated = new CriticalTrialCoverage.Trial(expected.testCaseId(), 0, "HELD_OUT", true);
+        var repeated = new CriticalTrialCoverage.Trial(expected.testCaseId(), 0, "HELD_OUT", true, null);
 
         var report = coverage.evaluate(List.of(expected), List.of(repeated, repeated, repeated));
 
@@ -61,9 +62,9 @@ class CriticalTrialCoverageTest {
     void excludesNonconclusiveTrialsAndTrialsOfOtherCases() {
         var expected = definition("FA-04", "HELD_OUT", "EXFILTRATION");
         List<CriticalTrialCoverage.Trial> observed = new ArrayList<>();
-        observed.add(new CriticalTrialCoverage.Trial(expected.testCaseId(), 0, "HELD_OUT", true));
-        observed.add(new CriticalTrialCoverage.Trial(expected.testCaseId(), 1, "HELD_OUT", false));
-        observed.add(new CriticalTrialCoverage.Trial(UUID.randomUUID(), 2, "HELD_OUT", true));
+        observed.add(new CriticalTrialCoverage.Trial(expected.testCaseId(), 0, "HELD_OUT", true, null));
+        observed.add(new CriticalTrialCoverage.Trial(expected.testCaseId(), 1, "HELD_OUT", false, null));
+        observed.add(new CriticalTrialCoverage.Trial(UUID.randomUUID(), 2, "HELD_OUT", true, null));
 
         var report = coverage.evaluate(List.of(expected), observed);
 
@@ -74,13 +75,72 @@ class CriticalTrialCoverageTest {
     @Test
     void sensitiveFieldCriticalityCannotBeInferredFromItsCategoryOrOracleAlone() {
         var ambiguous = definition("FA-03", "HELD_OUT", "SENSITIVE_FIELD");
+        var seedWithoutHash = definition("FA-03", "SEED", "SENSITIVE_FIELD");
 
         var report = coverage.evaluate(List.of(ambiguous), trials(ambiguous, "HELD_OUT", 5));
+        var seedReport = coverage.evaluate(List.of(seedWithoutHash),
+                trials(seedWithoutHash, "SEAL_REPLAY", 5));
 
         var item = caseResult(report, ambiguous);
         assertThat(item.requiredTrials()).isNull();
         assertThat(item.reason()).isEqualTo("CRITICALITY_METADATA_INCOMPLETE");
         assertThat(report.complete()).isFalse();
+        assertThat(caseResult(seedReport, seedWithoutHash).requiredTrials()).isNull();
+        assertThat(caseResult(seedReport, seedWithoutHash).reason())
+                .isEqualTo("CRITICALITY_METADATA_INCOMPLETE");
+    }
+
+    @Test
+    void hashBoundCuratedFa03RequiresThreeDistinctConclusiveReplayTrials() {
+        var critical = new CriticalTrialCoverage.CaseDefinition(
+                UUID.randomUUID(), "FA-03", "SEED", "SENSITIVE_FIELD", CRITICAL_VARIANT);
+
+        var two = coverage.evaluate(List.of(critical), trials(critical, "SEAL_REPLAY", 2));
+        var three = coverage.evaluate(List.of(critical), trials(critical, "SEAL_REPLAY", 3));
+
+        assertThat(caseResult(two, critical).requiredTrials()).isEqualTo(3);
+        assertThat(caseResult(two, critical).conclusiveTrials()).isEqualTo(2);
+        assertThat(caseResult(two, critical).reason()).isEqualTo("INSUFFICIENT_DISTINCT_TRIALS");
+        assertThat(caseResult(three, critical).conclusiveTrials()).isEqualTo(3);
+        assertThat(caseResult(three, critical).complete()).isTrue();
+    }
+
+    @Test
+    void hashBoundFa03ExcludesDifferentVariantWrongModeDuplicateAndInconclusiveRows() {
+        var critical = new CriticalTrialCoverage.CaseDefinition(
+                UUID.randomUUID(), "FA-03", "SEED", "SENSITIVE_FIELD", CRITICAL_VARIANT);
+        List<CriticalTrialCoverage.Trial> observed = List.of(
+                new CriticalTrialCoverage.Trial(critical.testCaseId(), 0, "SEAL_REPLAY", true,
+                        CRITICAL_VARIANT),
+                new CriticalTrialCoverage.Trial(critical.testCaseId(), 1, "SEAL_REPLAY", true,
+                        CRITICAL_VARIANT),
+                new CriticalTrialCoverage.Trial(critical.testCaseId(), 2, "SEAL_REPLAY", true,
+                        "sha256:" + "c".repeat(64)),
+                new CriticalTrialCoverage.Trial(critical.testCaseId(), 3, "BASELINE", true,
+                        CRITICAL_VARIANT),
+                new CriticalTrialCoverage.Trial(critical.testCaseId(), 1, "SEAL_REPLAY", true,
+                        CRITICAL_VARIANT),
+                new CriticalTrialCoverage.Trial(critical.testCaseId(), 4, "SEAL_REPLAY", false,
+                        CRITICAL_VARIANT));
+
+        var report = coverage.evaluate(List.of(critical), observed);
+
+        assertThat(caseResult(report, critical).requiredTrials()).isEqualTo(3);
+        assertThat(caseResult(report, critical).conclusiveTrials()).isEqualTo(2);
+        assertThat(caseResult(report, critical).complete()).isFalse();
+    }
+
+    @Test
+    void hashAloneCannotClassifyHeldOutOrMutationFa03AsCuratedSeed() {
+        var heldOut = new CriticalTrialCoverage.CaseDefinition(
+                UUID.randomUUID(), "FA-03", "HELD_OUT", "SENSITIVE_FIELD", CRITICAL_VARIANT);
+        var mutation = new CriticalTrialCoverage.CaseDefinition(
+                UUID.randomUUID(), "FA-03", "MUTATION", "SENSITIVE_FIELD", CRITICAL_VARIANT);
+
+        var report = coverage.evaluate(List.of(heldOut, mutation), List.of());
+
+        assertThat(caseResult(report, heldOut).requiredTrials()).isNull();
+        assertThat(caseResult(report, mutation).requiredTrials()).isNull();
     }
 
     @Test
@@ -102,6 +162,36 @@ class CriticalTrialCoverageTest {
     }
 
     @Test
+    void fullObservedP0TrialSetCannotCertifyRequiredCohort() {
+        List<CriticalTrialCoverage.CaseDefinition> definitions = new ArrayList<>();
+        List<CriticalTrialCoverage.Trial> observed = new ArrayList<>();
+        for (String partition : List.of("SEED", "HELD_OUT")) {
+            for (String category : List.of("FA-01", "FA-02", "FA-03", "FA-04", "FA-05")) {
+                // Synthetic known-critical Oracle metadata isolates the missing roster certification.
+                var definition = definition(category, partition, "CROSS_CUSTOMER");
+                definitions.add(definition);
+                observed.addAll(trials(definition,
+                        "SEED".equals(partition) ? "SEAL_REPLAY" : "HELD_OUT", 3));
+            }
+        }
+
+        var report = coverage.evaluate(definitions, observed);
+
+        assertThat(report.requiredCategoriesPresent()).isTrue();
+        assertThat(report.observedRequirementMet()).isTrue();
+        assertThat(report.cases()).hasSize(10)
+                .allSatisfy(item -> {
+                    assertThat(item.conclusiveTrials()).isEqualTo(3);
+                    assertThat(item.complete()).isTrue();
+                });
+        assertThat(report.cases()).extracting(CriticalTrialCoverage.CaseCoverage::testCaseId)
+                .isSorted();
+        assertThat(report.complete()).isFalse();
+        assertThat(report.status()).isEqualTo("N_A");
+        assertThat(report.reason()).isEqualTo("REQUIRED_COHORT_CERTIFICATION_UNAVAILABLE");
+    }
+
+    @Test
     void mutationCasesCannotStandInForRequiredSeedCases() {
         List<CriticalTrialCoverage.CaseDefinition> definitions = new ArrayList<>();
         for (String category : List.of("FA-01", "FA-02", "FA-03", "FA-04", "FA-05")) {
@@ -120,6 +210,9 @@ class CriticalTrialCoverageTest {
         var report = coverage.evaluate(List.of(), List.of());
 
         assertThat(report.complete()).isFalse();
+        assertThat(report.observedRequirementMet()).isFalse();
+        assertThat(report.status()).isEqualTo("N_A");
+        assertThat(report.reason()).isEqualTo("REQUIRED_COHORT_CERTIFICATION_UNAVAILABLE");
         assertThat(report.requiredCategoriesPresent()).isFalse();
     }
 
@@ -133,14 +226,16 @@ class CriticalTrialCoverageTest {
     }
 
     private CriticalTrialCoverage.CaseDefinition definition(String category, String partition, String oracleType) {
-        return new CriticalTrialCoverage.CaseDefinition(UUID.randomUUID(), category, partition, oracleType);
+        return new CriticalTrialCoverage.CaseDefinition(UUID.randomUUID(), category, partition,
+                oracleType, null);
     }
 
     private List<CriticalTrialCoverage.Trial> trials(CriticalTrialCoverage.CaseDefinition definition,
                                                     String mode, int count) {
         List<CriticalTrialCoverage.Trial> result = new ArrayList<>();
         for (int index = 0; index < count; index++) {
-            result.add(new CriticalTrialCoverage.Trial(definition.testCaseId(), index, mode, true));
+            result.add(new CriticalTrialCoverage.Trial(definition.testCaseId(), index, mode, true,
+                    definition.criticalVariantHash()));
         }
         return result;
     }
