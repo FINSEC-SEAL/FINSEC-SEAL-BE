@@ -76,6 +76,7 @@ class TestRunStartServiceTest {
         assertThat(registration.getValue().totalCases()).isEqualTo(2);
         assertThat(fixture.db.caseQueryCount).isEqualTo(2);
         verifyNoInteractions(fixture.executor, fixture.dispatch);
+        verifyNoInteractions(fixture.lifecycle);
 
         Runnable task = afterCommitTask(fixture.executor);
         task.run();
@@ -112,6 +113,7 @@ class TestRunStartServiceTest {
         assertInvalid(() -> fixture.service.start(
                 fixture.request(TestRunMode.HELD_OUT, List.of(one)), ACTOR));
         verifyNoInteractions(fixture.persistence, fixture.executor, fixture.dispatch);
+        verifyNoInteractions(fixture.lifecycle);
         assertThat(fixture.db.caseQueryCount).isZero();
     }
 
@@ -122,11 +124,13 @@ class TestRunStartServiceTest {
         assertInvalid(() -> hidden.service.start(
                 hidden.request(TestRunMode.BASELINE, List.of(chosen)), ACTOR));
         verifyNoInteractions(hidden.persistence, hidden.executor, hidden.dispatch);
+        verifyNoInteractions(hidden.lifecycle);
 
         Fixture foreign = new Fixture(List.of());
         assertInvalid(() -> foreign.service.start(
                 foreign.request(TestRunMode.BASELINE, List.of(chosen)), ACTOR));
         verifyNoInteractions(foreign.persistence, foreign.executor, foreign.dispatch);
+        verifyNoInteractions(foreign.lifecycle);
     }
 
     @Test
@@ -139,21 +143,44 @@ class TestRunStartServiceTest {
                 fixture.request(TestRunMode.BASELINE, List.of(chosen)), ACTOR));
         verify(fixture.persistence).register(any(), eq(ACTOR));
         verifyNoInteractions(fixture.executor, fixture.dispatch);
+        verifyNoInteractions(fixture.lifecycle);
         assertThat(TransactionSynchronizationManager.getSynchronizations()).isEmpty();
     }
 
     @Test
-    void executorRejectionAfterCommitLeavesRegistrationWithoutDispatch() {
+    void executorRejectionAfterCommitFailsExactRegisteredRunWithoutRawMessage() {
+        UUID chosen = UUID.randomUUID();
+        Fixture fixture = new Fixture(List.of(new CaseRow(chosen, "NORMAL", false)));
+        fixture.service.start(fixture.request(TestRunMode.BASELINE, List.of(chosen)), ACTOR);
+        doThrow(new RejectedExecutionException("secret-canary queue full"))
+                .when(fixture.executor).execute(any(Runnable.class));
+
+        assertThatThrownBy(() -> TransactionSynchronizationManager.getSynchronizations()
+                .forEach(TransactionSynchronization::afterCommit))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(error -> assertThat(((BusinessException) error).errorCode())
+                        .isEqualTo(ErrorCode.INTERNAL_ERROR))
+                .hasMessage("TestRun scheduling was rejected")
+                .hasMessageNotContaining("secret-canary");
+        verify(fixture.persistence).register(any(), eq(ACTOR));
+        verify(fixture.lifecycle).rejectScheduling(eq(fixture.runId), any(UUID.class), eq(ACTOR));
+        verifyNoInteractions(fixture.dispatch);
+    }
+
+    @Test
+    void schedulingFailureHandlerErrorIsNotSwallowed() {
         UUID chosen = UUID.randomUUID();
         Fixture fixture = new Fixture(List.of(new CaseRow(chosen, "NORMAL", false)));
         fixture.service.start(fixture.request(TestRunMode.BASELINE, List.of(chosen)), ACTOR);
         doThrow(new RejectedExecutionException("queue full"))
                 .when(fixture.executor).execute(any(Runnable.class));
+        IllegalStateException persistenceFailure = new IllegalStateException("write failed");
+        doThrow(persistenceFailure).when(fixture.lifecycle)
+                .rejectScheduling(eq(fixture.runId), any(UUID.class), eq(ACTOR));
 
         assertThatThrownBy(() -> TransactionSynchronizationManager.getSynchronizations()
                 .forEach(TransactionSynchronization::afterCommit))
-                .isInstanceOf(RejectedExecutionException.class);
-        verify(fixture.persistence).register(any(), eq(ACTOR));
+                .isSameAs(persistenceFailure);
         verifyNoInteractions(fixture.dispatch);
     }
 
@@ -184,6 +211,7 @@ class TestRunStartServiceTest {
         final SandboxFixtureService fixtures = mock(SandboxFixtureService.class);
         final TestRunPersistenceService persistence = mock(TestRunPersistenceService.class);
         final ExecutionDispatchService dispatch = mock(ExecutionDispatchService.class);
+        final RunExecutionLifecycleService lifecycle = mock(RunExecutionLifecycleService.class);
         final Executor executor = mock(Executor.class);
         final FakeJdbcTemplate db;
         final TestRunStartService service;
@@ -200,7 +228,7 @@ class TestRunStartServiceTest {
                             "/api/v1/test-runs/" + runId,
                             "/api/v1/test-runs/" + runId + "/events"));
             service = new TestRunStartService(releases, fingerprints, fixtures,
-                    persistence, dispatch, db, executor);
+                    persistence, dispatch, lifecycle, db, executor);
         }
 
         TestRunStartService.Request request(TestRunMode mode, List<UUID> ids) {

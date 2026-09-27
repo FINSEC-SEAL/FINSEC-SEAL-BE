@@ -2,6 +2,7 @@ package com.finsecseal.execution;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
@@ -14,6 +15,7 @@ import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.evidence.TestRunPersistenceDto;
+import com.finsecseal.evidence.TestRunPersistenceService;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -23,7 +25,6 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Executor;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.BeforeEach;
@@ -32,8 +33,10 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.core.task.TaskRejectedException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -52,6 +55,10 @@ class TestRunStartScopeIntegrationTest {
 
     @Autowired JdbcTemplate db;
     @Autowired TestRunStartService startService;
+    @Autowired RunExecutionLifecycleService lifecycleService;
+
+    @MockitoSpyBean
+    TestRunPersistenceService runPersistence;
 
     @MockitoBean(name = "testRunExecutor")
     Executor executor;
@@ -61,7 +68,7 @@ class TestRunStartScopeIntegrationTest {
 
     @BeforeEach
     void clearExecutionMocks() {
-        reset(executor, dispatch);
+        reset(executor, dispatch, runPersistence);
     }
 
     @Test
@@ -170,20 +177,104 @@ class TestRunStartScopeIntegrationTest {
     }
 
     @Test
-    void executorRejectionAfterCommitLeavesQueuedRunForSeparateRecovery() {
+    void executorRejectionAfterCommitPersistsFailureAndReleasesActiveSlot() {
         Seed seed = seed();
         addCase(seed.suiteId(), "NORMAL", false, "normal");
         ready(seed.suiteId());
-        doThrow(new RejectedExecutionException("queue full"))
+        String canary = "secret-executor-canary";
+        doThrow(new TaskRejectedException(canary + " queue full"))
                 .when(executor).execute(any(Runnable.class));
 
         assertThatThrownBy(() -> startService.start(
                 request(seed, TestRunMode.BASELINE, null, List.of()), ACTOR))
-                .isInstanceOf(RuntimeException.class);
+                .isInstanceOf(BusinessException.class)
+                .satisfies(error -> assertThat(((BusinessException) error).errorCode())
+                        .isEqualTo(ErrorCode.INTERNAL_ERROR))
+                .hasMessage("TestRun scheduling was rejected");
         assertThat(runCount(seed.releaseId())).isEqualTo(1);
         assertThat(auditCount(seed.workspaceId())).isEqualTo(1);
-        assertThat(db.queryForObject("select status from test_runs where release_id = ?",
-                String.class, seed.releaseId())).isEqualTo("QUEUED");
+        UUID failedRunId = db.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+        assertThat(db.queryForObject("select status from test_runs where id = ?",
+                String.class, failedRunId)).isEqualTo("FAILED");
+        assertThat(db.queryForObject("""
+                select completed_cases = 0 and operational_error_count = 0
+                  from test_runs where id = ?
+                """, Boolean.class, failedRunId)).isTrue();
+        assertThat(db.queryForList("""
+                select event_type from execution_events where run_id = ? order by sequence
+                """, String.class, failedRunId)).containsExactly("RUN_STARTED", "RUN_FAILED");
+        assertThat(db.queryForObject("""
+                select reason_code from execution_events
+                 where run_id = ? and event_type = 'RUN_FAILED'
+                """, String.class, failedRunId)).isEqualTo("EXECUTOR_REJECTED");
+        assertThat(db.queryForObject("""
+                select metadata_json ->> 'dispatchStatus' from execution_events
+                 where run_id = ? and event_type = 'RUN_FAILED'
+                """, String.class, failedRunId)).isEqualTo("REJECTED");
+        assertThat(db.queryForObject("""
+                select count(*) from test_case_runs where test_run_id = ?
+                """, Integer.class, failedRunId)).isZero();
+        assertThat(db.queryForObject("""
+                select count(*) from sandbox_namespaces where id = ?
+                """, Integer.class, failedRunId)).isZero();
+        assertThat(db.queryForList("""
+                select action from audit_records where workspace_id = ?
+                """, String.class, seed.workspaceId())).containsExactlyInAnyOrder(
+                        "TEST_RUN_REGISTERED", "EXECUTION_EVENT_APPENDED",
+                        "EXECUTION_EVENT_APPENDED", "TEST_RUN_STATUS_UPDATED");
+        assertThat(db.queryForObject("""
+                select summary_json::text from test_runs where id = ?
+                """, String.class, failedRunId)).doesNotContain(canary);
+        assertThat(db.queryForObject("""
+                select string_agg(metadata_json::text, ' ') from execution_events where run_id = ?
+                """, String.class, failedRunId)).doesNotContain(canary);
+        assertThat(db.queryForObject("""
+                select string_agg(metadata_json::text, ' ') from audit_records where workspace_id = ?
+                """, String.class, seed.workspaceId())).doesNotContain(canary);
+
+        int previousAuditCount = db.queryForObject("""
+                select count(*) from audit_records where workspace_id = ?
+                """, Integer.class, seed.workspaceId());
+        lifecycleService.rejectScheduling(failedRunId, UUID.randomUUID(), ACTOR);
+        assertThat(db.queryForObject("""
+                select count(*) from execution_events where run_id = ?
+                """, Integer.class, failedRunId)).isEqualTo(2);
+        assertThat(db.queryForObject("""
+                select count(*) from audit_records where workspace_id = ?
+                """, Integer.class, seed.workspaceId())).isEqualTo(previousAuditCount);
+
+        reset(executor);
+        TestRunPersistenceDto.Registered retry = startService.start(
+                request(seed, TestRunMode.BASELINE, null, List.of()), ACTOR);
+        assertThat(retry.runId()).isNotEqualTo(failedRunId);
+        assertThat(runCount(seed.releaseId())).isEqualTo(2);
+        verifyNoInteractions(dispatch);
+    }
+
+    @Test
+    void schedulingFailureTransactionRollsBackEventsAndAuditWhenStatusWriteFails() {
+        Seed seed = seed();
+        addCase(seed.suiteId(), "NORMAL", false, "normal");
+        ready(seed.suiteId());
+        TestRunPersistenceDto.Registered registered = startService.start(
+                request(seed, TestRunMode.BASELINE, null, List.of()), ACTOR);
+        doThrow(new IllegalStateException("status write failed"))
+                .when(runPersistence).updateStatus(eq(registered.runId()),
+                        any(TestRunPersistenceDto.StatusRequest.class), eq(ACTOR));
+
+        assertThatThrownBy(() -> lifecycleService.rejectScheduling(
+                registered.runId(), UUID.randomUUID(), ACTOR))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("status write failed");
+        assertThat(db.queryForObject("select status from test_runs where id = ?",
+                String.class, registered.runId())).isEqualTo("QUEUED");
+        assertThat(db.queryForObject("""
+                select count(*) from execution_events where run_id = ?
+                """, Integer.class, registered.runId())).isZero();
+        assertThat(db.queryForObject("""
+                select count(*) from audit_records where workspace_id = ?
+                """, Integer.class, seed.workspaceId())).isEqualTo(1);
         verifyNoInteractions(dispatch);
     }
 

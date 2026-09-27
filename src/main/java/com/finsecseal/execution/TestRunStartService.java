@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -44,6 +45,7 @@ public class TestRunStartService {
     private final SandboxFixtureService fixtureService;
     private final TestRunPersistenceService persistenceService;
     private final ExecutionDispatchService dispatchService;
+    private final RunExecutionLifecycleService lifecycleService;
     private final JdbcTemplate jdbcTemplate;
     private final Executor executor;
 
@@ -53,6 +55,7 @@ public class TestRunStartService {
             SandboxFixtureService fixtureService,
             TestRunPersistenceService persistenceService,
             ExecutionDispatchService dispatchService,
+            RunExecutionLifecycleService lifecycleService,
             JdbcTemplate jdbcTemplate,
             @Qualifier("testRunExecutor") Executor executor
     ) {
@@ -61,6 +64,7 @@ public class TestRunStartService {
         this.fixtureService = fixtureService;
         this.persistenceService = persistenceService;
         this.dispatchService = dispatchService;
+        this.lifecycleService = lifecycleService;
         this.jdbcTemplate = jdbcTemplate;
         this.executor = executor;
     }
@@ -122,11 +126,17 @@ public class TestRunStartService {
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                executor.execute(() -> {
-                    for (UUID caseId : executionCaseIds) {
-                        dispatchService.execute(registered.runId(), caseId, actorId);
-                    }
-                });
+                try {
+                    executor.execute(() -> {
+                        for (UUID caseId : executionCaseIds) {
+                            dispatchService.execute(registered.runId(), caseId, actorId);
+                        }
+                    });
+                } catch (RejectedExecutionException rejected) {
+                    lifecycleService.rejectScheduling(registered.runId(), UUID.randomUUID(), actorId);
+                    throw new BusinessException(ErrorCode.INTERNAL_ERROR,
+                            "TestRun scheduling was rejected");
+                }
             }
         });
 
