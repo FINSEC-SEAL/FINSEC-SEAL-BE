@@ -58,6 +58,7 @@ public class ReleaseAssuranceService {
     private final RedactionService redactionService;
     private final SensitiveFieldExposureCounter sensitiveFieldExposureCounter;
     private final ReleaseMetricsCalculator metricsCalculator = new ReleaseMetricsCalculator();
+    private final PolicyLatencyCalculator policyLatencyCalculator = new PolicyLatencyCalculator();
     private final ReleaseGate releaseGate = new ReleaseGate();
 
     public ReleaseAssuranceService(
@@ -90,7 +91,8 @@ public class ReleaseAssuranceService {
                 releaseId,
                 metricsCalculator.calculate(comparableTrials(trials, replay), actualEffectCounts(trials),
                         replay.comparableCaseRunIds()),
-                replay.summary()
+                replay.summary(),
+                policyLatency(releaseId, terminalRunIds(releaseId))
         );
     }
 
@@ -299,6 +301,7 @@ public class ReleaseAssuranceService {
         snapshot.set("criticalTrialCoverage", objectMapper.valueToTree(coverage));
         snapshot.set("criticalSuccessEvidence", objectMapper.valueToTree(criticalSuccessEvidence));
         snapshot.set("metrics", metricArray(metrics));
+        snapshot.set("policyLatency", objectMapper.valueToTree(policyLatency(release.id(), evidence.runIds())));
         snapshot.set("observedEffectCounts", observedEffectCounts(metrics, loadedTrials));
         snapshot.set("remainingFindings", remainingFindings(release.id()));
         snapshot.set("approvedPatch", approvedPatch(release.id()));
@@ -363,6 +366,32 @@ public class ReleaseAssuranceService {
             return null;
         }, releaseId);
         return trials.values().stream().map(MutableTrial::immutable).toList();
+    }
+
+    private List<UUID> terminalRunIds(UUID releaseId) {
+        return jdbcTemplate.queryForList("""
+                select id from test_runs
+                 where release_id = ? and status in ('COMPLETED', 'FAILED')
+                 order by id
+                """, UUID.class, releaseId);
+    }
+
+    private PolicyLatencyCalculator.PolicyLatency policyLatency(UUID releaseId, List<UUID> runIds) {
+        if (runIds.isEmpty()) return policyLatencyCalculator.calculate(List.of());
+        List<PolicyLatencyCalculator.EventSample> events = jdbcTemplate.query("""
+                select event.id, event.run_id, event.policy_decision_json::text
+                  from execution_events event
+                  join test_runs run on run.id = event.run_id
+                 where run.release_id = ? and run.status in ('COMPLETED', 'FAILED')
+                   and run.id = any(?::uuid[]) and event.event_type = 'POLICY_EVALUATED'
+                 order by event.run_id, event.sequence, event.id
+                """, (rs, row) -> {
+            String decisionJson = rs.getString("policy_decision_json");
+            return new PolicyLatencyCalculator.EventSample(
+                    rs.getObject("id", UUID.class), rs.getObject("run_id", UUID.class),
+                    decisionJson == null ? null : parseJson(decisionJson));
+        }, releaseId, (Object) runIds.toArray(UUID[]::new));
+        return policyLatencyCalculator.calculate(events);
     }
 
     private List<TrialEvaluation> comparableTrials(List<TrialEvaluation> trials, ReplayAssessment replay) {

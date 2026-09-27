@@ -107,6 +107,104 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     @Test
+    void policyLatencyUsesAllTerminalEventsAndSerializesApiAndDecisionEvidence() throws Exception {
+        Seed seed = seedCriticalReleaseWithPolicy(
+                policyDuration(0), policyDuration(1.5), policyDuration(2), policyDuration(10));
+        UUID runId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+        List<UUID> eventIds = jdbcTemplate.queryForList("""
+                select id from execution_events
+                 where run_id = ? and event_type = 'POLICY_EVALUATED' order by id
+                """, UUID.class, runId);
+        seedCriticalReleaseWithPolicy(policyDuration(100)); // another Release must not enter this aggregate
+
+        var api = assuranceService.metrics(seed.releaseId());
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var latency = api.policyLatency();
+        var serializedApi = objectMapper.readTree(objectMapper.writeValueAsString(api));
+        var snapshot = proposal.inputSnapshot().path("policyLatency");
+
+        assertThat(latency.status()).isEqualTo(PolicyLatencyCalculator.Status.AVAILABLE);
+        assertThat(latency.observedEventCount()).isEqualTo(4);
+        assertThat(latency.invalidEventCount()).isZero();
+        assertThat(latency.averageMs()).isEqualByComparingTo("3.375");
+        assertThat(latency.p50Ms()).isEqualByComparingTo("1.5");
+        assertThat(latency.p95Ms()).isEqualByComparingTo("10");
+        assertThat(latency.p99Ms()).isEqualByComparingTo("10");
+        assertThat(latency.sourceRunIds()).containsExactly(runId);
+        assertThat(latency.sourceEventIds()).containsExactlyElementsOf(eventIds);
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from execution_events
+                 where run_id = ? and event_type = 'POLICY_EVALUATED' and test_case_run_id is null
+                """, Long.class, runId)).isEqualTo(4L);
+        assertThat(serializedApi.at("/policyLatency/averageMs").decimalValue())
+                .isEqualByComparingTo("3.375");
+        assertThat(snapshot.at("/averageMs").decimalValue()).isEqualByComparingTo("3.375");
+        assertThat(snapshot.at("/observedEventCount").asLong()).isEqualTo(4);
+        assertThat(snapshot.at("/sourceEventIds").valueStream().map(value -> value.asString()).toList())
+                .containsExactlyElementsOf(eventIds.stream().map(UUID::toString).toList());
+    }
+
+    @Test
+    void policyLatencyExcludesActiveRunAndDecisionUsesOnlySelectedSuite() throws Exception {
+        Seed seed = seedCriticalReleaseWithPolicy(policyDuration(1));
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+        SensitiveRun later = seedSensitiveRun(seed.releaseId());
+        appendPolicyEvent(later, policyDuration(9));
+
+        assertThat(assuranceService.metrics(seed.releaseId()).policyLatency().sourceRunIds())
+                .containsExactly(baselineRunId);
+        finishSensitiveRun(later, false);
+
+        var api = assuranceService.metrics(seed.releaseId()).policyLatency();
+        var snapshot = assuranceService.evaluate(seed.releaseId(), "role-d")
+                .inputSnapshot().path("policyLatency");
+        assertThat(api.averageMs()).isEqualByComparingTo("5");
+        assertThat(api.sourceRunIds()).containsExactlyInAnyOrder(baselineRunId, later.runId());
+        assertThat(snapshot.at("/averageMs").decimalValue()).isEqualByComparingTo("9");
+        assertThat(snapshot.at("/observedEventCount").asLong()).isEqualTo(1);
+        assertThat(snapshot.at("/sourceRunIds").valueStream().map(value -> value.asString()).toList())
+                .containsExactly(later.runId().toString());
+    }
+
+    @Test
+    void policyLatencyMissingDurationIsUnavailableInSerializedApiAndDecision() throws Exception {
+        Seed seed = seedCriticalReleaseWithPolicy(policyDuration(4), objectMapper.createObjectNode());
+
+        var api = assuranceService.metrics(seed.releaseId());
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var serializedApi = objectMapper.readTree(objectMapper.writeValueAsString(api));
+        var snapshot = proposal.inputSnapshot().path("policyLatency");
+
+        assertThat(api.policyLatency().status()).isEqualTo(PolicyLatencyCalculator.Status.N_A);
+        assertThat(api.policyLatency().reason()).isEqualTo("MISSING_OR_INVALID_DURATION");
+        assertThat(api.policyLatency().observedEventCount()).isEqualTo(2);
+        assertThat(api.policyLatency().invalidEventCount()).isEqualTo(1);
+        assertThat(api.policyLatency().averageMs()).isNull();
+        assertThat(serializedApi.at("/policyLatency/status").asString()).isEqualTo("N_A");
+        assertThat(serializedApi.at("/policyLatency/averageMs").isNull()).isTrue();
+        assertThat(snapshot.at("/status").asString()).isEqualTo("N_A");
+        assertThat(snapshot.at("/reason").asString()).isEqualTo("MISSING_OR_INVALID_DURATION");
+        assertThat(snapshot.at("/averageMs").isNull()).isTrue();
+    }
+
+    @Test
+    void policyLatencyWithoutPolicyEventsIsUnavailableInApiAndDecision() throws Exception {
+        Seed seed = seedCriticalRelease();
+
+        var api = assuranceService.metrics(seed.releaseId()).policyLatency();
+        var snapshot = assuranceService.evaluate(seed.releaseId(), "role-d")
+                .inputSnapshot().path("policyLatency");
+
+        assertThat(api.status()).isEqualTo(PolicyLatencyCalculator.Status.N_A);
+        assertThat(api.reason()).isEqualTo("NO_POLICY_EVALUATIONS");
+        assertThat(api.observedEventCount()).isZero();
+        assertThat(snapshot.at("/status").asString()).isEqualTo("N_A");
+        assertThat(snapshot.at("/reason").asString()).isEqualTo("NO_POLICY_EVALUATIONS");
+    }
+
+    @Test
     void rejectsStaleProposalDigestAndUpwardOverride() throws Exception {
         Seed seed = seedCriticalRelease();
         var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
@@ -817,6 +915,22 @@ class ReleaseAssuranceIntegrationTest {
     private Seed seedCriticalRelease(String mode, boolean splitOracleOutcomes,
                                      String effectOracleType, String effectReason, String effectEvidence,
                                      boolean secondaryInconclusive) throws Exception {
+        return seedCriticalRelease(mode, splitOracleOutcomes, effectOracleType, effectReason,
+                effectEvidence, secondaryInconclusive, List.of());
+    }
+
+    private Seed seedCriticalReleaseWithPolicy(ObjectNode... policyDecisions) throws Exception {
+        return seedCriticalRelease("BASELINE", false, null, null, "{}", false,
+                List.of(policyDecisions));
+    }
+
+    private ObjectNode policyDuration(double durationMs) {
+        return objectMapper.createObjectNode().put("durationMs", durationMs);
+    }
+
+    private Seed seedCriticalRelease(String mode, boolean splitOracleOutcomes,
+                                     String effectOracleType, String effectReason, String effectEvidence,
+                                     boolean secondaryInconclusive, List<ObjectNode> policyDecisions) throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         AgentDto.Response agent = agentService.create(new AgentDto.CreateRequest(
                 "assurance-" + suffix, "Assurance Agent", "Release assurance integration test"
@@ -936,6 +1050,13 @@ class ReleaseAssuranceIntegrationTest {
                 null, traceId, ExecutionEventType.RUN_STARTED,
                 null, null, null, null, "RUN_STARTED", objectMapper.createObjectNode()
         ), "test");
+        for (ObjectNode policyDecision : policyDecisions) {
+            eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                    null, traceId, ExecutionEventType.POLICY_EVALUATED,
+                    "CUSTOMER_DATA_READ", null, null, policyDecision, "POLICY_ALLOWED",
+                    objectMapper.createObjectNode()
+            ), "test");
+        }
         eventService.append(runId, new ExecutionEventDto.AppendRequest(
                 null, traceId, ExecutionEventType.RUN_COMPLETED,
                 null, null, null, null, "RUN_COMPLETED", objectMapper.createObjectNode()
@@ -1144,6 +1265,14 @@ class ReleaseAssuranceIntegrationTest {
         jdbcTemplate.update("update test_runs set status = 'RUNNING', started_at = ?, updated_at = ? where id = ?",
                 Timestamp.from(now), Timestamp.from(now), runId);
         return new SensitiveRun(runId, caseRunId, traceId);
+    }
+
+    private ExecutionEventDto.Event appendPolicyEvent(SensitiveRun run, ObjectNode decision) {
+        return eventService.append(run.runId(), new ExecutionEventDto.AppendRequest(
+                null, run.traceId(), ExecutionEventType.POLICY_EVALUATED,
+                "CUSTOMER_DATA_READ", null, null, decision, "POLICY_ALLOWED",
+                objectMapper.createObjectNode()
+        ), "test");
     }
 
     private ObjectNode customerOutput(String... customerIds) {
