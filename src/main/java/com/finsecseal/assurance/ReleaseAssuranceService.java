@@ -88,7 +88,8 @@ public class ReleaseAssuranceService {
         ReplayAssessment replay = assessReplay(releaseId, null);
         return new ReleaseAssuranceDto.MetricsView(
                 releaseId,
-                metricsCalculator.calculate(comparableTrials(trials, replay), actualEffectCounts(trials)),
+                metricsCalculator.calculate(comparableTrials(trials, replay), actualEffectCounts(trials),
+                        replay.comparableCaseRunIds()),
                 replay.summary()
         );
     }
@@ -254,7 +255,8 @@ public class ReleaseAssuranceService {
                 .toList();
         ReplayAssessment replay = assessReplay(release.id(), Set.copyOf(evidence.runIds()));
         List<TrialEvaluation> trials = comparableTrials(loadedTrials, replay);
-        ReleaseMetrics metrics = metricsCalculator.calculate(trials, actualEffectCounts(loadedTrials));
+        ReleaseMetrics metrics = metricsCalculator.calculate(trials, actualEffectCounts(loadedTrials),
+                replay.comparableCaseRunIds());
         // Comparability controls rate eligibility; it must not erase an observed ENFORCE effect.
         List<Map<String, Object>> criticalSuccessEvidence = criticalSuccessEvidence(loadedTrials);
         boolean criticalSuccess = !criticalSuccessEvidence.isEmpty();
@@ -292,7 +294,7 @@ public class ReleaseAssuranceService {
                 .put("hash", evidence.suiteHash()));
         snapshot.set("sandbox", objectMapper.createObjectNode()
                 .put("fixtureVersion", evidence.fixtureVersion()).put("fixtureDigest", evidence.fixtureDigest()));
-        snapshot.set("results", resultSummary(metrics, trials));
+        snapshot.set("results", resultSummary(trials, replay.comparableCaseRunIds()));
         snapshot.set("replayComparability", objectMapper.valueToTree(replay.summary()));
         snapshot.set("criticalTrialCoverage", objectMapper.valueToTree(coverage));
         snapshot.set("criticalSuccessEvidence", objectMapper.valueToTree(criticalSuccessEvidence));
@@ -744,18 +746,20 @@ public class ReleaseAssuranceService {
         return values;
     }
 
-    private ObjectNode resultSummary(ReleaseMetrics metrics, List<TrialEvaluation> trials) {
+    private ObjectNode resultSummary(List<TrialEvaluation> trials, Set<UUID> comparableReplayCaseRunIds) {
         ObjectNode results = objectMapper.createObjectNode();
-        results.set("baseline", resultMetric("BASELINE", trials, false));
-        results.set("sealReplay", resultMetric("SEAL_REPLAY", trials, false));
-        results.set("heldOut", resultMetric("HELD_OUT", trials, false));
-        results.set("normalRegression", resultMetric("REGRESSION", trials, true));
+        results.set("baseline", resultMetric("BASELINE", trials, false, comparableReplayCaseRunIds));
+        results.set("sealReplay", resultMetric("SEAL_REPLAY", trials, false, comparableReplayCaseRunIds));
+        results.set("heldOut", resultMetric("HELD_OUT", trials, false, comparableReplayCaseRunIds));
+        results.set("normalRegression", resultMetric("REGRESSION", trials, true, comparableReplayCaseRunIds));
         return results;
     }
 
-    private ObjectNode resultMetric(String mode, List<TrialEvaluation> all, boolean normal) {
+    private ObjectNode resultMetric(String mode, List<TrialEvaluation> all, boolean normal,
+                                    Set<UUID> comparableReplayCaseRunIds) {
         List<TrialEvaluation> trials = all.stream().filter(t -> mode.equals(t.mode()))
-                .filter(normal ? TrialEvaluation::normalConclusive : TrialEvaluation::attackConclusive).toList();
+                .filter(trial -> normal ? trial.normalConclusive()
+                        : ReleaseMetricsCalculator.attackRateEligible(trial, comparableReplayCaseRunIds)).toList();
         long numerator = trials.stream().filter(normal ? TrialEvaluation::normalSuccess : TrialEvaluation::attackSuccess)
                 .count();
         List<UUID> runIds = trials.stream().map(TrialEvaluation::runId).distinct().sorted().toList();

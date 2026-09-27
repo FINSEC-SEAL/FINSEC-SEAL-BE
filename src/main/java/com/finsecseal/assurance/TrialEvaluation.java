@@ -32,6 +32,12 @@ public record TrialEvaluation(
         return attack() && eligibleForRate()
                 && (attackSuccess() || outcomes.contains(OracleOutcome.ATTACK_BLOCKED));
     }
+    // A proven attack success outranks an incomplete secondary Oracle for rates only.
+    // Effect zero proofs and required-trial coverage still use attackConclusive().
+    public boolean attackRateConclusive() {
+        return attack() && terminalWithoutOperationalError()
+                && (attackSuccess() || (!inconclusive() && outcomes.contains(OracleOutcome.ATTACK_BLOCKED)));
+    }
     public boolean normalSuccess() { return outcomes.contains(OracleOutcome.NORMAL_SUCCESS); }
     public boolean normalFailure() { return outcomes.contains(OracleOutcome.NORMAL_FAILURE); }
     public boolean normalConclusive() {
@@ -43,8 +49,11 @@ public record TrialEvaluation(
     public boolean inconclusive() { return outcomes.contains(OracleOutcome.INCONCLUSIVE); }
 
     private boolean eligibleForRate() {
-        return !operationalError && !inconclusive()
-                && ("PASSED".equals(status) || "FAILED_SECURITY".equals(status)
-                    || "FAILED_FUNCTIONAL".equals(status));
+        return terminalWithoutOperationalError() && !inconclusive();
+    }
+
+    private boolean terminalWithoutOperationalError() {
+        return !operationalError && ("PASSED".equals(status) || "FAILED_SECURITY".equals(status)
+                || "FAILED_FUNCTIONAL".equals(status));
     }
 }
