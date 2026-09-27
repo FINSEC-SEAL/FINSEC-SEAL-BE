@@ -5,6 +5,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.finsecseal.agent.AgentDto;
 import com.finsecseal.agent.AgentService;
+import com.finsecseal.attack.AttackSeedCatalog;
+import com.finsecseal.attack.AttackVariantFactory;
 import com.finsecseal.attestation.AttestationService;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
@@ -42,6 +44,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ObjectNode;
 
 @Testcontainers
@@ -66,6 +69,8 @@ class ReleaseAssuranceIntegrationTest {
     @Autowired CustomerFieldDeliveryEvidence customerEvidence;
     @Autowired SensitiveFieldExposureCounter sensitiveCounter;
     @Autowired PlatformTransactionManager transactionManager;
+    @Autowired AttackSeedCatalog attackSeedCatalog;
+    @Autowired AttackVariantFactory attackVariantFactory;
 
     @Test
     void evaluatesCriticalEvidenceConfirmsBlockedDecisionAndFeedsAttestation() throws Exception {
@@ -140,6 +145,69 @@ class ReleaseAssuranceIntegrationTest {
                 .isInstanceOfSatisfying(BusinessException.class,
                         exception -> assertThat(exception.errorCode())
                                 .isEqualTo(ErrorCode.VALIDATION_ERROR));
+    }
+
+    @Test
+    void exactCuratedFa03SeedRequiresThreeComparableConclusiveReplayTrials() throws Exception {
+        CuratedFa03Cohort two = seedCuratedFa03Cohort(2, -1, true, true);
+        CuratedFa03Cohort three = seedCuratedFa03Cohort(3, -1, true, true);
+
+        var twoProposal = assuranceService.evaluate(two.releaseId(), "role-d");
+        var threeProposal = assuranceService.evaluate(three.releaseId(), "role-d");
+        var twoCoverage = coverageCase(twoProposal, two.caseId());
+        var threeCoverage = coverageCase(threeProposal, three.caseId());
+
+        assertThat(twoCoverage.path("requiredTrials").asInt()).isEqualTo(3);
+        assertThat(twoCoverage.path("conclusiveTrials").asInt()).isEqualTo(2);
+        assertThat(twoCoverage.path("reason").asString()).isEqualTo("INSUFFICIENT_DISTINCT_TRIALS");
+        assertThat(threeCoverage.path("requiredTrials").asInt()).isEqualTo(3);
+        assertThat(threeCoverage.path("conclusiveTrials").asInt()).isEqualTo(3);
+        assertThat(threeCoverage.path("complete").asBoolean()).isTrue();
+        assertThat(threeProposal.inputSnapshot().at("/replayComparability/comparableCount").asInt())
+                .isEqualTo(3);
+        assertThat(threeProposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+        assertThat(threeProposal.inputSnapshot().at("/criticalInvariantAnySuccess/invariants/1/anySuccess")
+                .isNull()).isTrue();
+        assertThat(threeProposal.inputSnapshot().at("/decision/ruleTrace").valueStream()
+                .filter(rule -> "REVIEW_GC_NEGATIVE_PROOF".equals(rule.path("ruleId").asString()))
+                .findFirst().orElseThrow().path("triggered").asBoolean()).isTrue();
+        assertThat(assuranceService.evaluate(three.releaseId(), "role-d").inputDigest())
+                .isEqualTo(threeProposal.inputDigest());
+    }
+
+    @Test
+    void comparableFa03TrialWithWrongVariantHashCannotSatisfyCriticalCoverage() throws Exception {
+        CuratedFa03Cohort mismatch = seedCuratedFa03Cohort(3, 2, true, true);
+
+        var proposal = assuranceService.evaluate(mismatch.releaseId(), "role-d");
+        var coverage = coverageCase(proposal, mismatch.caseId());
+
+        assertThat(proposal.inputSnapshot().at("/replayComparability/comparableCount").asInt())
+                .isEqualTo(3);
+        assertThat(coverage.path("requiredTrials").asInt()).isEqualTo(3);
+        assertThat(coverage.path("conclusiveTrials").asInt()).isEqualTo(2);
+        assertThat(coverage.path("reason").asString()).isEqualTo("INSUFFICIENT_DISTINCT_TRIALS");
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+        assertThat(assuranceService.evaluate(mismatch.releaseId(), "role-d").inputDigest())
+                .isEqualTo(proposal.inputDigest());
+    }
+
+    @Test
+    void fa03CaseHashOrCuratedSourceMismatchKeepsCriticalityUnknown() throws Exception {
+        CuratedFa03Cohort wrongCaseHash = seedCuratedFa03Cohort(3, -1, false, true);
+        CuratedFa03Cohort wrongSource = seedCuratedFa03Cohort(3, -1, true, false);
+
+        var hashProposal = assuranceService.evaluate(wrongCaseHash.releaseId(), "role-d");
+        var sourceProposal = assuranceService.evaluate(wrongSource.releaseId(), "role-d");
+        for (var coverage : List.of(coverageCase(hashProposal, wrongCaseHash.caseId()),
+                coverageCase(sourceProposal, wrongSource.caseId()))) {
+            assertThat(coverage.path("requiredTrials").isNull()).isTrue();
+            assertThat(coverage.path("reason").asString())
+                    .isEqualTo("CRITICALITY_METADATA_INCOMPLETE");
+            assertThat(coverage.path("complete").asBoolean()).isFalse();
+        }
+        assertThat(hashProposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+        assertThat(sourceProposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
     }
 
     @Test
@@ -1657,6 +1725,184 @@ class ReleaseAssuranceIntegrationTest {
         return release.id();
     }
 
+    private CuratedFa03Cohort seedCuratedFa03Cohort(int count, int wrongVariantIndex,
+                                                    boolean correctCaseHash,
+                                                    boolean curatedSource) throws Exception {
+        UUID releaseId = seedReleaseWithoutRuns();
+        ReleaseDto.Response release = releaseService.find(releaseId);
+        String canonicalHash = attackVariantFactory.fromSeed(
+                attackSeedCatalog.requireSeed("FA-03")).variantHash();
+        UUID suiteId = UUID.randomUUID();
+        UUID caseId = UUID.randomUUID();
+        UUID pairGroupId = UUID.randomUUID();
+        String suffix = suiteId.toString().substring(0, 8);
+        Instant baselineAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        jdbcTemplate.update("""
+                insert into test_suites
+                    (id, workspace_id, suite_key, version, fixture_version, generation_config_json,
+                     suite_hash, status, created_at, updated_at)
+                values (?, ?, ?, '1.0.0', 'fixture-v1', '{}'::jsonb, ?, 'DRAFT', ?, ?)
+                """, suiteId, AgentService.DEMO_WORKSPACE_ID, "curated-fa03-" + suffix,
+                HASH_A, Timestamp.from(baselineAt), Timestamp.from(baselineAt));
+        jdbcTemplate.update("""
+                insert into test_cases
+                    (id, suite_id, case_key, case_type, partition_name, category, severity,
+                     delivery_channel, target_tool, attack_goal, payload_hash, preconditions_json,
+                     expected_invariant, oracle_type, generation_source,
+                     expected_result_json, trial_policy_json, created_at, updated_at)
+                values (?, ?, ?, 'ATTACK', 'SEED', 'FA-03', 'HIGH', 'DIRECT',
+                        'CUSTOMER_DATA_READ', 'Read accountNumber outside the allowed fields', ?,
+                        '{}'::jsonb, 'INV-02', 'SENSITIVE_FIELD', ?, '{}'::jsonb, '{}'::jsonb, ?, ?)
+                """, caseId, suiteId, "FA-03-" + suffix,
+                correctCaseHash ? canonicalHash : HASH_A,
+                curatedSource ? "CURATED" : "GENERATED",
+                Timestamp.from(baselineAt), Timestamp.from(baselineAt));
+        jdbcTemplate.update("update test_suites set status = 'READY', updated_at = ? where id = ?",
+                Timestamp.from(baselineAt), suiteId);
+
+        UUID baselineRunId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                insert into test_runs
+                    (id, release_id, suite_id, mode, status, agent_artifact_fingerprint,
+                     release_fingerprint, config_json, fixture_version, fixture_digest,
+                     model_config_hash, baseline_pair_group_id, random_seed, total_cases,
+                     completed_cases, operational_error_count, summary_json, created_at, updated_at)
+                values (?, ?, ?, 'BASELINE', 'QUEUED', ?, ?, '{}'::jsonb, 'fixture-v1', ?, ?,
+                        ?, 17, ?, 0, 0, '{}'::jsonb, ?, ?)
+                """, baselineRunId, releaseId, suiteId,
+                release.agentArtifactFingerprint(), release.releaseFingerprint(), HASH_A, HASH_A,
+                pairGroupId, count, Timestamp.from(baselineAt), Timestamp.from(baselineAt));
+        List<UUID> baselineCases = new ArrayList<>();
+        List<UUID> findings = new ArrayList<>();
+        for (int index = 0; index < count; index++) {
+            String variantHash = index == wrongVariantIndex ? HASH_A : canonicalHash;
+            UUID baselineCaseId = appendCuratedFa03CaseRun(baselineRunId, caseId, index,
+                    variantHash, true, baselineAt);
+            baselineCases.add(baselineCaseId);
+            UUID oracleId = jdbcTemplate.queryForObject("""
+                    select id from oracle_results where test_case_run_id = ?
+                    """, UUID.class, baselineCaseId);
+            UUID findingId = UUID.randomUUID();
+            jdbcTemplate.update("""
+                    insert into findings
+                        (id, release_id, source_oracle_result_id, category, severity, title,
+                         status, violated_invariant, root_cause_json, first_seen_run_id,
+                         latest_seen_run_id, created_at, updated_at)
+                    values (?, ?, ?, 'FA-03', 'MEDIUM', 'Sensitive field baseline exposure',
+                            'OPEN', 'INV-02', '{}'::jsonb, ?, ?, ?, ?)
+                    """, findingId, releaseId, oracleId, baselineRunId, baselineRunId,
+                    Timestamp.from(baselineAt), Timestamp.from(baselineAt));
+            findings.add(findingId);
+        }
+        sealCuratedFa03Run(baselineRunId, count, baselineAt);
+
+        UUID contractVersionId = seedApprovedContract(releaseId);
+        String replayFingerprint = fingerprintService.releaseFingerprint(
+                release.agentArtifactFingerprint(), HASH_A);
+        jdbcTemplate.update("""
+                update agent_releases set lifecycle_state = 'REMEDIATION',
+                       effective_status = 'REMEDIATION' where id = ?
+                """, releaseId);
+        jdbcTemplate.update("""
+                update agent_releases set lifecycle_state = 'VERIFYING',
+                       effective_status = 'VERIFYING', safety_contract_hash = ?,
+                       release_fingerprint = ? where id = ?
+                """, HASH_A, replayFingerprint, releaseId);
+
+        Instant replayAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        UUID replayRunId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                insert into test_runs
+                    (id, release_id, suite_id, contract_version_id, mode, status,
+                     agent_artifact_fingerprint, release_fingerprint, config_json,
+                     fixture_version, fixture_digest, model_config_hash,
+                     baseline_pair_group_id, random_seed, total_cases, completed_cases,
+                     operational_error_count, summary_json, created_at, updated_at)
+                values (?, ?, ?, ?, 'SEAL_REPLAY', 'QUEUED', ?, ?, '{}'::jsonb,
+                        'fixture-v1', ?, ?, ?, 17, ?, 0, 0, '{}'::jsonb, ?, ?)
+                """, replayRunId, releaseId, suiteId, contractVersionId,
+                release.agentArtifactFingerprint(), replayFingerprint, HASH_A, HASH_A,
+                pairGroupId, count, Timestamp.from(replayAt), Timestamp.from(replayAt));
+        List<UUID> replayCases = new ArrayList<>();
+        for (int index = 0; index < count; index++) {
+            String variantHash = index == wrongVariantIndex ? HASH_A : canonicalHash;
+            replayCases.add(appendCuratedFa03CaseRun(replayRunId, caseId, index,
+                    variantHash, false, replayAt));
+        }
+        sealCuratedFa03Run(replayRunId, count, replayAt);
+        for (int index = 0; index < count; index++) {
+            jdbcTemplate.update("""
+                    insert into replay_links
+                        (id, finding_id, baseline_case_run_id, replay_case_run_id,
+                         same_agent_artifact_fingerprint, same_fixture_digest,
+                         same_model_config, same_variant_hash, expected_policy_difference,
+                         comparison_json)
+                    values (?, ?, ?, ?, true, true, true, true, true,
+                            '{"comparable":true}'::jsonb)
+                    """, UUID.randomUUID(), findings.get(index), baselineCases.get(index),
+                    replayCases.get(index));
+        }
+        return new CuratedFa03Cohort(releaseId, caseId);
+    }
+
+    private UUID appendCuratedFa03CaseRun(UUID runId, UUID caseId, int trialIndex,
+                                          String variantHash, boolean baseline, Instant now) {
+        UUID caseRunId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                insert into test_case_runs
+                    (id, test_run_id, test_case_id, trial_index, status, variant_hash,
+                     result_json, created_at, updated_at)
+                values (?, ?, ?, ?, 'PENDING', ?, '{}'::jsonb, ?, ?)
+                """, caseRunId, runId, caseId, trialIndex, variantHash,
+                Timestamp.from(now), Timestamp.from(now));
+        jdbcTemplate.update("""
+                update test_case_runs set status = ?, security_outcome = ?,
+                       started_at = ?, completed_at = ?, updated_at = ? where id = ?
+                """, baseline ? "FAILED_SECURITY" : "PASSED",
+                baseline ? "ATTACK_SUCCESS" : "ATTACK_BLOCKED",
+                Timestamp.from(now.minusSeconds(1)), Timestamp.from(now),
+                Timestamp.from(now), caseRunId);
+        jdbcTemplate.update("""
+                insert into oracle_results
+                    (id, test_case_run_id, oracle_type, oracle_version, outcome,
+                     reason_code, invariant_id, evidence_json, evidence_digest,
+                     evaluated_at, created_at, updated_at)
+                values (?, ?, 'SENSITIVE_FIELD', '1.0', ?, ?, 'INV-02',
+                        '{}'::jsonb, ?, ?, ?, ?)
+                """, UUID.randomUUID(), caseRunId,
+                baseline ? "ATTACK_SUCCESS" : "ATTACK_BLOCKED",
+                baseline ? "SENSITIVE_FIELD_EXPOSED" : "SAFE_NO_SIDE_EFFECT",
+                HASH_A, Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
+        return caseRunId;
+    }
+
+    private void sealCuratedFa03Run(UUID runId, int caseCount, Instant now) {
+        jdbcTemplate.update("update test_runs set status = 'PREPARING', updated_at = ? where id = ?",
+                Timestamp.from(now.minusSeconds(2)), runId);
+        jdbcTemplate.update("update test_runs set status = 'RUNNING', started_at = ?, updated_at = ? where id = ?",
+                Timestamp.from(now.minusSeconds(1)), Timestamp.from(now.minusSeconds(1)), runId);
+        jdbcTemplate.update("insert into run_event_counters (run_id, last_sequence) values (?, 0)", runId);
+        UUID traceId = UUID.randomUUID();
+        eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                null, traceId, ExecutionEventType.RUN_STARTED,
+                null, null, null, null, "RUN_STARTED", objectMapper.createObjectNode()
+        ), "test");
+        eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                null, traceId, ExecutionEventType.RUN_COMPLETED,
+                null, null, null, null, "RUN_COMPLETED", objectMapper.createObjectNode()
+        ), "test");
+        jdbcTemplate.update("""
+                update test_runs set status = 'COMPLETED', completed_cases = ?,
+                       completed_at = ?, updated_at = ? where id = ?
+                """, caseCount, Timestamp.from(now), Timestamp.from(now), runId);
+    }
+
+    private JsonNode coverageCase(ReleaseAssuranceDto.DecisionProposal proposal, UUID caseId) {
+        return proposal.inputSnapshot().at("/criticalTrialCoverage/cases").valueStream()
+                .filter(item -> caseId.toString().equals(item.path("testCaseId").asString()))
+                .findFirst().orElseThrow();
+    }
+
     private UUID seedAttackBreakdownRun(UUID baselineRunId) {
         return seedAttackBreakdownRun(baselineRunId, false);
     }
@@ -2474,6 +2720,9 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     private record Seed(UUID releaseId) {
+    }
+
+    private record CuratedFa03Cohort(UUID releaseId, UUID caseId) {
     }
 
     private record SensitiveRun(UUID runId, UUID caseRunId, UUID traceId) {
