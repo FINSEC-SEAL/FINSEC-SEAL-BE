@@ -3,6 +3,7 @@ package com.finsecseal.evidence;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.finsecseal.audit.AuditDto;
 import com.finsecseal.audit.AuditService;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
@@ -39,6 +40,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ObjectNode;
 
 @Testcontainers
@@ -467,6 +469,104 @@ class EventEvidenceIntegrationTest {
                 "update audit_records set action = 'MUTATED' where id = ?",
                 auditId
         ));
+        assertSqlState("55000", () -> jdbcTemplate.update(
+                "delete from audit_records where id = ?",
+                auditId
+        ));
+    }
+
+    @Test
+    void redactsAuditMetadataBeforeStorageAndReadback() throws Exception {
+        Seed seed = seedRun();
+        ObjectNode rawMetadata = objectMapper.createObjectNode()
+                .put("accountNumber", "SYNTH-ACCT-9911")
+                .put("email", "audit-borrower@example.test")
+                .put("customerId", "audit-customer-9911")
+                .put("purpose", "integration-check");
+
+        AuditDto.Record appended = auditService.append(
+                WORKSPACE_ID, "audit-tester", "METADATA_PRIVACY_CHECK", "TEST_RUN", seed.runId(),
+                HASH_A, HASH_B, rawMetadata
+        );
+        assertThat(appended.afterDigest()).isEqualTo(HASH_B);
+        assertThat(appended.actorId()).isEqualTo("audit-tester");
+        assertThat(appended.metadata().path("accountNumber").asString()).isEqualTo("[REDACTED:FINANCIAL]");
+        assertThat(appended.metadata().path("email").asString()).isEqualTo("[REDACTED:SENSITIVE_PII]");
+        String customerToken = appended.metadata().path("customerId").asString();
+        assertThat(customerToken).matches("\\[SYNTH_ID:[0-9a-f]{12}]");
+        assertThat(appended.metadata().path("purpose").asString()).isEqualTo("integration-check");
+        assertThat(rawMetadata.path("accountNumber").asString()).isEqualTo("SYNTH-ACCT-9911");
+
+        String stored = jdbcTemplate.queryForObject(
+                "select metadata_json::text from audit_records where id = ?", String.class, appended.id()
+        );
+        assertThat(stored)
+                .contains("[REDACTED:FINANCIAL]", "[REDACTED:SENSITIVE_PII]", customerToken)
+                .doesNotContain("SYNTH-ACCT-9911", "audit-borrower@example.test", "audit-customer-9911");
+        assertThat(jdbcTemplate.queryForObject(
+                "select after_digest from audit_records where id = ?", String.class, appended.id()
+        )).isEqualTo(HASH_B);
+        AuditDto.Record found = auditService.find("TEST_RUN", seed.runId(), 25).stream()
+                .filter(record -> record.id().equals(appended.id()))
+                .findFirst().orElseThrow();
+        assertThat(found.metadata()).isEqualTo(appended.metadata());
+        assertThat(found.afterDigest()).isEqualTo(HASH_B);
+
+        HttpResponse<String> response = HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create("http://localhost:" + port
+                        + "/api/v1/audit-records?resourceType=TEST_RUN&resourceId=" + seed.runId()))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString()
+        );
+        assertThat(response.statusCode()).isEqualTo(200);
+        assertThat(response.body())
+                .doesNotContain("SYNTH-ACCT-9911", "audit-borrower@example.test", "audit-customer-9911");
+        JsonNode httpRecord = null;
+        for (JsonNode candidate : objectMapper.readTree(response.body()).path("data")) {
+            if (appended.id().toString().equals(candidate.path("id").asString())) {
+                httpRecord = candidate;
+                break;
+            }
+        }
+        assertThat(httpRecord).isNotNull();
+        assertThat(httpRecord.path("metadata")).isEqualTo(appended.metadata());
+        assertThat(httpRecord.path("afterDigest").asString()).isEqualTo(HASH_B);
+
+        AuditDto.Record empty = auditService.append(
+                WORKSPACE_ID, "audit-tester", "METADATA_NULL_CHECK", "TEST_RUN", seed.runId(),
+                null, null, null
+        );
+        assertThat(empty.metadata().isObject()).isTrue();
+        assertThat(empty.metadata().isEmpty()).isTrue();
+        assertThat(jdbcTemplate.queryForObject(
+                "select metadata_json::text from audit_records where id = ?", String.class, empty.id()
+        )).isEqualTo("{}");
+    }
+
+    @Test
+    void rejectsSecretAuditMetadataAndActorBeforeInsertion() {
+        Seed seed = seedRun();
+        ObjectNode secretMetadata = objectMapper.createObjectNode()
+                .put("clientSecret", "audit-secret-canary");
+        assertThatThrownBy(() -> auditService.append(
+                WORKSPACE_ID, "audit-tester", "PRIVACY_REJECTED", "TEST_RUN", seed.runId(),
+                null, null, secretMetadata
+        )).isInstanceOfSatisfying(BusinessException.class, exception -> {
+            assertThat(exception.errorCode()).isEqualTo(ErrorCode.SECRET_DETECTED);
+            assertThat(exception.getMessage()).doesNotContain("audit-secret-canary");
+        });
+        String secretActor = "Bearer audit-actor-secret-canary";
+        assertThatThrownBy(() -> auditService.append(
+                WORKSPACE_ID, secretActor, "PRIVACY_REJECTED", "TEST_RUN", seed.runId(),
+                null, null, objectMapper.createObjectNode()
+        )).isInstanceOfSatisfying(BusinessException.class, exception -> {
+            assertThat(exception.errorCode()).isEqualTo(ErrorCode.SECRET_DETECTED);
+            assertThat(exception.getMessage()).doesNotContain(secretActor);
+        });
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from audit_records
+                 where action = 'PRIVACY_REJECTED' and resource_id = ?
+                """, Integer.class, seed.runId())).isZero();
     }
 
     private Seed seedRun() {
