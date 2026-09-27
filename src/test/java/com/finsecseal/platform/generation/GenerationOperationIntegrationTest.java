@@ -170,6 +170,40 @@ class GenerationOperationIntegrationTest {
         assertThat(metadata).contains("patch-model","sourceEvidenceDigest","redactedEvidenceDigest",base.resourceHash(),seed.findingId().toString());
         assertThat(db.queryForObject("select version_id from contract_generation_records where operation_id=?",UUID.class,operation)).isEqualTo(
                 db.queryForObject("select version_id from generation_operations where id=?",UUID.class,operation));
+
+        String detailPath="/api/v1/patch-proposals/"+proposal;
+        var detailRequest=HttpRequest.newBuilder(URI.create("http://localhost:"+port+detailPath))
+                .header("X-Contract-Reviewer-Key",KEY).GET().build();
+        var detail=HttpClient.newHttpClient().send(detailRequest,HttpResponse.BodyHandlers.ofString());
+        assertThat(detail.statusCode()).withFailMessage(detail.body()).isEqualTo(200);
+        var value=json.readTree(detail.body()).path("data");
+        assertThat(value.path("id").stringValue()).isEqualTo(proposal.toString());
+        assertThat(value.path("findingId").stringValue()).isEqualTo(seed.findingId().toString());
+        assertThat(value.path("state").stringValue()).isEqualTo("PROPOSED");
+        assertThat(value.at("/generation/operationId").stringValue()).isEqualTo(operation.toString());
+        assertThat(value.at("/generation/provider").stringValue()).isEqualTo("test");
+        assertThat(value.at("/generation/model").stringValue()).isEqualTo("patch-model");
+        assertThat(value.at("/generation/latencyMs").longValue()).isEqualTo(9);
+        assertThat(value.at("/generation/promptDigest").stringValue()).matches("sha256:[0-9a-f]{64}");
+        assertThat(value.at("/generation/sourceEvidenceDigest").stringValue())
+                .isEqualTo(value.at("/source/evidenceDigest").stringValue());
+        assertThat(value.at("/generation/metadataHash").stringValue()).isEqualTo(db.queryForObject(
+                "select metadata_hash from contract_generation_records where operation_id=?",String.class,operation));
+        assertThat(value.at("/catalogBinding/serverToolCatalogHash").stringValue()).matches("sha256:[0-9a-f]{64}");
+        assertThat(value.path("diff").size()).isEqualTo(1);
+        assertThat(value.path("generation").has("source")).isFalse();
+        assertThat(value.has("recommendedRule")).isFalse();
+        assertThat(detail.body()).doesNotContain("accountNumber","canonicalJson","inputJson","resultPolicy","sourceOracleResultId");
+
+        db.update("""
+                update patch_proposals set generation_model_meta_json=jsonb_set(generation_model_meta_json,
+                    '{generation,provider}',to_jsonb(cast(? as text))) where id=?
+                ""","forged-provider",proposal);
+        var tampered=HttpClient.newHttpClient().send(detailRequest,HttpResponse.BodyHandlers.ofString());
+        assertThat(tampered.statusCode()).withFailMessage(tampered.body()).isEqualTo(409);
+        assertThat(json.readTree(tampered.body()).path("code").stringValue()).isEqualTo("EVIDENCE_INCOMPLETE");
+        assertThat(tampered.body()).contains("Patch proposal integrity check failed")
+                .doesNotContain("forged-provider","patch-model","generation_model_meta_json");
     }
     @Test void noChangeDoesNotCreateAnotherVersionAndHiddenSourceNeverCallsModel() throws Exception {
         Seed seed=seed("SEED",false,false);var base=contracts.create(seed.releaseId(),policy(),reviewer);
