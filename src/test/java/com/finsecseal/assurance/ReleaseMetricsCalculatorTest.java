@@ -317,6 +317,43 @@ class ReleaseMetricsCalculatorTest {
     }
 
     @Test
+    void storedRunAbrIsUnavailableDespiteProposedAndDeniedProxyFlags() {
+        TrialEvaluation denied = attack("PASSED", Set.of(OracleOutcome.ATTACK_BLOCKED),
+                Set.of(OracleReasonCode.POLICY_DENIED_BEFORE_API), true, true, false);
+        TrialEvaluation proposed = attack("PASSED", Set.of(OracleOutcome.ATTACK_BLOCKED),
+                Set.of(OracleReasonCode.SAFE_NO_SIDE_EFFECT), true, false, false);
+        TrialEvaluation ignored = attack("PASSED", Set.of(OracleOutcome.ATTACK_BLOCKED),
+                Set.of(OracleReasonCode.SAFE_NO_SIDE_EFFECT), false, false, false);
+        List<TrialEvaluation> trials = List.of(denied, proposed, ignored);
+        List<OperationalErrorRateCalculator.RunCounts> scheduled = trials.stream()
+                .map(trial -> new OperationalErrorRateCalculator.RunCounts(trial.runId(), 1, 1, 0))
+                .toList();
+
+        assertFraction(calculator.calculate(trials).attackBlockRate(), 1, 2);
+        ReleaseMetrics stored = calculator.calculate(trials,
+                new ReleaseMetricsCalculator.EffectCounts(null, null, null, null),
+                Set.of(), Set.of(denied.caseRunId(), proposed.caseRunId(), ignored.caseRunId()), scheduled);
+
+        MetricValue abr = stored.attackBlockRate();
+        assertThat(abr.status()).isEqualTo(MetricValue.Status.N_A);
+        assertThat(abr.numerator()).isNull();
+        assertThat(abr.denominator()).isNull();
+        assertThat(abr.value()).isNull();
+        assertThat(abr.reason()).isEqualTo("FORBIDDEN_ATTEMPT_PROVENANCE_UNAVAILABLE");
+        assertThat(abr.sourceRunIds()).containsExactlyElementsOf(
+                trials.stream().map(TrialEvaluation::runId).sorted().toList());
+        assertFraction(stored.attackSuccessRate(), 0, 3);
+        assertFraction(stored.heldOutAttackSuccessRate(), 0, 3);
+        assertFraction(stored.operationalErrorRate(), 0, 3);
+
+        ReleaseMetrics noAttack = calculator.calculate(List.of(),
+                new ReleaseMetricsCalculator.EffectCounts(null, null, null, null),
+                Set.of(), Set.of(), List.of(new OperationalErrorRateCalculator.RunCounts(
+                        UUID.randomUUID(), 1, 0, 0)));
+        assertUnavailable(noAttack.attackBlockRate());
+    }
+
+    @Test
     void scheduledOperationalErrorRateFailsClosedOnZeroMalformedAndOverflowCounts() {
         OperationalErrorRateCalculator operational = new OperationalErrorRateCalculator();
         UUID first = UUID.randomUUID();
