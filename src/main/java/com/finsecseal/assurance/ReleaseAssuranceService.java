@@ -60,6 +60,8 @@ public class ReleaseAssuranceService {
     private final ReleaseMetricsCalculator metricsCalculator = new ReleaseMetricsCalculator();
     private final PolicyLatencyCalculator policyLatencyCalculator = new PolicyLatencyCalculator();
     private final CompletionRateCalculator completionRateCalculator = new CompletionRateCalculator();
+    private final TrialSuccessDistributionCalculator trialSuccessDistributionCalculator =
+            new TrialSuccessDistributionCalculator();
     private final ReleaseGate releaseGate = new ReleaseGate();
 
     public ReleaseAssuranceService(
@@ -94,7 +96,8 @@ public class ReleaseAssuranceService {
                         replay.comparableCaseRunIds()),
                 replay.summary(),
                 policyLatency(releaseId, terminalRunIds(releaseId)),
-                completionRate(release, null)
+                completionRate(release, null),
+                trialSuccessDistribution(trials, replay.comparableCaseRunIds())
         );
     }
 
@@ -305,6 +308,8 @@ public class ReleaseAssuranceService {
         snapshot.set("metrics", metricArray(metrics));
         snapshot.set("policyLatency", objectMapper.valueToTree(policyLatency(release.id(), evidence.runIds())));
         snapshot.set("completionRate", objectMapper.valueToTree(completionRate(release, evidence)));
+        snapshot.set("trialSuccessDistribution", objectMapper.valueToTree(
+                trialSuccessDistribution(loadedTrials, replay.comparableCaseRunIds())));
         snapshot.set("observedEffectCounts", observedEffectCounts(metrics, loadedTrials));
         snapshot.set("remainingFindings", remainingFindings(release.id()));
         snapshot.set("approvedPatch", approvedPatch(release.id()));
@@ -424,6 +429,47 @@ public class ReleaseAssuranceService {
                 rs.getLong("materialized_cases"), rs.getLong("terminal_non_cancelled"),
                 rs.getLong("cancelled_cases")), arguments);
         return completionRateCalculator.calculate(runs);
+    }
+
+    private TrialSuccessDistributionCalculator.Report trialSuccessDistribution(
+            List<TrialEvaluation> trials, Set<UUID> comparableReplayCaseRunIds) {
+        if (trials.isEmpty()) {
+            return trialSuccessDistributionCalculator.calculate(List.of(), comparableReplayCaseRunIds);
+        }
+        UUID[] caseRunIds = trials.stream().map(TrialEvaluation::caseRunId).toArray(UUID[]::new);
+        Map<UUID, TrialMetadata> metadata = new LinkedHashMap<>();
+        jdbcTemplate.query("""
+                select case_run.id case_run_id, case_run.test_run_id, case_run.test_case_id,
+                       test_case.case_key, test_case.partition_name, case_run.trial_index
+                  from test_case_runs case_run
+                  join test_cases test_case on test_case.id = case_run.test_case_id
+                 where case_run.id = any(?::uuid[])
+                 order by case_run.id
+                """, rs -> {
+            while (rs.next()) {
+                TrialMetadata row = new TrialMetadata(
+                        rs.getObject("test_run_id", UUID.class),
+                        rs.getObject("test_case_id", UUID.class),
+                        rs.getString("case_key"), rs.getString("partition_name"),
+                        rs.getInt("trial_index"));
+                if (metadata.putIfAbsent(rs.getObject("case_run_id", UUID.class), row) != null) {
+                    throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE,
+                            "Duplicate TestCaseRun distribution metadata");
+                }
+            }
+            return null;
+        }, (Object) caseRunIds);
+        List<TrialSuccessDistributionCalculator.TrialSample> samples = new ArrayList<>();
+        for (TrialEvaluation trial : trials) {
+            TrialMetadata row = metadata.get(trial.caseRunId());
+            if (row == null || !row.runId().equals(trial.runId())) {
+                throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE,
+                        "Missing or mismatched TestCaseRun distribution metadata");
+            }
+            samples.add(new TrialSuccessDistributionCalculator.TrialSample(trial,
+                    row.testCaseId(), row.caseKey(), row.partition(), row.trialIndex()));
+        }
+        return trialSuccessDistributionCalculator.calculate(samples, comparableReplayCaseRunIds);
     }
 
     private List<TrialEvaluation> comparableTrials(List<TrialEvaluation> trials, ReplayAssessment replay) {
@@ -1020,6 +1066,8 @@ public class ReleaseAssuranceService {
                                    String fixtureVersion, String fixtureDigest, Instant testedAt,
                                    List<UUID> runIds) { }
     private record SnapshotBuild(GateDecision decision, ObjectNode snapshot) { }
+    private record TrialMetadata(UUID runId, UUID testCaseId, String caseKey,
+                                 String partition, int trialIndex) { }
     private record EffectEvidence(UUID caseRunId, String oracleType, String reasonCode,
                                   String evidenceJson) { }
     private record MutationOracle(UUID caseRunId, String oracleType, String outcome, String reasonCode,
