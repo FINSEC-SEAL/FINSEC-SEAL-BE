@@ -59,6 +59,7 @@ public class ReleaseAssuranceService {
     private final SensitiveFieldExposureCounter sensitiveFieldExposureCounter;
     private final ReleaseMetricsCalculator metricsCalculator = new ReleaseMetricsCalculator();
     private final PolicyLatencyCalculator policyLatencyCalculator = new PolicyLatencyCalculator();
+    private final CompletionRateCalculator completionRateCalculator = new CompletionRateCalculator();
     private final ReleaseGate releaseGate = new ReleaseGate();
 
     public ReleaseAssuranceService(
@@ -84,7 +85,7 @@ public class ReleaseAssuranceService {
     }
 
     public ReleaseAssuranceDto.MetricsView metrics(UUID releaseId) {
-        requireRelease(releaseId, false);
+        ReleaseRow release = requireRelease(releaseId, false);
         List<TrialEvaluation> trials = loadTrials(releaseId);
         ReplayAssessment replay = assessReplay(releaseId, null);
         return new ReleaseAssuranceDto.MetricsView(
@@ -92,7 +93,8 @@ public class ReleaseAssuranceService {
                 metricsCalculator.calculate(comparableTrials(trials, replay), actualEffectCounts(trials),
                         replay.comparableCaseRunIds()),
                 replay.summary(),
-                policyLatency(releaseId, terminalRunIds(releaseId))
+                policyLatency(releaseId, terminalRunIds(releaseId)),
+                completionRate(release, null)
         );
     }
 
@@ -302,6 +304,7 @@ public class ReleaseAssuranceService {
         snapshot.set("criticalSuccessEvidence", objectMapper.valueToTree(criticalSuccessEvidence));
         snapshot.set("metrics", metricArray(metrics));
         snapshot.set("policyLatency", objectMapper.valueToTree(policyLatency(release.id(), evidence.runIds())));
+        snapshot.set("completionRate", objectMapper.valueToTree(completionRate(release, evidence)));
         snapshot.set("observedEffectCounts", observedEffectCounts(metrics, loadedTrials));
         snapshot.set("remainingFindings", remainingFindings(release.id()));
         snapshot.set("approvedPatch", approvedPatch(release.id()));
@@ -392,6 +395,35 @@ public class ReleaseAssuranceService {
                     decisionJson == null ? null : parseJson(decisionJson));
         }, releaseId, (Object) runIds.toArray(UUID[]::new));
         return policyLatencyCalculator.calculate(events);
+    }
+
+    private CompletionRateCalculator.CompletionRate completionRate(ReleaseRow release,
+                                                                   EvidenceContext evidence) {
+        String cohortFilter = evidence == null ? "" : """
+                   and run.suite_id = ? and run.fixture_version = ? and run.fixture_digest = ?
+                   and run.agent_artifact_fingerprint = ? and run.release_fingerprint = ?
+                """;
+        Object[] arguments = evidence == null ? new Object[]{release.id()}
+                : new Object[]{release.id(), evidence.suiteId(), evidence.fixtureVersion(),
+                        evidence.fixtureDigest(), release.agentArtifactFingerprint(),
+                        release.releaseFingerprint()};
+        List<CompletionRateCalculator.RunCounts> runs = jdbcTemplate.query("""
+                select run.id, run.total_cases,
+                       count(case_run.id) materialized_cases,
+                       count(case_run.id) filter (where case_run.status in
+                           ('PASSED', 'FAILED_SECURITY', 'FAILED_FUNCTIONAL', 'ERROR')) terminal_non_cancelled,
+                       count(case_run.id) filter (where case_run.status = 'CANCELLED') cancelled_cases
+                  from test_runs run
+                  left join test_case_runs case_run on case_run.test_run_id = run.id
+                 where run.release_id = ?
+                """ + cohortFilter + """
+                 group by run.id, run.total_cases
+                 order by run.id
+                """, (rs, row) -> new CompletionRateCalculator.RunCounts(
+                rs.getObject("id", UUID.class), rs.getLong("total_cases"),
+                rs.getLong("materialized_cases"), rs.getLong("terminal_non_cancelled"),
+                rs.getLong("cancelled_cases")), arguments);
+        return completionRateCalculator.calculate(runs);
     }
 
     private List<TrialEvaluation> comparableTrials(List<TrialEvaluation> trials, ReplayAssessment replay) {
