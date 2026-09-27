@@ -294,6 +294,120 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     @Test
+    void trialDistributionSerializesNullBitsAndKeepsDecisionInSelectedCohort() throws Exception {
+        Seed seed = seedCriticalRelease();
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+        SensitiveRun otherSuite = seedSensitiveRun(seed.releaseId());
+        finishSensitiveRun(otherSuite, false);
+        PlannedRun selected = seedDistributionRun(baselineRunId);
+
+        var api = assuranceService.metrics(seed.releaseId());
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var report = api.trialSuccessDistribution();
+        var apiJson = objectMapper.readTree(objectMapper.writeValueAsString(api));
+        var snapshot = proposal.inputSnapshot().path("trialSuccessDistribution");
+        var selectedCase = report.cases().stream()
+                .filter(item -> item.runId().equals(selected.runId())).findFirst().orElseThrow();
+        var selectedApiJson = apiJson.at("/trialSuccessDistribution/cases").valueStream()
+                .filter(item -> selected.runId().toString().equals(item.path("runId").asString()))
+                .findFirst().orElseThrow();
+        var selectedSnapshot = snapshot.path("cases").valueStream()
+                .filter(item -> selected.runId().toString().equals(item.path("runId").asString()))
+                .findFirst().orElseThrow();
+
+        assertThat(report.sourceRunIds()).containsExactlyElementsOf(
+                List.of(baselineRunId, otherSuite.runId(), selected.runId()).stream().sorted().toList());
+        assertThat(snapshot.path("sourceRunIds").valueStream().map(item -> item.asString()).toList())
+                .containsExactlyElementsOf(List.of(baselineRunId, selected.runId()).stream()
+                        .sorted().map(UUID::toString).toList());
+        assertThat(selectedCase.successBits()).containsExactly(1, null, 0);
+        assertThat(selectedCase.orderedTrials())
+                .extracting(TrialSuccessDistributionCalculator.TrialBit::trialIndex)
+                .containsExactly(0, 1, 2);
+        assertThat(selectedCase.successCount()).isEqualTo(1L);
+        assertThat(selectedCase.trials()).isEqualTo(2L);
+        assertThat(selectedCase.orderedTrials().getFirst().secondaryInconclusive()).isTrue();
+        assertThat(selectedCase.orderedTrials().get(1).exclusionReason())
+                .isEqualTo("INCONCLUSIVE_ORACLE");
+        assertThat(selectedApiJson.at("/successBits/0").asInt()).isEqualTo(1);
+        assertThat(selectedApiJson.at("/successBits/1").isNull()).isTrue();
+        assertThat(selectedApiJson.at("/successBits/2").asInt()).isZero();
+        assertThat(selectedSnapshot.path("successBits")).isEqualTo(selectedApiJson.path("successBits"));
+        var category = snapshot.path("categories").valueStream()
+                .filter(item -> "HELD_OUT".equals(item.path("mode").asString())
+                        && "FA-02".equals(item.path("category").asString()))
+                .findFirst().orElseThrow();
+        var expectedCategoryBits = report.cases().stream()
+                .filter(item -> "HELD_OUT".equals(item.mode()) && "FA-02".equals(item.category()))
+                .flatMap(item -> item.successBits().stream()).toList();
+        assertThat(category.path("successBits").valueStream()
+                .map(item -> item.isNull() ? null : item.asInt()).toList())
+                .containsExactlyElementsOf(expectedCategoryBits);
+        assertThat(category.path("successBits")).hasSize(4);
+        assertThat(category.path("successCount").asLong()).isEqualTo(2L);
+        assertThat(category.path("trials").asLong()).isEqualTo(3L);
+        assertThat(api.metrics().attackSuccessRate().numerator()).isEqualTo(2L);
+        assertThat(api.metrics().operationalErrorRate().numerator()).isEqualTo(2L);
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+    }
+
+    @Test
+    void trialDistributionDecisionDigestChangesWhenSelectedTerminalEvidenceArrives() throws Exception {
+        Seed seed = seedCriticalRelease();
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+        var before = assuranceService.evaluate(seed.releaseId(), "role-d");
+
+        PlannedRun added = seedDistributionRun(baselineRunId);
+        var after = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var repeated = assuranceService.evaluate(seed.releaseId(), "role-d");
+
+        assertThat(after.inputDigest()).isNotEqualTo(before.inputDigest());
+        assertThat(repeated.inputDigest()).isEqualTo(after.inputDigest());
+        assertThat(before.inputSnapshot().at("/trialSuccessDistribution/sourceRunIds").valueStream()
+                .map(item -> item.asString()).toList()).containsExactly(baselineRunId.toString());
+        assertThat(after.inputSnapshot().at("/trialSuccessDistribution/sourceRunIds").valueStream()
+                .map(item -> item.asString()).toList()).containsExactlyElementsOf(
+                        List.of(baselineRunId, added.runId()).stream()
+                                .sorted().map(UUID::toString).toList());
+        assertThat(after.proposedDecision()).isEqualTo(before.proposedDecision());
+        assertThat(after.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+    }
+
+    @Test
+    void trialDistributionSeparatesComparableReplayFromIncomparableSuccess() throws Exception {
+        Seed baseline = seedCriticalRelease("BASELINE");
+        UUID comparableRunId = seedComparableMixedReplay(baseline.releaseId());
+
+        var comparableApi = assuranceService.metrics(baseline.releaseId());
+        var comparableCase = comparableApi.trialSuccessDistribution().cases().stream()
+                .filter(item -> item.runId().equals(comparableRunId)).findFirst().orElseThrow();
+        var comparableDecision = assuranceService.evaluate(baseline.releaseId(), "role-d");
+        var comparableSnapshotCase = comparableDecision.inputSnapshot()
+                .at("/trialSuccessDistribution/cases").valueStream()
+                .filter(item -> comparableRunId.toString().equals(item.path("runId").asString()))
+                .findFirst().orElseThrow();
+        assertThat(comparableCase.successBits()).containsExactly(1);
+        assertThat(comparableCase.orderedTrials().getFirst().secondaryInconclusive()).isTrue();
+        assertThat(comparableSnapshotCase.at("/successBits/0").asInt()).isEqualTo(1);
+        assertThat(comparableApi.metrics().attackSuccessRate().numerator()).isEqualTo(2L);
+        assertThat(comparableDecision.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+
+        Seed noLink = seedCriticalRelease("SEAL_REPLAY", false, null, null, "{}", true);
+        var incomparableApi = assuranceService.metrics(noLink.releaseId());
+        var incomparableCase = incomparableApi.trialSuccessDistribution().cases().getFirst();
+        var incomparableDecision = assuranceService.evaluate(noLink.releaseId(), "role-d");
+        assertThat(incomparableCase.successBits()).containsExactly((Integer) null);
+        assertThat(incomparableCase.orderedTrials().getFirst().exclusionReason())
+                .isEqualTo("REPLAY_NOT_COMPARABLE");
+        assertThat(incomparableApi.metrics().attackSuccessRate().status())
+                .isEqualTo(MetricValue.Status.N_A);
+        assertThat(incomparableApi.metrics().operationalErrorRate().numerator()).isEqualTo(1L);
+        assertThat(incomparableDecision.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+    }
+
+    @Test
     void rejectsStaleProposalDigestAndUpwardOverride() throws Exception {
         Seed seed = seedCriticalRelease();
         var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
@@ -999,6 +1113,53 @@ class ReleaseAssuranceIntegrationTest {
         ReleaseDto.Response release = releaseService.create(agent.id(), manifest, "test");
         releaseService.analyze(release.id(), "test");
         return release.id();
+    }
+
+    private PlannedRun seedDistributionRun(UUID baselineRunId) {
+        PlannedRun run = seedPlannedRun(baselineRunId, "HELD_OUT", 3,
+                List.of("FAILED_SECURITY", "PASSED", "PASSED"), "RUNNING");
+        UUID successId = jdbcTemplate.queryForObject("""
+                select id from test_case_runs where test_run_id = ? and trial_index = 0
+                """, UUID.class, run.runId());
+        UUID inconclusiveId = jdbcTemplate.queryForObject("""
+                select id from test_case_runs where test_run_id = ? and trial_index = 1
+                """, UUID.class, run.runId());
+        UUID blockedId = jdbcTemplate.queryForObject("""
+                select id from test_case_runs where test_run_id = ? and trial_index = 2
+                """, UUID.class, run.runId());
+        appendDistributionOracle(successId, "CROSS_CUSTOMER", "ATTACK_SUCCESS",
+                "UNAUTHORIZED_RECORD_RETURNED", "INV-01");
+        appendDistributionOracle(successId, "SENSITIVE_FIELD", "INCONCLUSIVE",
+                "EVIDENCE_INCOMPLETE", "INV-02");
+        appendDistributionOracle(inconclusiveId, "CROSS_CUSTOMER", "INCONCLUSIVE",
+                "EVIDENCE_INCOMPLETE", "INV-01");
+        appendDistributionOracle(blockedId, "CROSS_CUSTOMER", "ATTACK_BLOCKED",
+                "POLICY_DENIED_BEFORE_API", "INV-01");
+        UUID traceId = jdbcTemplate.queryForObject("""
+                select trace_id from execution_events where run_id = ? and sequence = 1
+                """, UUID.class, run.runId());
+        eventService.append(run.runId(), new ExecutionEventDto.AppendRequest(
+                null, traceId, ExecutionEventType.RUN_COMPLETED,
+                null, null, null, null, "RUN_COMPLETED", objectMapper.createObjectNode()
+        ), "test");
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        jdbcTemplate.update("""
+                update test_runs set status = 'COMPLETED', completed_cases = 3,
+                       operational_error_count = 0, completed_at = ?, updated_at = ? where id = ?
+                """, Timestamp.from(now), Timestamp.from(now), run.runId());
+        return run;
+    }
+
+    private void appendDistributionOracle(UUID caseRunId, String oracleType, String outcome,
+                                          String reasonCode, String invariantId) {
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        jdbcTemplate.update("""
+                insert into oracle_results
+                    (id, test_case_run_id, oracle_type, oracle_version, outcome, reason_code,
+                     invariant_id, evidence_json, evidence_digest, evaluated_at, created_at, updated_at)
+                values (?, ?, ?, '1.0', ?, ?, ?, '{}'::jsonb, ?, ?, ?, ?)
+                """, UUID.randomUUID(), caseRunId, oracleType, outcome, reasonCode, invariantId,
+                HASH_A, Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
     }
 
     private PlannedRun seedPlannedRun(UUID baselineRunId, String mode, int scheduled,
