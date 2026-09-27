@@ -1,7 +1,6 @@
 package com.finsecseal.policy;
 
 import com.finsecseal.contract.LoanReviewFinancialTemplate;
-import com.finsecseal.contract.SafetyContractLifecyclePolicy.ReviewerContext;
 import com.finsecseal.evidence.ExecutionEventService;
 import com.finsecseal.evidence.RedactionService;
 import com.finsecseal.evidence.TestRunProjectionService;
@@ -9,7 +8,6 @@ import com.finsecseal.release.ReleaseService;
 import com.finsecseal.sandbox.tool.StateChangingToolExecutionService;
 import com.finsecseal.sandbox.tool.ToolAdapter;
 import java.util.List;
-import java.util.function.Supplier;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
@@ -28,7 +26,7 @@ public class LoanReviewPolicyGatewayConfiguration {
     @Bean
     @Primary
     LoanReviewPolicyGateway loanReviewPolicyGateway(PlatformTransactionManager transactions,
-            @Qualifier(REVIEWER_CONTEXT_BEAN) Supplier<ReviewerContext> reviewers,
+            @Qualifier(REVIEWER_CONTEXT_BEAN) GatewayReviewerContextSource reviewers,
             GatewayRuntimeObservations observations, GatewayApprovedPolicySourceService approved,
             GatewayBaselinePolicySourceService baseline, TestRunProjectionService runs,
             ReleaseService releases, GatewayPolicyFactsAssembler facts, ExecutionEventService events,
@@ -38,7 +36,7 @@ public class LoanReviewPolicyGatewayConfiguration {
                 || Boolean.TRUE.equals(environment.getProperty("policy.gateway.c.enabled", Boolean.class))) {
             throw new IllegalStateException("Local C Gateway cannot be combined with a remote Gateway");
         }
-        // Keep the supplier itself: identity must be resolved for each invocation, not at bean creation.
+        // Resolve authenticated identity for the exact invocation; no fallback source is registered.
         return new LoanReviewPolicyGateway(transactions, reviewers, observations, approved, baseline, runs,
                 releases, facts, events, mutations, redaction, json, template, adapters);
     }
