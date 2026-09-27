@@ -62,6 +62,8 @@ public class ReleaseAssuranceService {
     private final CompletionRateCalculator completionRateCalculator = new CompletionRateCalculator();
     private final TrialSuccessDistributionCalculator trialSuccessDistributionCalculator =
             new TrialSuccessDistributionCalculator();
+    private final AttackRateBreakdownCalculator attackRateBreakdownCalculator =
+            new AttackRateBreakdownCalculator();
     private final ReleaseGate releaseGate = new ReleaseGate();
 
     public ReleaseAssuranceService(
@@ -90,6 +92,8 @@ public class ReleaseAssuranceService {
         ReleaseRow release = requireRelease(releaseId, false);
         List<TrialEvaluation> trials = loadTrials(releaseId);
         ReplayAssessment replay = assessReplay(releaseId, null);
+        TrialSuccessDistributionCalculator.Report distribution =
+                trialSuccessDistribution(trials, replay.comparableCaseRunIds());
         return new ReleaseAssuranceDto.MetricsView(
                 releaseId,
                 metricsCalculator.calculate(comparableTrials(trials, replay), actualEffectCounts(trials),
@@ -97,7 +101,8 @@ public class ReleaseAssuranceService {
                 replay.summary(),
                 policyLatency(releaseId, terminalRunIds(releaseId)),
                 completionRate(release, null),
-                trialSuccessDistribution(trials, replay.comparableCaseRunIds())
+                distribution,
+                attackRateBreakdownCalculator.calculate(distribution)
         );
     }
 
@@ -308,8 +313,11 @@ public class ReleaseAssuranceService {
         snapshot.set("metrics", metricArray(metrics));
         snapshot.set("policyLatency", objectMapper.valueToTree(policyLatency(release.id(), evidence.runIds())));
         snapshot.set("completionRate", objectMapper.valueToTree(completionRate(release, evidence)));
-        snapshot.set("trialSuccessDistribution", objectMapper.valueToTree(
-                trialSuccessDistribution(loadedTrials, replay.comparableCaseRunIds())));
+        TrialSuccessDistributionCalculator.Report distribution =
+                trialSuccessDistribution(loadedTrials, replay.comparableCaseRunIds());
+        snapshot.set("trialSuccessDistribution", objectMapper.valueToTree(distribution));
+        snapshot.set("attackRateBreakdown", objectMapper.valueToTree(
+                attackRateBreakdownCalculator.calculate(distribution)));
         snapshot.set("observedEffectCounts", observedEffectCounts(metrics, loadedTrials));
         snapshot.set("remainingFindings", remainingFindings(release.id()));
         snapshot.set("approvedPatch", approvedPatch(release.id()));

@@ -294,6 +294,107 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     @Test
+    void attackRateBreakdownUsesStoredPartitionsAndSelectedDecisionCohort() throws Exception {
+        Seed seed = seedCriticalRelease();
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+        var before = assuranceService.evaluate(seed.releaseId(), "role-d");
+        UUID selectedRunId = seedAttackBreakdownRun(baselineRunId);
+        seedCriticalRelease(); // another Release cannot contribute to this rate
+
+        var api = assuranceService.metrics(seed.releaseId());
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var repeated = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var apiJson = objectMapper.readTree(objectMapper.writeValueAsString(api));
+        var apiBreakdown = api.attackRateBreakdown();
+        var decisionBreakdown = proposal.inputSnapshot().path("attackRateBreakdown");
+        var decisionGroups = decisionBreakdown.path("groups");
+        var decisionAsr = proposal.inputSnapshot().path("metrics").valueStream()
+                .filter(metric -> "ASR".equals(metric.path("metric").asString()))
+                .findFirst().orElseThrow();
+
+        assertThat(apiBreakdown.status()).isEqualTo(AttackRateBreakdownCalculator.Status.AVAILABLE);
+        assertThat(apiBreakdown.sourceRunIds()).containsExactlyElementsOf(
+                List.of(baselineRunId, selectedRunId).stream().sorted().toList());
+        assertThat(apiBreakdown.groups()).extracting(AttackRateBreakdownCalculator.Group::partition)
+                .containsExactly("HELD_OUT", "MUTATION", "SEED");
+        assertThat(apiBreakdown.groups()).extracting(AttackRateBreakdownCalculator.Group::category)
+                .containsOnly("FA-02");
+        assertThat(apiBreakdown.groups()).extracting(AttackRateBreakdownCalculator.Group::mode)
+                .containsOnly("HELD_OUT");
+        assertThat(apiBreakdown.groups().get(0).numerator()).isEqualTo(1L);
+        assertThat(apiBreakdown.groups().get(0).denominator()).isEqualTo(1L);
+        assertThat(apiBreakdown.groups().get(0).excludedTrials()).isEqualTo(1L);
+        assertThat(apiBreakdown.groups().get(0).sourceRunIds()).containsExactly(baselineRunId);
+        assertThat(apiBreakdown.groups().get(1).numerator()).isZero();
+        assertThat(apiBreakdown.groups().get(1).denominator()).isEqualTo(1L);
+        assertThat(apiBreakdown.groups().get(1).excludedTrials()).isEqualTo(1L);
+        assertThat(apiBreakdown.groups().get(2).numerator()).isEqualTo(1L);
+        assertThat(apiBreakdown.groups().get(2).denominator()).isEqualTo(1L);
+        assertThat(apiBreakdown.groups().get(2).sourceRunIds()).containsExactly(selectedRunId);
+        assertThat(apiBreakdown.groups().stream().mapToLong(
+                AttackRateBreakdownCalculator.Group::numerator).sum())
+                .isEqualTo(api.metrics().attackSuccessRate().numerator());
+        assertThat(apiBreakdown.groups().stream().mapToLong(
+                AttackRateBreakdownCalculator.Group::denominator).sum())
+                .isEqualTo(api.metrics().attackSuccessRate().denominator());
+        assertThat(api.metrics().operationalErrorRate().numerator()).isEqualTo(3L);
+        assertThat(api.metrics().operationalErrorRate().denominator()).isEqualTo(5L);
+
+        assertThat(apiJson.at("/attackRateBreakdown/groups/1/partition").asString())
+                .isEqualTo("MUTATION");
+        assertThat(apiJson.at("/attackRateBreakdown/groups/1/numerator").asLong()).isZero();
+        assertThat(decisionBreakdown.path("sourceRunIds").valueStream()
+                .map(node -> node.asString()).toList()).containsExactly(selectedRunId.toString());
+        assertThat(decisionGroups).hasSize(3);
+        assertThat(decisionGroups.get(0).path("partition").asString()).isEqualTo("HELD_OUT");
+        assertThat(decisionGroups.get(0).path("status").asString()).isEqualTo("N_A");
+        assertThat(decisionGroups.get(0).path("numerator").isNull()).isTrue();
+        assertThat(decisionGroups.get(0).path("denominator").isNull()).isTrue();
+        assertThat(decisionGroups.get(0).path("excludedTrials").asLong()).isEqualTo(1L);
+        assertThat(decisionGroups.get(0).path("sourceRunIds").isEmpty()).isTrue();
+        assertThat(decisionGroups.get(1).path("partition").asString()).isEqualTo("MUTATION");
+        assertThat(decisionGroups.get(1).path("numerator").asLong()).isZero();
+        assertThat(decisionGroups.get(1).path("denominator").asLong()).isEqualTo(1L);
+        assertThat(decisionGroups.get(2).path("partition").asString()).isEqualTo("SEED");
+        assertThat(decisionGroups.get(2).path("numerator").asLong()).isEqualTo(1L);
+        assertThat(decisionGroups.get(2).path("denominator").asLong()).isEqualTo(1L);
+        assertThat(decisionGroups.valueStream().mapToLong(group ->
+                group.path("numerator").asLong()).sum()).isEqualTo(decisionAsr.path("numerator").asLong());
+        assertThat(decisionGroups.valueStream().mapToLong(group ->
+                group.path("denominator").asLong()).sum()).isEqualTo(decisionAsr.path("denominator").asLong());
+        assertThat(decisionAsr.path("numerator").asLong()).isEqualTo(1L);
+        assertThat(decisionAsr.path("denominator").asLong()).isEqualTo(2L);
+        assertThat(proposal.inputDigest()).isNotEqualTo(before.inputDigest());
+        assertThat(repeated.inputDigest()).isEqualTo(proposal.inputDigest());
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+    }
+
+    @Test
+    void attackRateBreakdownKeepsIncomparableReplayAsNullOnlyGroup() throws Exception {
+        Seed seed = seedCriticalRelease("SEAL_REPLAY", false, null, null, "{}", true);
+
+        var api = assuranceService.metrics(seed.releaseId());
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var apiJson = objectMapper.readTree(objectMapper.writeValueAsString(api));
+
+        assertThat(api.attackRateBreakdown().status()).isEqualTo(AttackRateBreakdownCalculator.Status.N_A);
+        assertThat(api.attackRateBreakdown().reason()).isEqualTo("NO_CONCLUSIVE_ATTACK_TRIALS");
+        assertThat(api.attackRateBreakdown().groups()).singleElement().satisfies(group -> {
+            assertThat(group.mode()).isEqualTo("SEAL_REPLAY");
+            assertThat(group.numerator()).isNull();
+            assertThat(group.denominator()).isNull();
+            assertThat(group.excludedTrials()).isEqualTo(1L);
+            assertThat(group.sourceRunIds()).isEmpty();
+        });
+        assertThat(apiJson.at("/attackRateBreakdown/groups/0/numerator").isNull()).isTrue();
+        assertThat(proposal.inputSnapshot().at("/attackRateBreakdown/groups/0/status").asString())
+                .isEqualTo("N_A");
+        assertThat(api.metrics().attackSuccessRate().status()).isEqualTo(MetricValue.Status.N_A);
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+    }
+
+    @Test
     void trialDistributionSerializesNullBitsAndKeepsDecisionInSelectedCohort() throws Exception {
         Seed seed = seedCriticalRelease();
         UUID baselineRunId = jdbcTemplate.queryForObject(
@@ -392,6 +493,27 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(comparableCase.orderedTrials().getFirst().secondaryInconclusive()).isTrue();
         assertThat(comparableSnapshotCase.at("/successBits/0").asInt()).isEqualTo(1);
         assertThat(comparableApi.metrics().attackSuccessRate().numerator()).isEqualTo(2L);
+        assertThat(comparableApi.attackRateBreakdown().groups().stream()
+                .mapToLong(group -> group.numerator() == null ? 0 : group.numerator()).sum())
+                .isEqualTo(comparableApi.metrics().attackSuccessRate().numerator());
+        assertThat(comparableApi.attackRateBreakdown().groups().stream()
+                .mapToLong(group -> group.denominator() == null ? 0 : group.denominator()).sum())
+                .isEqualTo(comparableApi.metrics().attackSuccessRate().denominator());
+        assertThat(comparableApi.attackRateBreakdown().groups().stream()
+                .filter(group -> "SEAL_REPLAY".equals(group.mode())).toList())
+                .singleElement().satisfies(group -> {
+                    assertThat(group.numerator()).isEqualTo(1L);
+                    assertThat(group.denominator()).isEqualTo(1L);
+                    assertThat(group.sourceRunIds()).containsExactly(comparableRunId);
+                });
+        var replayDecisionGroup = comparableDecision.inputSnapshot()
+                .at("/attackRateBreakdown/groups").valueStream()
+                .filter(group -> "SEAL_REPLAY".equals(group.path("mode").asString()))
+                .findFirst().orElseThrow();
+        assertThat(replayDecisionGroup.path("numerator").asLong()).isEqualTo(1L);
+        assertThat(replayDecisionGroup.path("denominator").asLong()).isEqualTo(1L);
+        assertThat(replayDecisionGroup.path("sourceRunIds").valueStream()
+                .map(node -> node.asString()).toList()).containsExactly(comparableRunId.toString());
         assertThat(comparableDecision.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
 
         Seed noLink = seedCriticalRelease("SEAL_REPLAY", false, null, null, "{}", true);
@@ -1113,6 +1235,125 @@ class ReleaseAssuranceIntegrationTest {
         ReleaseDto.Response release = releaseService.create(agent.id(), manifest, "test");
         releaseService.analyze(release.id(), "test");
         return release.id();
+    }
+
+    private UUID seedAttackBreakdownRun(UUID baselineRunId) {
+        UUID baselineSuiteId = jdbcTemplate.queryForObject(
+                "select suite_id from test_runs where id = ?", UUID.class, baselineRunId);
+        UUID baselineCaseId = jdbcTemplate.queryForObject(
+                "select test_case_id from test_case_runs where test_run_id = ?",
+                UUID.class, baselineRunId);
+        UUID suiteId = UUID.randomUUID();
+        UUID runId = UUID.randomUUID();
+        String suffix = runId.toString().substring(0, 8);
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        jdbcTemplate.update("""
+                insert into test_suites
+                    (id, workspace_id, suite_key, version, fixture_version,
+                     generation_config_json, suite_hash, status, created_at, updated_at)
+                select ?, workspace_id, ?, version, fixture_version,
+                       generation_config_json, suite_hash, 'BUILDING', ?, ?
+                  from test_suites where id = ?
+                """, suiteId, "attack-breakdown-" + suffix,
+                Timestamp.from(now), Timestamp.from(now), baselineSuiteId);
+        UUID seedCaseId = copyBreakdownCase(baselineCaseId, suiteId,
+                "BREAKDOWN-SEED-" + suffix, "SEED", now);
+        UUID mutationCaseId = copyBreakdownCase(baselineCaseId, suiteId,
+                "BREAKDOWN-MUTATION-" + suffix, "MUTATION", now);
+        UUID heldOutCaseId = copyBreakdownCase(baselineCaseId, suiteId,
+                "BREAKDOWN-HELDOUT-" + suffix, "HELD_OUT", now);
+        jdbcTemplate.update("update test_suites set status = 'READY', updated_at = ? where id = ?",
+                Timestamp.from(now), suiteId);
+
+        jdbcTemplate.update("""
+                insert into test_runs
+                    (id, release_id, suite_id, contract_version_id, mode, status,
+                     agent_artifact_fingerprint, release_fingerprint, config_json,
+                     fixture_version, fixture_digest, model_config_hash, total_cases,
+                     completed_cases, operational_error_count, summary_json, created_at, updated_at)
+                select ?, release_id, ?, contract_version_id, 'HELD_OUT', 'QUEUED',
+                       agent_artifact_fingerprint, release_fingerprint, config_json,
+                       fixture_version, fixture_digest, model_config_hash, 4,
+                       0, 0, '{}'::jsonb, ?, ?
+                  from test_runs where id = ?
+                """, runId, suiteId, Timestamp.from(now), Timestamp.from(now), baselineRunId);
+        UUID successId = addBreakdownCaseRun(runId, seedCaseId, 0, "FAILED_SECURITY",
+                "ATTACK_SUCCESS", now);
+        UUID blockedId = addBreakdownCaseRun(runId, mutationCaseId, 0, "PASSED",
+                "ATTACK_BLOCKED", now);
+        UUID mutationIncompleteId = addBreakdownCaseRun(runId, mutationCaseId, 1, "PASSED",
+                null, now);
+        UUID heldOutIncompleteId = addBreakdownCaseRun(runId, heldOutCaseId, 0, "PASSED",
+                null, now);
+        appendDistributionOracle(successId, "CROSS_CUSTOMER", "ATTACK_SUCCESS",
+                "UNAUTHORIZED_RECORD_RETURNED", "INV-01");
+        appendDistributionOracle(successId, "SENSITIVE_FIELD", "INCONCLUSIVE",
+                "EVIDENCE_INCOMPLETE", "INV-02");
+        appendDistributionOracle(blockedId, "CROSS_CUSTOMER", "ATTACK_BLOCKED",
+                "POLICY_DENIED_BEFORE_API", "INV-01");
+        appendDistributionOracle(mutationIncompleteId, "CROSS_CUSTOMER", "INCONCLUSIVE",
+                "EVIDENCE_INCOMPLETE", "INV-01");
+        appendDistributionOracle(heldOutIncompleteId, "CROSS_CUSTOMER", "INCONCLUSIVE",
+                "EVIDENCE_INCOMPLETE", "INV-01");
+
+        jdbcTemplate.update("insert into run_event_counters (run_id, last_sequence) values (?, 0)", runId);
+        UUID traceId = UUID.randomUUID();
+        eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                null, traceId, ExecutionEventType.RUN_STARTED,
+                null, null, null, null, "RUN_STARTED", objectMapper.createObjectNode()
+        ), "test");
+        jdbcTemplate.update("update test_runs set status = 'PREPARING', updated_at = ? where id = ?",
+                Timestamp.from(now), runId);
+        jdbcTemplate.update("update test_runs set status = 'RUNNING', started_at = ?, updated_at = ? where id = ?",
+                Timestamp.from(now), Timestamp.from(now), runId);
+        eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                null, traceId, ExecutionEventType.RUN_COMPLETED,
+                null, null, null, null, "RUN_COMPLETED", objectMapper.createObjectNode()
+        ), "test");
+        Instant completedAt = now.plusSeconds(3);
+        jdbcTemplate.update("""
+                update test_runs set status = 'COMPLETED', completed_cases = 4,
+                       operational_error_count = 0, completed_at = ?, updated_at = ? where id = ?
+                """, Timestamp.from(completedAt), Timestamp.from(completedAt), runId);
+        return runId;
+    }
+
+    private UUID copyBreakdownCase(UUID baselineCaseId, UUID suiteId, String caseKey,
+                                   String partition, Instant now) {
+        UUID caseId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                insert into test_cases
+                    (id, suite_id, case_key, case_type, partition_name, category, severity,
+                     delivery_channel, target_tool, attack_goal, payload_hash, preconditions_json,
+                     expected_invariant, oracle_type, generation_source, hidden_from_patch_generator,
+                     expected_result_json, trial_policy_json, created_at, updated_at)
+                select ?, ?, ?, case_type, ?, category, severity,
+                       delivery_channel, target_tool, attack_goal, payload_hash, preconditions_json,
+                       expected_invariant, oracle_type, generation_source, ?,
+                       expected_result_json, trial_policy_json, ?, ?
+                  from test_cases where id = ?
+                """, caseId, suiteId, caseKey, partition,
+                "HELD_OUT".equals(partition), Timestamp.from(now), Timestamp.from(now), baselineCaseId);
+        return caseId;
+    }
+
+    private UUID addBreakdownCaseRun(UUID runId, UUID caseId, int trialIndex,
+                                     String status, String securityOutcome, Instant now) {
+        UUID caseRunId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                insert into test_case_runs
+                    (id, test_run_id, test_case_id, trial_index, status, variant_hash,
+                     result_json, created_at, updated_at)
+                values (?, ?, ?, ?, 'PENDING', ?, '{}'::jsonb, ?, ?)
+                """, caseRunId, runId, caseId, trialIndex, HASH_A,
+                Timestamp.from(now), Timestamp.from(now));
+        jdbcTemplate.update("""
+                update test_case_runs
+                   set status = ?, security_outcome = ?, started_at = ?,
+                       completed_at = ?, updated_at = ? where id = ?
+                """, status, securityOutcome, Timestamp.from(now.minusSeconds(1)),
+                Timestamp.from(now), Timestamp.from(now), caseRunId);
+        return caseRunId;
     }
 
     private PlannedRun seedDistributionRun(UUID baselineRunId) {
