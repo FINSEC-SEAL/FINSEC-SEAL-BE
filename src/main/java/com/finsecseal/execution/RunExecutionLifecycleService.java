@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.UUID;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ArrayNode;
@@ -40,6 +41,51 @@ public class RunExecutionLifecycleService {
         this.fixtureService = fixtureService;
         this.eventService = eventService;
         this.runPersistenceService = runPersistenceService;
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void rejectScheduling(UUID runId, UUID traceId, String actorId) {
+        TestRunStatus status = lockRunStatus(runId);
+        if (status.isTerminal()) {
+            return;
+        }
+        if (status != TestRunStatus.QUEUED) {
+            throw new BusinessException(ErrorCode.INVALID_STATE_TRANSITION,
+                    "Only a QUEUED TestRun can be failed for scheduling rejection");
+        }
+        RunCounts counts = readRunCounts(runId);
+        if (counts.materializedCases() != 0) {
+            throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE,
+                    "A TestRun with materialized cases cannot be failed for scheduling rejection");
+        }
+
+        ensureRunStartedForFailure(runId, traceId, actorId);
+        ObjectNode metadata = objectMapper.createObjectNode();
+        metadata.put("schemaVersion", "1.0");
+        metadata.put("dispatchStatus", "REJECTED");
+        metadata.put("materializedCases", 0);
+        metadata.put("completedCases", 0);
+        metadata.put("operationalErrorCount", 0);
+        eventService.append(
+                runId,
+                new ExecutionEventDto.AppendRequest(
+                        null,
+                        traceId,
+                        ExecutionEventType.RUN_FAILED,
+                        null,
+                        null,
+                        null,
+                        null,
+                        "EXECUTOR_REJECTED",
+                        metadata
+                ),
+                actorId
+        );
+        runPersistenceService.updateStatus(
+                runId,
+                new TestRunPersistenceDto.StatusRequest(TestRunStatus.FAILED, 0, 0, metadata),
+                actorId
+        );
     }
 
     @Transactional
