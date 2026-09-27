@@ -3,11 +3,15 @@ package com.finsecseal;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.finsecseal.attestation.AttestationService;
+import com.finsecseal.release.CanonicalJsonService;
+import com.finsecseal.release.DigestService;
 import java.io.InputStream;
 import java.security.MessageDigest;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.HexFormat;
 import java.util.UUID;
 import org.flywaydb.core.Flyway;
@@ -16,6 +20,8 @@ import org.junit.jupiter.api.Test;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ObjectNode;
 
 @Testcontainers
 class FlywayUpgradeIntegrationTest {
@@ -35,15 +41,17 @@ class FlywayUpgradeIntegrationTest {
         assertThat(throughV9.migrate().migrationsExecuted).isEqualTo(9);
         assertThat(appliedVersionCount()).isEqualTo(9);
         UUID legacyNamespace = insertLegacyDocument();
+        LegacyAttestation legacyPass = insertLegacyPassAttestation(legacyNamespace);
 
         Flyway current = flyway(null);
-        assertThat(current.migrate().migrationsExecuted).isEqualTo(11);
-        assertThat(appliedVersionCount()).isEqualTo(20);
+        assertThat(current.migrate().migrationsExecuted).isEqualTo(12);
+        assertThat(appliedVersionCount()).isEqualTo(21);
         assertThat(current.validateWithResult().validationSuccessful).isTrue();
-        assertThat(current.info().current().getVersion()).isEqualTo(MigrationVersion.fromVersion("17"));
+        assertThat(current.info().current().getVersion()).isEqualTo(MigrationVersion.fromVersion("18"));
         verifyDocumentSourceTimestamp(legacyNamespace);
         verifyReviewerSessionRevocationSchema();
         verifyRunReviewerGrantSchemaWithoutBackfill(legacyNamespace);
+        verifyGcProjectionGuardAndLegacyPassWithoutBackfill(legacyPass);
 
         UUID leaseId = UUID.randomUUID();
         Instant now = Instant.now();
@@ -108,6 +116,132 @@ class FlywayUpgradeIntegrationTest {
                     """, run, hash);
         }
         return run;
+    }
+
+    private LegacyAttestation insertLegacyPassAttestation(UUID legacyRun) throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        UUID decisionId = UUID.randomUUID();
+        UUID attestationId = UUID.randomUUID();
+        String hash = "sha256:" + "a".repeat(64);
+        Instant confirmedAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        try (var connection = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+             var releaseQuery = connection.prepareStatement("select release_id from test_runs where id = ?")) {
+            releaseQuery.setObject(1, legacyRun);
+            UUID releaseId;
+            try (var releases = releaseQuery.executeQuery()) {
+                assertThat(releases.next()).isTrue();
+                releaseId = releases.getObject(1, UUID.class);
+            }
+
+            ObjectNode snapshot = mapper.createObjectNode();
+            snapshot.putObject("agent").put("id", UUID.randomUUID().toString());
+            snapshot.putObject("release").put("id", releaseId.toString());
+            snapshot.putObject("model").put("name", "historical-model");
+            snapshot.put("systemPromptFingerprint", hash);
+            snapshot.put("toolSetFingerprint", hash);
+            snapshot.putArray("toolSchemaFingerprints");
+            snapshot.put("ragConfigurationFingerprint", hash);
+            snapshot.putObject("safetyContract").put("status", "N_A");
+            snapshot.putObject("testSuite").put("status", "N_A");
+            snapshot.putObject("sandbox").put("status", "N_A");
+            snapshot.putObject("results").put("status", "N_A");
+            snapshot.putArray("metrics");
+            snapshot.putArray("remainingFindings");
+            snapshot.putNull("approvedPatch");
+            snapshot.putObject("decision").putArray("ruleTrace");
+            snapshot.put("testedAt", confirmedAt.toString());
+            String inputDigest = new DigestService().sha256(new CanonicalJsonService(mapper).canonicalize(snapshot));
+
+            ObjectNode document = snapshot.deepCopy();
+            document.put("schemaVersion", "1.0");
+            document.put("attestationType", "FINSEC_SEAL_INTERNAL_RELEASE_ATTESTATION");
+            document.put("canonicalizationVersion", CanonicalJsonService.VERSION);
+            document.putObject("decision")
+                    .put("id", decisionId.toString()).put("value", "PASS")
+                    .put("gatePolicyVersion", "mvp-gate/1")
+                    .put("inputDigest", inputDigest)
+                    .put("proposedAt", confirmedAt.minusSeconds(1).toString())
+                    .put("confirmedAt", confirmedAt.toString())
+                    .putArray("ruleTrace");
+            document.putObject("reviewer")
+                    .put("actorId", "historical-reviewer")
+                    .put("role", "AI_GOVERNANCE_REVIEWER")
+                    .put("demoMode", true);
+            document.putArray("revalidationTriggers")
+                    .add("MODEL_CHANGE").add("SYSTEM_PROMPT_CHANGE")
+                    .add("TOOL_SET_OR_SCHEMA_OR_DESCRIPTION_CHANGE").add("RAG_CHANGE")
+                    .add("SAFETY_CONTRACT_CHANGE").add("BUSINESS_PURPOSE_OR_CONTEXT_CHANGE");
+            document.putObject("disclaimer")
+                    .put("version", AttestationService.DISCLAIMER_VERSION)
+                    .put("ko", AttestationService.DISCLAIMER_KO)
+                    .put("en", AttestationService.DISCLAIMER_EN);
+            document.put("generatedAt", confirmedAt.toString());
+            String documentHash = new DigestService().sha256(new CanonicalJsonService(mapper).canonicalize(document));
+            String html = "<html><body>%s %s %s PASS %s</body></html>".formatted(
+                    AttestationService.DISCLAIMER_KO, AttestationService.DISCLAIMER_EN,
+                    releaseId, documentHash);
+
+            execute(connection, """
+                    insert into release_decisions
+                        (id, release_id, decision, gate_policy_version, input_snapshot_json, input_digest,
+                         proposed_at, confirmed_by, confirmed_at)
+                    values (?, ?, 'PASS', 'mvp-gate/1', ?::jsonb, ?, ?, 'historical-reviewer', ?)
+                    """, decisionId, releaseId, mapper.writeValueAsString(snapshot), inputDigest,
+                    java.sql.Timestamp.from(confirmedAt.minusSeconds(1)), java.sql.Timestamp.from(confirmedAt));
+            execute(connection, """
+                    insert into release_attestations
+                        (id, release_decision_id, format_version, document_json, document_hash,
+                         html_content, generated_at, disclaimer_version)
+                    values (?, ?, '1.0', ?::jsonb, ?, ?, ?, 'finsec-internal/v1')
+                    """, attestationId, decisionId, mapper.writeValueAsString(document), documentHash, html,
+                    java.sql.Timestamp.from(confirmedAt));
+            return new LegacyAttestation(attestationId, decisionId, mapper.writeValueAsString(document),
+                    documentHash, html);
+        }
+    }
+
+    private void verifyGcProjectionGuardAndLegacyPassWithoutBackfill(LegacyAttestation legacy) throws Exception {
+        try (var connection = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+             var guard = connection.prepareStatement("""
+                     select tgenabled from pg_trigger
+                      where tgrelid = 'release_attestations'::regclass
+                        and tgname = 'release_attestation_zz_gc_coverage_guard'
+                     """);
+             var query = connection.prepareStatement("""
+                     select document_json::text, document_hash, html_content
+                       from release_attestations where id = ? and release_decision_id = ?
+                     """)) {
+            try (var triggers = guard.executeQuery()) {
+                assertThat(triggers.next()).isTrue();
+                assertThat(triggers.getString(1)).isEqualTo("O");
+                assertThat(triggers.next()).isFalse();
+            }
+            query.setObject(1, legacy.id());
+            query.setObject(2, legacy.decisionId());
+            try (var attestations = query.executeQuery()) {
+                assertThat(attestations.next()).isTrue();
+                assertThat(new ObjectMapper().readTree(attestations.getString(1)))
+                        .isEqualTo(new ObjectMapper().readTree(legacy.document()));
+                assertThat(attestations.getString(2)).isEqualTo(legacy.hash());
+                assertThat(attestations.getString(3)).isEqualTo(legacy.html());
+                assertThat(attestations.next()).isFalse();
+            }
+            try (var audit = connection.prepareStatement("""
+                    select count(*) from audit_records
+                     where resource_type = 'RELEASE_ATTESTATION' and resource_id = ?
+                    """)) {
+                audit.setObject(1, legacy.id());
+                try (var rows = audit.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getInt(1)).isZero();
+                }
+            }
+        }
+    }
+
+    private record LegacyAttestation(UUID id, UUID decisionId, String document, String hash, String html) {
     }
 
     private void verifyDocumentSourceTimestamp(UUID namespace) throws SQLException {
