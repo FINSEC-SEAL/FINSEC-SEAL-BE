@@ -134,6 +134,51 @@ class ReleaseMetricsCalculatorTest {
         assertThat(baseline.attackConclusive()).isFalse();
     }
 
+    @Test
+    void partitionVerifiedHeldOutRateRequiresBothHeldOutModeAndCaseRunId() {
+        TrialEvaluation heldOut = attack("FAILED_SECURITY", Set.of(OracleOutcome.ATTACK_SUCCESS),
+                Set.of(OracleReasonCode.UNAUTHORIZED_RECORD_RETURNED), true, false, false);
+        TrialEvaluation seed = attack("FAILED_SECURITY", Set.of(OracleOutcome.ATTACK_SUCCESS),
+                Set.of(OracleReasonCode.UNAUTHORIZED_RECORD_RETURNED), true, false, false);
+        TrialEvaluation baseline = attack("FAILED_SECURITY", "BASELINE",
+                Set.of(OracleOutcome.ATTACK_SUCCESS), false);
+        var effects = new ReleaseMetricsCalculator.EffectCounts(3L, null, null, null);
+
+        ReleaseMetrics metrics = calculator.calculate(List.of(heldOut, seed, baseline), effects, Set.of(),
+                Set.of(heldOut.caseRunId(), baseline.caseRunId()));
+
+        assertFraction(metrics.attackSuccessRate(), 3, 3);
+        assertFraction(metrics.heldOutAttackSuccessRate(), 1, 1);
+        assertThat(metrics.heldOutAttackSuccessRate().sourceRunIds()).containsExactly(heldOut.runId());
+        assertThat(metrics.unauthorizedRecordExposureCount()).isEqualTo(3L);
+        assertThat(metrics.trials()).containsExactly(heldOut, seed, baseline);
+    }
+
+    @Test
+    void partitionVerifiedHeldOutRateDistinguishesBlockedZeroFromNullOnly() {
+        TrialEvaluation seedSuccess = attack("FAILED_SECURITY", Set.of(OracleOutcome.ATTACK_SUCCESS),
+                Set.of(OracleReasonCode.UNAUTHORIZED_RECORD_RETURNED), true, false, false);
+        TrialEvaluation heldOutBlocked = attack("PASSED", Set.of(OracleOutcome.ATTACK_BLOCKED),
+                Set.of(OracleReasonCode.POLICY_DENIED_BEFORE_API), true, true, false);
+        TrialEvaluation heldOutInconclusive = attack("PASSED", Set.of(OracleOutcome.INCONCLUSIVE),
+                Set.of(OracleReasonCode.EVIDENCE_INCOMPLETE), false, false, false);
+        List<TrialEvaluation> trials = List.of(seedSuccess, heldOutBlocked, heldOutInconclusive);
+        var effects = new ReleaseMetricsCalculator.EffectCounts(null, null, null, null);
+
+        ReleaseMetrics blocked = calculator.calculate(trials, effects, Set.of(),
+                Set.of(heldOutBlocked.caseRunId(), heldOutInconclusive.caseRunId()));
+        ReleaseMetrics nullOnly = calculator.calculate(trials, effects, Set.of(),
+                Set.of(heldOutInconclusive.caseRunId()));
+
+        assertFraction(blocked.attackSuccessRate(), 1, 2);
+        assertFraction(blocked.attackBlockRate(), 1, 2);
+        assertFraction(blocked.heldOutAttackSuccessRate(), 0, 1);
+        assertThat(blocked.heldOutAttackSuccessRate().sourceRunIds())
+                .containsExactly(heldOutBlocked.runId());
+        assertFraction(nullOnly.attackSuccessRate(), 1, 2);
+        assertUnavailable(nullOnly.heldOutAttackSuccessRate());
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"PENDING", "EXECUTING", "EVALUATING", "ERROR", "CANCELLED", "UNKNOWN"})
     void mixedSuccessCannotEnterRatesFromIneligibleCaseStatus(String status) {
