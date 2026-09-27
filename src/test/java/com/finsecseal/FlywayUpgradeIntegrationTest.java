@@ -37,10 +37,10 @@ class FlywayUpgradeIntegrationTest {
         UUID legacyNamespace = insertLegacyDocument();
 
         Flyway current = flyway(null);
-        assertThat(current.migrate().migrationsExecuted).isEqualTo(9);
-        assertThat(appliedVersionCount()).isEqualTo(18);
+        assertThat(current.migrate().migrationsExecuted).isEqualTo(10);
+        assertThat(appliedVersionCount()).isEqualTo(19);
         assertThat(current.validateWithResult().validationSuccessful).isTrue();
-        assertThat(current.info().current().getVersion()).isEqualTo(MigrationVersion.fromVersion("15"));
+        assertThat(current.info().current().getVersion()).isEqualTo(MigrationVersion.fromVersion("16"));
         verifyDocumentSourceTimestamp(legacyNamespace);
         verifyReviewerSessionRevocationSchema();
 

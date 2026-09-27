@@ -270,6 +270,137 @@ class ContractPersistenceIntegrationTest {
                 Map.of("Cookie", cookie + "x", "X-Contract-Reviewer-Key", KEY)).statusCode()).isEqualTo(200);
     }
 
+    @Test void proposalRejectionRequiresTrustedReviewerBeforeIdempotencyReservation() throws Exception {
+        UUID proposalId=UUID.randomUUID();
+        String path="/api/v1/patch-proposals/"+proposalId+":reject";
+        String body="{\"comment\":\"review\"}";
+        String key=UUID.randomUUID().toString();
+        assertThat(post(path,body,key,"wrong",null).statusCode()).isEqualTo(403);
+        assertThat(post(path,body,key,KEY,"forged-actor").statusCode()).isEqualTo(403);
+        assertThat(post("/api/v1/%70atch-proposals/"+proposalId+":reject",body,key,KEY,null).statusCode()).isEqualTo(400);
+        assertThat(post("/api/v1/patch-proposals/"+proposalId+";bad:reject",body,key,KEY,null).statusCode()).isEqualTo(400);
+        assertThat(db.queryForObject("select count(*) from api_idempotency_records where idempotency_key=?",Integer.class,key)).isZero();
+
+        var issued=api("GET","/api/v1/reviewer-session",null,Map.of("X-Contract-Reviewer-Key",KEY));
+        String cookie=issued.headers().firstValue("Set-Cookie").orElseThrow().split(";",2)[0];
+        String csrf=json.readTree(issued.body()).at("/data/csrfToken").stringValue();
+        assertThat(api("POST",path,body,Map.of("Cookie",cookie,"Idempotency-Key",key)).statusCode()).isEqualTo(403);
+        assertThat(api("POST",path,body,Map.of("Cookie",cookie,"X-CSRF-Token","wrong","Idempotency-Key",key)).statusCode()).isEqualTo(403);
+        assertThat(api("POST",path,body,Map.of("Cookie",expiredReviewerCookie(),"X-CSRF-Token",csrf,
+                "Idempotency-Key",key)).statusCode()).isEqualTo(403);
+        assertThat(db.queryForObject("select count(*) from api_idempotency_records where idempotency_key=?",Integer.class,key)).isZero();
+        String sessionId=json.readTree(issued.body()).at("/data/sessionId").stringValue();
+        assertThat(api("DELETE","/api/v1/reviewer-session/"+sessionId,null,
+                Map.of("Cookie",cookie,"X-CSRF-Token",csrf,"Idempotency-Key",UUID.randomUUID().toString())).statusCode()).isEqualTo(204);
+        assertThat(api("POST",path,body,Map.of("Cookie",cookie,"X-CSRF-Token",csrf,"Idempotency-Key",key)).statusCode()).isEqualTo(403);
+        assertThat(db.queryForObject("select count(*) from api_idempotency_records where idempotency_key=?",Integer.class,key)).isZero();
+    }
+
+    @Test void proposalRejectionReturnsBoundedStateAndReplaysOnlyTheSameAuthorizedRequest() throws Exception {
+        UUID proposalId=pendingProposal();
+        String path="/api/v1/patch-proposals/"+proposalId+":reject";
+        String body="{\"comment\":\"Reviewed patch risk\"}";
+        String key=UUID.randomUUID().toString();
+        var headers=Map.of("X-Contract-Reviewer-Key",KEY,"Idempotency-Key",key);
+        var first=api("POST",path,body,headers);
+        assertThat(first.statusCode()).withFailMessage(first.body()).isEqualTo(200);
+        var value=json.readTree(first.body()).path("data");
+        assertThat(value.properties().stream().map(Map.Entry::getKey).toList())
+                .containsExactlyInAnyOrder("id","findingId","baseContractVersionId","state","decidedAt");
+        assertThat(value.path("id").stringValue()).isEqualTo(proposalId.toString());
+        assertThat(value.path("state").stringValue()).isEqualTo("REJECTED");
+        assertThat(first.body()).doesNotContain("Reviewed patch risk","recommendedRule","policyDiff","validation");
+        var replay=api("POST",path,body,headers);
+        assertThat(replay.statusCode()).isEqualTo(200);
+        assertThat(replay.body()).isEqualTo(first.body());
+        assertThat(replay.headers().firstValue("Idempotent-Replayed")).contains("true");
+        assertThat(db.queryForObject("select count(*) from patch_approvals where patch_proposal_id=?",Integer.class,proposalId)).isEqualTo(1);
+        assertThat(api("POST",path,"{\"comment\":\"other\"}",headers).statusCode()).isEqualTo(409);
+        assertThat(api("POST",path,body,Map.of("X-Contract-Reviewer-Key",KEY,
+                "Idempotency-Key",UUID.randomUUID().toString())).statusCode()).isEqualTo(409);
+        assertThat(api("POST","/api/v1/patch-proposals/"+UUID.randomUUID()+":reject",body,
+                Map.of("X-Contract-Reviewer-Key",KEY)).statusCode()).isEqualTo(404);
+        var missingKey=HttpRequest.newBuilder(URI.create("http://localhost:"+port+path))
+                .header("Content-Type","application/json").header("X-Contract-Reviewer-Key",KEY)
+                .POST(HttpRequest.BodyPublishers.ofString(body)).build();
+        assertThat(HttpClient.newHttpClient().send(missingKey,HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(400);
+        for(String invalid:List.of("{}","{\"comment\":\"review\",\"role\":\"AI_SECURITY_REVIEWER\"}",
+                "{\"comment\":\"review\",\"workspaceId\":\""+reviewer.workspaceId()+"\"}","{\"comment\":\"  \"}")) {
+            assertThat(api("POST",path,invalid,Map.of("X-Contract-Reviewer-Key",KEY)).statusCode()).isEqualTo(400);
+        }
+
+        UUID cookieProposal=pendingProposal();
+        var issued=api("GET","/api/v1/reviewer-session",null,Map.of("X-Contract-Reviewer-Key",KEY));
+        String cookie=issued.headers().firstValue("Set-Cookie").orElseThrow().split(";",2)[0];
+        String csrf=json.readTree(issued.body()).at("/data/csrfToken").stringValue();
+        var cookieResult=api("POST","/api/v1/patch-proposals/"+cookieProposal+":reject",body,
+                Map.of("Cookie",cookie,"X-CSRF-Token",csrf,"Idempotency-Key",UUID.randomUUID().toString()));
+        assertThat(cookieResult.statusCode()).withFailMessage(cookieResult.body()).isEqualTo(200);
+        assertThat(json.readTree(cookieResult.body()).at("/data/id").stringValue()).isEqualTo(cookieProposal.toString());
+    }
+
+    private UUID pendingProposal() throws Exception {
+        UUID releaseId=release();
+        var base=service.create(releaseId,fixture("loan-review-safety-contract.json"),reviewer);
+        var release=releases.find(releaseId);
+        String hash="sha256:"+"a".repeat(64);
+        UUID suite=UUID.randomUUID(),testCase=UUID.randomUUID(),run=UUID.randomUUID();
+        UUID caseRun=UUID.randomUUID(),oracle=UUID.randomUUID(),finding=UUID.randomUUID(),proposal=UUID.randomUUID();
+        String suffix=UUID.randomUUID().toString().substring(0,8);
+        db.update("""
+            insert into test_suites(id,workspace_id,suite_key,version,fixture_version,generation_config_json,suite_hash,status)
+            values(?,?,?,'1.0','fixture-v1','{}',?,'DRAFT')
+            """,suite,reviewer.workspaceId(),"patch-http-"+suffix,hash);
+        db.update("""
+            insert into test_cases(id,suite_id,case_key,case_type,partition_name,category,severity,delivery_channel,
+                target_tool,attack_goal,payload_hash,preconditions_json,expected_invariant,oracle_type,generation_source,
+                hidden_from_patch_generator,expected_result_json,trial_policy_json)
+            values(?,?,'FA-02','ATTACK','SEED','FA-02','CRITICAL','DOCUMENT','CUSTOMER_DATA_READ','cross customer read',
+                ?,'{}','INV-01','CROSS_CUSTOMER','GOLDEN',false,'{}','{}')
+            """,testCase,suite,hash);
+        db.update("update test_suites set status='READY' where id=?",suite);
+        db.update("""
+            insert into test_runs(id,release_id,suite_id,mode,status,agent_artifact_fingerprint,release_fingerprint,
+                config_json,fixture_version,fixture_digest,model_config_hash,total_cases)
+            values(?,?,?,'BASELINE','RUNNING',?,?,'{}','fixture-v1',?,?,1)
+            """,run,releaseId,suite,release.agentArtifactFingerprint(),release.releaseFingerprint(),hash,hash);
+        db.update("""
+            insert into test_case_runs(id,test_run_id,test_case_id,trial_index,status,security_outcome,variant_hash,
+                started_at,completed_at,result_json)
+            values(?,?,?,0,'FAILED_SECURITY','ATTACK_SUCCESS',?,now(),now(),'{}')
+            """,caseRun,run,testCase,hash);
+        db.update("""
+            insert into oracle_results(id,test_case_run_id,oracle_type,oracle_version,outcome,reason_code,invariant_id,
+                evidence_json,evidence_digest,evaluated_at)
+            values(?,?,'CROSS_CUSTOMER','1.0','ATTACK_SUCCESS','UNAUTHORIZED_RECORD_RETURNED','INV-01','{}',?,now())
+            """,oracle,caseRun,hash);
+        db.update("""
+            insert into findings(id,release_id,source_oracle_result_id,category,severity,title,status,violated_invariant,
+                root_cause_json,first_seen_run_id,latest_seen_run_id)
+            values(?,?,?,'FA-02','CRITICAL','Unauthorized customer record returned','OPEN','INV-01','{}',?,?)
+            """,finding,releaseId,oracle,run,run);
+        db.update("""
+            insert into patch_proposals(id,finding_id,base_contract_version_id,state,root_cause,recommended_rule_json,
+                policy_diff_json,normal_workflow_impact_json,rollback_json,generation_model_meta_json,validation_json)
+            values(?,?,?,'PROPOSED','Excessive scope','{}','[]','{}','{}','{}','{}')
+            """,proposal,finding,base.id());
+        return proposal;
+    }
+
+    private String expiredReviewerCookie() {
+        try {
+            var payload=json.createObjectNode().put("sessionId",UUID.randomUUID().toString()).put("csrf","expired")
+                    .put("expires",java.time.Instant.now().minusSeconds(60).getEpochSecond())
+                    .put("actor",reviewer.actorId()).put("workspace",reviewer.workspaceId().toString());
+            String encoded=Base64.getUrlEncoder().withoutPadding().encodeToString(json.writeValueAsBytes(payload));
+            var mac=javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new javax.crypto.spec.SecretKeySpec(KEY.getBytes(java.nio.charset.StandardCharsets.UTF_8),"HmacSHA256"));
+            String signature=Base64.getUrlEncoder().withoutPadding().encodeToString(mac.doFinal(
+                    ("FINSEC_REVIEWER_SESSION_V1:"+encoded).getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+            return ContractReviewerCredentials.COOKIE+"="+encoded+"."+signature;
+        } catch (java.security.GeneralSecurityException exception) {throw new IllegalStateException(exception);}
+    }
+
     private HttpResponse<String> api(String method,String path,String body,Map<String,String> headers) throws Exception {
         var builder=HttpRequest.newBuilder(URI.create("http://localhost:"+port+path));
         headers.forEach(builder::header);
