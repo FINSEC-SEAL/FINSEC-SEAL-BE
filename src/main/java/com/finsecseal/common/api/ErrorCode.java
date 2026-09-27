@@ -9,6 +9,7 @@ public enum ErrorCode {
     RELEASE_CHANGED(HttpStatus.CONFLICT, false),
     INVALID_STATE_TRANSITION(HttpStatus.CONFLICT, false),
     EVIDENCE_INCOMPLETE(HttpStatus.CONFLICT, false),
+    EXECUTION_EVENT_INGEST_FORBIDDEN(HttpStatus.FORBIDDEN, false),
     SECRET_DETECTED(HttpStatus.UNPROCESSABLE_CONTENT, false),
     STREAM_CURSOR_EXPIRED(HttpStatus.GONE, true),
     IDEMPOTENCY_CONFLICT(HttpStatus.CONFLICT, false),

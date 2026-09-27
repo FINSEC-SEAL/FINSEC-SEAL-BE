@@ -125,7 +125,50 @@ class ContractPersistenceIntegrationTest {
         }
         var unauthenticated=HttpRequest.newBuilder(URI.create("http://localhost:"+port+"/api/v1/platform/contracts?releaseId="+UUID.randomUUID()))
                 .header("Origin","http://localhost:5173").GET().build();
-        assertThat(HttpClient.newHttpClient().send(unauthenticated,HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(403);
+        var denied=HttpClient.newHttpClient().send(unauthenticated,HttpResponse.BodyHandlers.ofString());
+        assertThat(denied.statusCode()).isEqualTo(403);
+        assertAllowedCors(denied);
+    }
+    @Test void preservesCorsForAuthenticationAndIdempotencyFailuresWithoutReservingRequests() throws Exception {
+        String path="/api/v1/platform/contracts";
+        String key=UUID.randomUUID().toString();
+        var denied=api("POST",path,"{}",Map.of("Origin","http://localhost:5173",
+                "Idempotency-Key",key,"X-Contract-Reviewer-Key","wrong"));
+        assertThat(denied.statusCode()).isEqualTo(403);
+        assertThat(json.readTree(denied.body()).path("code").stringValue()).isEqualTo("CONTRACT_AUTH_REQUIRED");
+        assertAllowedCors(denied);
+        assertThat(db.queryForObject("select count(*) from api_idempotency_records where idempotency_key=?",Integer.class,key)).isZero();
+
+        var invalidKey=api("POST",path,"{}",Map.of("Origin","http://localhost:5173",
+                "Idempotency-Key","invalid key","X-Contract-Reviewer-Key",KEY));
+        assertThat(invalidKey.statusCode()).isEqualTo(400);
+        assertThat(json.readTree(invalidKey.body()).path("code").stringValue()).isEqualTo("VALIDATION_ERROR");
+        assertAllowedCors(invalidKey);
+    }
+    @Test void rechecksOriginBeforeReturningAnIdempotentContractResponse() throws Exception {
+        UUID release=release();
+        String path="/api/v1/platform/contracts";
+        String key=UUID.randomUUID().toString();
+        String body=json.createObjectNode().put("releaseId",release.toString())
+                .set("policy",fixture("loan-review-safety-contract.json")).toString();
+        var headers=Map.of("Origin","http://localhost:5173","Idempotency-Key",key,"X-Contract-Reviewer-Key",KEY);
+        var first=api("POST",path,body,headers);
+        assertThat(first.statusCode()).withFailMessage(first.body()).isEqualTo(201);
+        assertAllowedCors(first);
+
+        var untrusted=api("POST",path,body,Map.of("Origin","https://untrusted.invalid",
+                "Idempotency-Key",key,"X-Contract-Reviewer-Key",KEY));
+        assertThat(untrusted.statusCode()).isEqualTo(403);
+        assertThat(untrusted.headers().firstValue("Access-Control-Allow-Origin")).isEmpty();
+        assertThat(untrusted.headers().firstValue("Idempotent-Replayed")).isEmpty();
+        assertThat(untrusted.body()).doesNotContain("policyHash","resourceHash");
+
+        var replay=api("POST",path,body,headers);
+        assertThat(replay.statusCode()).isEqualTo(201);
+        assertThat(replay.body()).isEqualTo(first.body());
+        assertThat(replay.headers().firstValue("Idempotent-Replayed")).contains("true");
+        assertAllowedCors(replay);
+        assertThat(db.queryForObject("select count(*) from safety_contract_versions v join safety_contracts c on c.id=v.contract_id where c.release_id=?",Integer.class,release)).isEqualTo(1);
     }
     @Test void specificationPathsReturnValidationResultAndContractScopedHistory() throws Exception {
         UUID release=release();
@@ -200,6 +243,82 @@ class ContractPersistenceIntegrationTest {
         assertThat(api("POST",path+":validate","{}",Map.of("Cookie",cookie,"If-Match",etag(c),"Idempotency-Key",idem,"X-CSRF-Token","wrong")).statusCode()).isEqualTo(403);
         var restored=api("GET","/api/v1/reviewer-session",null,Map.of("Cookie",cookie));
         assertThat(json.readTree(restored.body()).at("/data/csrfToken").stringValue()).isEqualTo(csrf);
+    }
+
+    @Test void runStartRequiresCurrentSignedReviewerBeforeIdempotency() throws Exception {
+        String path="/api/v1/test-runs";
+        String body="{}";
+        String key="run-start-"+UUID.randomUUID();
+        int runsBefore=db.queryForObject("select count(*) from test_runs",Integer.class);
+        int grantsBefore=db.queryForObject("select count(*) from test_run_reviewer_grants",Integer.class);
+        int auditsBefore=db.queryForObject("select count(*) from audit_records",Integer.class);
+        var issued=api("GET","/api/v1/reviewer-session",null,Map.of("X-Contract-Reviewer-Key",KEY));
+        assertThat(issued.statusCode()).isEqualTo(200);
+        var data=json.readTree(issued.body()).path("data");
+        String cookie=issued.headers().firstValue("Set-Cookie").orElseThrow().split(";",2)[0];
+        String csrf=data.path("csrfToken").stringValue();
+        String sessionId=data.path("sessionId").stringValue();
+
+        assertThat(api("POST",path,body,Map.of("Idempotency-Key",key)).statusCode()).isEqualTo(403);
+        assertThat(api("POST",path,body,Map.of("Idempotency-Key",key,
+                "X-Contract-Reviewer-Key",KEY)).statusCode()).isEqualTo(403);
+        assertThat(api("POST",path,body,Map.of("Idempotency-Key",key,"Cookie",cookie+"x",
+                "X-Contract-Reviewer-Key",KEY,"X-CSRF-Token",csrf)).statusCode()).isEqualTo(403);
+        assertThat(api("POST",path,body,Map.of("Idempotency-Key",key,"Cookie",expiredReviewerCookie(),
+                "X-CSRF-Token",csrf)).statusCode()).isEqualTo(403);
+        assertThat(api("POST",path,body,Map.of("Idempotency-Key",key,"Cookie",cookie)).statusCode())
+                .isEqualTo(403);
+        assertThat(api("POST",path,body,Map.of("Idempotency-Key",key,"Cookie",cookie,
+                "X-CSRF-Token","wrong")).statusCode()).isEqualTo(403);
+        assertThat(api("POST",path,body,Map.of("Idempotency-Key",key,"Cookie",cookie,
+                "X-CSRF-Token",csrf,"X-Actor-Id","forged-actor")).statusCode()).isEqualTo(403);
+        assertThat(api("POST","/api/v1/%74est-runs",body,Map.of("Idempotency-Key",key,"Cookie",cookie,
+                "X-CSRF-Token",csrf)).statusCode()).isEqualTo(400);
+        assertThat(api("POST",path+";probe=1",body,Map.of("Idempotency-Key",key,"Cookie",cookie,
+                "X-CSRF-Token",csrf)).statusCode()).isEqualTo(400);
+        assertThat(api("POST",path+"/",body,Map.of("Idempotency-Key",key,"Cookie",cookie,
+                "X-CSRF-Token",csrf)).statusCode()).isEqualTo(400);
+        assertThat(db.queryForObject("select count(*) from api_idempotency_records where idempotency_key=?",
+                Integer.class,key)).isZero();
+        assertThat(db.queryForObject("select count(*) from test_runs",Integer.class)).isEqualTo(runsBefore);
+        assertThat(db.queryForObject("select count(*) from test_run_reviewer_grants",Integer.class))
+                .isEqualTo(grantsBefore);
+        assertThat(db.queryForObject("select count(*) from audit_records",Integer.class)).isEqualTo(auditsBefore);
+
+        var missingKey=HttpClient.newHttpClient().send(HttpRequest.newBuilder(
+                URI.create("http://localhost:"+port+path)).header("Content-Type","application/json")
+                .header("Cookie",cookie).header("X-CSRF-Token",csrf)
+                .POST(HttpRequest.BodyPublishers.ofString(body)).build(),HttpResponse.BodyHandlers.ofString());
+        assertThat(missingKey.statusCode()).isEqualTo(400);
+        var admitted=api("POST",path,body,Map.of("Idempotency-Key",key,"Cookie",cookie,
+                "X-CSRF-Token",csrf,"X-Actor-Id",data.path("actorId").stringValue()));
+        assertThat(admitted.statusCode()).withFailMessage(admitted.body()).isEqualTo(400);
+        assertThat(db.queryForObject("""
+                select count(*) from api_idempotency_records
+                 where workspace_id=? and actor_id=? and http_method='POST' and request_path=?
+                   and idempotency_key=? and state='COMPLETED'
+                """,Integer.class,reviewer.workspaceId(),reviewer.actorId(),path,key)).isEqualTo(1);
+        assertThat(db.queryForObject("select count(*) from test_runs",Integer.class)).isEqualTo(runsBefore);
+        assertThat(db.queryForObject("select count(*) from test_run_reviewer_grants",Integer.class))
+                .isEqualTo(grantsBefore);
+
+        var revoked=api("DELETE","/api/v1/reviewer-session/"+sessionId,null,
+                Map.of("Cookie",cookie,"X-CSRF-Token",csrf,"Idempotency-Key",UUID.randomUUID().toString()));
+        assertThat(revoked.statusCode()).withFailMessage(revoked.body()).isEqualTo(204);
+        var retry=api("POST",path,body,Map.of("Idempotency-Key",key,"Cookie",cookie,"X-CSRF-Token",csrf));
+        assertThat(retry.statusCode()).isEqualTo(403);
+        assertThat(retry.headers().firstValue("Idempotent-Replayed")).isEmpty();
+        assertThat(db.queryForObject("select count(*) from api_idempotency_records where idempotency_key=?",
+                Integer.class,key)).isEqualTo(1);
+        assertThat(db.queryForObject("select count(*) from test_runs",Integer.class)).isEqualTo(runsBefore);
+        assertThat(db.queryForObject("select count(*) from test_run_reviewer_grants",Integer.class))
+                .isEqualTo(grantsBefore);
+
+        String eventPath="/api/v1/test-runs/"+UUID.randomUUID()+"/events";
+        var event=api("POST",eventPath,body,Map.of("Idempotency-Key",key));
+        assertThat(event.statusCode()).isEqualTo(403);
+        assertThat(json.readTree(event.body()).path("code").asString())
+                .isEqualTo("EXECUTION_EVENT_INGEST_FORBIDDEN");
     }
 
     @Test void revokesOnlyTheCurrentSignedSessionAndClearsCookieOnIdempotentRetries() throws Exception {
@@ -431,6 +550,13 @@ class ContractPersistenceIntegrationTest {
                     ("FINSEC_REVIEWER_SESSION_V1:"+encoded).getBytes(java.nio.charset.StandardCharsets.UTF_8)));
             return ContractReviewerCredentials.COOKIE+"="+encoded+"."+signature;
         } catch (java.security.GeneralSecurityException exception) {throw new IllegalStateException(exception);}
+    }
+
+    private void assertAllowedCors(HttpResponse<?> response) {
+        assertThat(response.headers().allValues("Access-Control-Allow-Origin")).containsExactly("http://localhost:5173");
+        assertThat(response.headers().firstValue("Access-Control-Allow-Credentials")).contains("true");
+        assertThat(response.headers().firstValue("Access-Control-Expose-Headers").orElseThrow())
+                .contains("X-Trace-Id","Location","Idempotent-Replayed");
     }
 
     private HttpResponse<String> api(String method,String path,String body,Map<String,String> headers) throws Exception {

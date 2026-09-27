@@ -93,6 +93,15 @@ public class ContractReviewerCredentials {
         return signature("GENERATION_AUTHORITY:"+workspace+":"+actor);
     }
 
+    /** Compare a stored admission stamp with current configuration without inventing a session. */
+    public boolean matchesCurrentAuthorityStamp(UUID storedWorkspace, String storedActor,
+            String storedRole, String storedStamp) {
+        return configured() && workspace.equals(storedWorkspace) && actor.equals(storedActor)
+                && "AI_SECURITY_REVIEWER".equals(storedRole)
+                && storedStamp != null && storedStamp.length() <= 100
+                && equal(signature("GENERATION_AUTHORITY:" + workspace + ":" + actor), storedStamp);
+    }
+
     private ReviewerContext reviewer(String sessionId) {
         return new ReviewerContext(workspace, actor, "AI_SECURITY_REVIEWER", sessionId, true, true, false);
     }

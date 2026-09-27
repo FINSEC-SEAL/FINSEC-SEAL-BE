@@ -3,6 +3,7 @@ package com.finsecseal.audit;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.persistence.UuidV7;
+import com.finsecseal.evidence.RedactionService;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
@@ -20,10 +21,12 @@ public class AuditService {
 
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
+    private final RedactionService redactionService;
 
-    public AuditService(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper) {
+    public AuditService(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper, RedactionService redactionService) {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
+        this.redactionService = redactionService;
     }
 
     @Transactional
@@ -38,11 +41,13 @@ public class AuditService {
             JsonNode metadata
     ) {
         String safeActor = requireText(actorId, "actorId", 120);
+        redactionService.redact(objectMapper.createObjectNode().put("actorId", safeActor));
         String safeAction = requireText(action, "action", 100);
         String safeResourceType = requireText(resourceType, "resourceType", 80);
         UUID id = UuidV7.generate();
         Instant occurredAt = Instant.now();
-        JsonNode safeMetadata = metadata == null ? objectMapper.createObjectNode() : metadata.deepCopy();
+        JsonNode rawMetadata = metadata == null ? objectMapper.createObjectNode() : metadata.deepCopy();
+        JsonNode safeMetadata = redactionService.redact(rawMetadata).redacted();
         jdbcTemplate.update("""
                 insert into audit_records
                     (id, workspace_id, actor_id, action, resource_type, resource_id,
