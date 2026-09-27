@@ -67,7 +67,7 @@ public final class LoanReviewPolicyGateway implements PolicyGateway {
             PolicyEvaluationStage.CARDINALITY, PolicyEvaluationStage.EGRESS,
             PolicyEvaluationStage.HUMAN_BOUNDARY);
     private final TransactionTemplate transaction;
-    private final Supplier<ReviewerContext> reviewers;
+    private final GatewayReviewerContextSource reviewers;
     private final GatewayRuntimeObservations observations;
     private final GatewayApprovedPolicySourceService approved;
     private final GatewayBaselinePolicySourceService baseline;
@@ -86,7 +86,7 @@ public final class LoanReviewPolicyGateway implements PolicyGateway {
     private final EnforcePolicyPostCallResponseGuard customerGuard = new EnforcePolicyPostCallResponseGuard();
     private final NonCustomerResponseSemanticsEvaluator otherResponses = new NonCustomerResponseSemanticsEvaluator();
 
-    public LoanReviewPolicyGateway(PlatformTransactionManager transactions, Supplier<ReviewerContext> reviewers,
+    public LoanReviewPolicyGateway(PlatformTransactionManager transactions, GatewayReviewerContextSource reviewers,
             GatewayRuntimeObservations observations, GatewayApprovedPolicySourceService approved,
             GatewayBaselinePolicySourceService baseline, TestRunProjectionService runs, ReleaseService releases,
             GatewayPolicyFactsAssembler facts, ExecutionEventService events,
@@ -134,11 +134,17 @@ public final class LoanReviewPolicyGateway implements PolicyGateway {
             if (arguments == null) throw failure(FailureCode.INVALID_INVOCATION);
             var call = new ToolInvocation(new ToolProposal(invocation.proposal().toolName(), arguments),
                     invocation.toolCallId(), invocation.requestDigest());
-            ReviewerContext reviewer = reviewers.get();
-            if (reviewer == null || !reviewer.authenticated() || !actorId.equals(reviewer.actorId())) {
+            Deadline sourceDeadline = new Deadline(Duration.ofSeconds(5));
+            InvocationKey invocationKey = key(context, call);
+            GatewayReviewerContextSource.Resolution resolution = reviewers.resolve(
+                    invocationKey, sourceDeadline.remaining());
+            sourceDeadline.remaining();
+            ReviewerContext reviewer = resolution == null ? null : resolution.reviewer();
+            if (resolution == null || !invocationKey.equals(resolution.key())
+                    || reviewer == null || !reviewer.authenticated()
+                    || !actorId.equals(reviewer.actorId())) {
                 throw failure(FailureCode.AUTHENTICATION_REQUIRED);
             }
-            Deadline sourceDeadline = new Deadline(Duration.ofSeconds(5));
             Prepared prepared = transaction.execute(status -> prepare(context, call, reviewer, sourceDeadline));
             requireNoTransaction();
             if (prepared == null) throw failure(FailureCode.EVIDENCE_FAILURE);
