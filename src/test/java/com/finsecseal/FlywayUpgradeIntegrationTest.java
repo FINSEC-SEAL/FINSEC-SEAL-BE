@@ -44,14 +44,15 @@ class FlywayUpgradeIntegrationTest {
         LegacyAttestation legacyPass = insertLegacyPassAttestation(legacyNamespace);
 
         Flyway current = flyway(null);
-        assertThat(current.migrate().migrationsExecuted).isEqualTo(12);
-        assertThat(appliedVersionCount()).isEqualTo(21);
+        assertThat(current.migrate().migrationsExecuted).isEqualTo(13);
+        assertThat(appliedVersionCount()).isEqualTo(22);
         assertThat(current.validateWithResult().validationSuccessful).isTrue();
-        assertThat(current.info().current().getVersion()).isEqualTo(MigrationVersion.fromVersion("18"));
+        assertThat(current.info().current().getVersion()).isEqualTo(MigrationVersion.fromVersion("19"));
         verifyDocumentSourceTimestamp(legacyNamespace);
         verifyReviewerSessionRevocationSchema();
         verifyRunReviewerGrantSchemaWithoutBackfill(legacyNamespace);
         verifyGcProjectionGuardAndLegacyPassWithoutBackfill(legacyPass);
+        verifyUnverifiedSlotPlanSchemaWithoutBackfill(legacyNamespace);
 
         UUID leaseId = UUID.randomUUID();
         Instant now = Instant.now();
@@ -237,6 +238,35 @@ class FlywayUpgradeIntegrationTest {
                     assertThat(rows.next()).isTrue();
                     assertThat(rows.getInt(1)).isZero();
                 }
+            }
+        }
+    }
+
+    private void verifyUnverifiedSlotPlanSchemaWithoutBackfill(UUID legacyRun) throws SQLException {
+        try (var connection = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+             var plans = connection.prepareStatement("select count(*) from test_run_slot_plans");
+             var slots = connection.prepareStatement("select count(*) from test_run_slot_entries");
+             var legacy = connection.prepareStatement(
+                     "select count(*) from test_run_slot_plans where run_id = ?");
+             var invalidPolicy = connection.prepareStatement(
+                     "select finsec_configured_trials_v1('{}'::jsonb)")) {
+            try (var rows = plans.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+                assertThat(rows.getInt(1)).isZero();
+            }
+            try (var rows = slots.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+                assertThat(rows.getInt(1)).isZero();
+            }
+            legacy.setObject(1, legacyRun);
+            try (var rows = legacy.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+                assertThat(rows.getInt(1)).isZero();
+            }
+            try (var rows = invalidPolicy.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+                assertThat(rows.getObject(1)).isNull();
             }
         }
     }
