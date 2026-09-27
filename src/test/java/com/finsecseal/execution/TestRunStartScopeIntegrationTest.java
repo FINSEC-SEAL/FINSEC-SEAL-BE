@@ -13,16 +13,24 @@ import static org.mockito.Mockito.verifyNoInteractions;
 
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
+import com.finsecseal.agent.AgentService;
 import com.finsecseal.common.domain.TestRunMode;
+import com.finsecseal.platform.contract.ContractReviewerCredentials;
 import com.finsecseal.evidence.TestRunPersistenceDto;
 import com.finsecseal.evidence.TestRunPersistenceService;
+import jakarta.servlet.http.Cookie;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -32,20 +40,29 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.core.task.TaskRejectedException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
+import tools.jackson.databind.ObjectMapper;
 
 @Testcontainers
-@SpringBootTest
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
+        "finsec.crypto.key-base64=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "finsec.scheduling.enabled=false",
+        "finsec.contract-access.key=b-run-scope-reviewer-key-at-least-32-bytes",
+        "finsec.contract-access.actor=b-run-scope-reviewer",
+        "finsec.contract-access.workspace=0198f1e2-0000-7000-8000-000000000001"
+})
 class TestRunStartScopeIntegrationTest {
 
-    private static final String ACTOR = "b-run-scope-test";
+    private static final String ACTOR = "b-run-scope-reviewer";
     private static final String HASH_A = "sha256:" + "a".repeat(64);
     private static final String HASH_B = "sha256:" + "b".repeat(64);
 
@@ -54,8 +71,11 @@ class TestRunStartScopeIntegrationTest {
     static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:17.11-alpine");
 
     @Autowired JdbcTemplate db;
+    @Autowired ObjectMapper json;
+    @Autowired ContractReviewerCredentials credentials;
     @Autowired TestRunStartService startService;
     @Autowired RunExecutionLifecycleService lifecycleService;
+    @LocalServerPort int port;
 
     @MockitoSpyBean
     TestRunPersistenceService runPersistence;
@@ -84,11 +104,12 @@ class TestRunStartScopeIntegrationTest {
             }).when(executor).execute(any(Runnable.class));
 
             TestRunPersistenceDto.Registered result = startService.start(
-                    request(seed, TestRunMode.BASELINE, null, selection), ACTOR);
+                    request(seed, TestRunMode.BASELINE, null, selection), reviewerRequest());
 
             assertThat(result.runId()).isNotNull();
             assertThat(runCount(seed.releaseId())).isEqualTo(1);
-            assertThat(auditCount(seed.workspaceId())).isEqualTo(1);
+            assertThat(registrationAuditCount(seed.releaseId())).isEqualTo(1);
+            assertGrant(result.runId());
             assertThat(independentlyVisibleRuns.get()).isEqualTo(1);
             assertThat(db.queryForObject("select total_cases from test_runs where id = ?",
                     Integer.class, result.runId())).isEqualTo(1);
@@ -110,15 +131,15 @@ class TestRunStartScopeIntegrationTest {
         ready(foreignSuite);
 
         assertError(ErrorCode.VALIDATION_ERROR, () -> startService.start(
-                request(seed, TestRunMode.BASELINE, null, List.of(hidden)), ACTOR));
+                request(seed, TestRunMode.BASELINE, null, List.of(hidden)), reviewerRequest()));
         assertError(ErrorCode.VALIDATION_ERROR, () -> startService.start(
-                request(seed, TestRunMode.BASELINE, null, List.of(foreign)), ACTOR));
+                request(seed, TestRunMode.BASELINE, null, List.of(foreign)), reviewerRequest()));
         assertThat(runCount(seed.releaseId())).isZero();
-        assertThat(auditCount(seed.workspaceId())).isZero();
+        assertThat(registrationAuditCount(seed.releaseId())).isZero();
         verifyNoInteractions(executor, dispatch);
 
         TestRunPersistenceDto.Registered result = startService.start(
-                request(seed, TestRunMode.BASELINE, null, List.of(second, first)), ACTOR);
+                request(seed, TestRunMode.BASELINE, null, List.of(second, first)), reviewerRequest());
         assertThat(db.queryForObject("select total_cases from test_runs where id = ?",
                 Integer.class, result.runId())).isEqualTo(2);
         runScheduledTask();
@@ -136,12 +157,12 @@ class TestRunStartScopeIntegrationTest {
         UUID contract = approvedContract(seed);
 
         assertError(ErrorCode.VALIDATION_ERROR, () -> startService.start(
-                request(seed, TestRunMode.HELD_OUT, contract, List.of(hidden)), ACTOR));
+                request(seed, TestRunMode.HELD_OUT, contract, List.of(hidden)), reviewerRequest()));
         assertThat(runCount(seed.releaseId())).isZero();
         verifyNoInteractions(executor, dispatch);
 
         TestRunPersistenceDto.Registered result = startService.start(
-                request(seed, TestRunMode.HELD_OUT, contract, List.of()), ACTOR);
+                request(seed, TestRunMode.HELD_OUT, contract, List.of()), reviewerRequest());
         assertThat(db.queryForObject("select total_cases from test_runs where id = ?",
                 Integer.class, result.runId())).isEqualTo(1);
         runScheduledTask();
@@ -162,17 +183,17 @@ class TestRunStartScopeIntegrationTest {
                 List.of(other));
         for (List<UUID> selection : invalid) {
             assertError(ErrorCode.VALIDATION_ERROR, () -> startService.start(
-                    request(seed, TestRunMode.BASELINE, null, selection), ACTOR));
+                    request(seed, TestRunMode.BASELINE, null, selection), reviewerRequest()));
         }
 
-        Seed foreign = seed();
+        Seed foreign = seed(UUID.randomUUID());
         addCase(foreign.suiteId(), "NORMAL", false, "normal");
         ready(foreign.suiteId());
         assertError(ErrorCode.RESOURCE_NOT_FOUND, () -> startService.start(
                 new TestRunStartService.Request(seed.releaseId(), foreign.suiteId(),
-                        TestRunMode.BASELINE, null, List.of(), 42L), ACTOR));
+                        TestRunMode.BASELINE, null, List.of(), 42L), reviewerRequest()));
         assertThat(runCount(seed.releaseId())).isZero();
-        assertThat(auditCount(seed.workspaceId())).isZero();
+        assertThat(registrationAuditCount(seed.releaseId())).isZero();
         verifyNoInteractions(executor, dispatch);
     }
 
@@ -186,13 +207,13 @@ class TestRunStartScopeIntegrationTest {
                 .when(executor).execute(any(Runnable.class));
 
         assertThatThrownBy(() -> startService.start(
-                request(seed, TestRunMode.BASELINE, null, List.of()), ACTOR))
+                request(seed, TestRunMode.BASELINE, null, List.of()), reviewerRequest()))
                 .isInstanceOf(BusinessException.class)
                 .satisfies(error -> assertThat(((BusinessException) error).errorCode())
                         .isEqualTo(ErrorCode.INTERNAL_ERROR))
                 .hasMessage("TestRun scheduling was rejected");
         assertThat(runCount(seed.releaseId())).isEqualTo(1);
-        assertThat(auditCount(seed.workspaceId())).isEqualTo(1);
+        assertThat(registrationAuditCount(seed.releaseId())).isEqualTo(1);
         UUID failedRunId = db.queryForObject(
                 "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
         assertThat(db.queryForObject("select status from test_runs where id = ?",
@@ -218,9 +239,7 @@ class TestRunStartScopeIntegrationTest {
         assertThat(db.queryForObject("""
                 select count(*) from sandbox_namespaces where id = ?
                 """, Integer.class, failedRunId)).isZero();
-        assertThat(db.queryForList("""
-                select action from audit_records where workspace_id = ?
-                """, String.class, seed.workspaceId())).containsExactlyInAnyOrder(
+        assertThat(runAuditActions(failedRunId)).containsExactlyInAnyOrder(
                         "TEST_RUN_REGISTERED", "EXECUTION_EVENT_APPENDED",
                         "EXECUTION_EVENT_APPENDED", "TEST_RUN_STATUS_UPDATED");
         assertThat(db.queryForObject("""
@@ -229,24 +248,18 @@ class TestRunStartScopeIntegrationTest {
         assertThat(db.queryForObject("""
                 select string_agg(metadata_json::text, ' ') from execution_events where run_id = ?
                 """, String.class, failedRunId)).doesNotContain(canary);
-        assertThat(db.queryForObject("""
-                select string_agg(metadata_json::text, ' ') from audit_records where workspace_id = ?
-                """, String.class, seed.workspaceId())).doesNotContain(canary);
+        assertThat(runAuditMetadata(failedRunId)).doesNotContain(canary);
 
-        int previousAuditCount = db.queryForObject("""
-                select count(*) from audit_records where workspace_id = ?
-                """, Integer.class, seed.workspaceId());
+        int previousAuditCount = runAuditCount(failedRunId);
         lifecycleService.rejectScheduling(failedRunId, UUID.randomUUID(), ACTOR);
         assertThat(db.queryForObject("""
                 select count(*) from execution_events where run_id = ?
                 """, Integer.class, failedRunId)).isEqualTo(2);
-        assertThat(db.queryForObject("""
-                select count(*) from audit_records where workspace_id = ?
-                """, Integer.class, seed.workspaceId())).isEqualTo(previousAuditCount);
+        assertThat(runAuditCount(failedRunId)).isEqualTo(previousAuditCount);
 
         reset(executor);
         TestRunPersistenceDto.Registered retry = startService.start(
-                request(seed, TestRunMode.BASELINE, null, List.of()), ACTOR);
+                request(seed, TestRunMode.BASELINE, null, List.of()), reviewerRequest());
         assertThat(retry.runId()).isNotEqualTo(failedRunId);
         assertThat(runCount(seed.releaseId())).isEqualTo(2);
         verifyNoInteractions(dispatch);
@@ -258,7 +271,7 @@ class TestRunStartScopeIntegrationTest {
         addCase(seed.suiteId(), "NORMAL", false, "normal");
         ready(seed.suiteId());
         TestRunPersistenceDto.Registered registered = startService.start(
-                request(seed, TestRunMode.BASELINE, null, List.of()), ACTOR);
+                request(seed, TestRunMode.BASELINE, null, List.of()), reviewerRequest());
         doThrow(new IllegalStateException("status write failed"))
                 .when(runPersistence).updateStatus(eq(registered.runId()),
                         any(TestRunPersistenceDto.StatusRequest.class), eq(ACTOR));
@@ -272,16 +285,127 @@ class TestRunStartScopeIntegrationTest {
         assertThat(db.queryForObject("""
                 select count(*) from execution_events where run_id = ?
                 """, Integer.class, registered.runId())).isZero();
-        assertThat(db.queryForObject("""
-                select count(*) from audit_records where workspace_id = ?
-                """, Integer.class, seed.workspaceId())).isEqualTo(1);
+        assertThat(runAuditCount(registered.runId())).isEqualTo(1);
         verifyNoInteractions(dispatch);
+    }
+
+    @Test
+    void signedReviewerCannotRegisterForeignWorkspaceAndLeavesNoPartialRunOrDispatch() {
+        Seed foreign = seed(UUID.randomUUID());
+        addCase(foreign.suiteId(), "NORMAL", false, "normal");
+        ready(foreign.suiteId());
+
+        assertError(ErrorCode.OPERATOR_AUTH_REQUIRED, () -> startService.start(
+                request(foreign, TestRunMode.BASELINE, null, List.of()), reviewerRequest()));
+
+        assertThat(runCount(foreign.releaseId())).isZero();
+        assertThat(grantCount(foreign.releaseId())).isZero();
+        assertThat(db.queryForObject("select count(*) from audit_records where workspace_id = ?",
+                Integer.class, foreign.workspaceId())).isZero();
+        verifyNoInteractions(executor, dispatch);
+    }
+
+    @Test
+    void publicHttpSignedReviewerAdmitsOnceAndReplaysIdempotentResult() throws Exception {
+        Seed seed = seed();
+        UUID normal = addCase(seed.suiteId(), "NORMAL", false, "normal");
+        ready(seed.suiteId());
+        var session = credentials.issue();
+        String key = "b-run-signed-" + UUID.randomUUID();
+
+        HttpResponse<String> first = httpStart(seed, session, key, true);
+        assertThat(first.statusCode()).isEqualTo(202);
+        UUID runId = UUID.fromString(json.readTree(first.body()).path("data").path("runId").asString());
+        assertThat(runCount(seed.releaseId())).isEqualTo(1);
+        assertThat(registrationAuditCount(seed.releaseId())).isEqualTo(1);
+        assertGrant(runId);
+        assertThat(db.queryForMap("""
+                select actor_id, state, response_status from api_idempotency_records
+                 where idempotency_key = ? and request_path = '/api/v1/test-runs'
+                """, key)).containsEntry("actor_id", ACTOR)
+                .containsEntry("state", "COMPLETED")
+                .containsEntry("response_status", 202);
+
+        HttpResponse<String> replay = httpStart(seed, session, key, true);
+        assertThat(replay.statusCode()).isEqualTo(202);
+        assertThat(replay.body()).isEqualTo(first.body());
+        assertThat(runCount(seed.releaseId())).isEqualTo(1);
+        assertThat(grantCount(seed.releaseId())).isEqualTo(1);
+        runScheduledTask();
+        verify(dispatch).execute(runId, normal, ACTOR);
+    }
+
+    @Test
+    void publicHttpPreAuthenticationFailureCreatesNoReservationOrRun() throws Exception {
+        Seed seed = seed();
+        addCase(seed.suiteId(), "NORMAL", false, "normal");
+        ready(seed.suiteId());
+        var session = credentials.issue();
+        String absentCookieKey = "b-run-no-cookie-" + UUID.randomUUID();
+        String absentCsrfKey = "b-run-no-csrf-" + UUID.randomUUID();
+
+        assertThat(httpStart(seed, null, absentCookieKey, false).statusCode()).isEqualTo(403);
+        assertThat(httpStart(seed, session, absentCsrfKey, false).statusCode()).isEqualTo(403);
+
+        assertThat(idempotencyCount(absentCookieKey)).isZero();
+        assertThat(idempotencyCount(absentCsrfKey)).isZero();
+        assertThat(runCount(seed.releaseId())).isZero();
+        assertThat(grantCount(seed.releaseId())).isZero();
+        assertThat(registrationAuditCount(seed.releaseId())).isZero();
+        verifyNoInteractions(executor, dispatch);
+    }
+
+    @Test
+    void publicHttpAuthenticatedForeignWorkspaceFailureMayCompleteIdempotencyWithoutRun() throws Exception {
+        Seed foreign = seed(UUID.randomUUID());
+        addCase(foreign.suiteId(), "NORMAL", false, "normal");
+        ready(foreign.suiteId());
+        String key = "b-run-foreign-" + UUID.randomUUID();
+
+        HttpResponse<String> response = httpStart(foreign, credentials.issue(), key, true);
+        assertThat(response.statusCode()).isEqualTo(403);
+        assertThat(runCount(foreign.releaseId())).isZero();
+        assertThat(grantCount(foreign.releaseId())).isZero();
+        assertThat(db.queryForObject("select count(*) from audit_records where workspace_id = ?",
+                Integer.class, foreign.workspaceId())).isZero();
+        assertThat(db.queryForMap("""
+                select actor_id, state, response_status from api_idempotency_records
+                 where idempotency_key = ? and request_path = '/api/v1/test-runs'
+                """, key)).containsEntry("actor_id", ACTOR)
+                .containsEntry("state", "COMPLETED")
+                .containsEntry("response_status", 403);
+        verifyNoInteractions(executor, dispatch);
     }
 
     private TestRunStartService.Request request(Seed seed, TestRunMode mode,
             UUID contract, List<UUID> ids) {
         return new TestRunStartService.Request(seed.releaseId(), seed.suiteId(),
                 mode, contract, ids, 42L);
+    }
+
+    private MockHttpServletRequest reviewerRequest() {
+        var session = credentials.issue();
+        var request = new MockHttpServletRequest();
+        request.setCookies(new Cookie(ContractReviewerCredentials.COOKIE, session.token()));
+        request.addHeader("X-CSRF-Token", session.csrfToken());
+        return request;
+    }
+
+    private HttpResponse<String> httpStart(Seed seed, ContractReviewerCredentials.Session session,
+            String key, boolean includeCsrf) throws Exception {
+        String body = json.writeValueAsString(Map.of(
+                "releaseId", seed.releaseId(), "suiteId", seed.suiteId(),
+                "mode", "BASELINE", "caseIds", List.of(), "randomSeed", 42L));
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(
+                        "http://localhost:" + port + "/api/v1/test-runs"))
+                .header("Content-Type", "application/json")
+                .header("Idempotency-Key", key);
+        if (session != null) {
+            request.header("Cookie", ContractReviewerCredentials.COOKIE + "=" + session.token());
+            if (includeCsrf) request.header("X-CSRF-Token", session.csrfToken());
+        }
+        return HttpClient.newHttpClient().send(request.POST(HttpRequest.BodyPublishers.ofString(body)).build(),
+                HttpResponse.BodyHandlers.ofString());
     }
 
     private void runScheduledTask() {
@@ -291,9 +415,15 @@ class TestRunStartScopeIntegrationTest {
     }
 
     private Seed seed() {
-        UUID workspace = UUID.randomUUID(), agent = UUID.randomUUID(), release = UUID.randomUUID();
-        db.update("insert into workspaces(id,name,mode) values (?,?,'DEMO')",
-                workspace, "B run scope " + workspace);
+        return seed(AgentService.DEMO_WORKSPACE_ID);
+    }
+
+    private Seed seed(UUID workspace) {
+        UUID agent = UUID.randomUUID(), release = UUID.randomUUID();
+        if (!AgentService.DEMO_WORKSPACE_ID.equals(workspace)) {
+            db.update("insert into workspaces(id,name,mode) values (?,?,'DEMO')",
+                    workspace, "B run scope " + workspace);
+        }
         db.update("""
                 insert into agents(id,workspace_id,agent_key,name,purpose_summary,status)
                 values (?,?,?,'B Scope Agent','Run scope test','ACTIVE')
@@ -355,11 +485,64 @@ class TestRunStartScopeIntegrationTest {
                 Integer.class, release);
     }
 
-    private int auditCount(UUID workspace) {
+    private int registrationAuditCount(UUID release) {
         return db.queryForObject("""
-                select count(*) from audit_records
-                 where workspace_id = ? and action = 'TEST_RUN_REGISTERED'
-                """, Integer.class, workspace);
+                select count(*) from audit_records audit
+                  join test_runs run on run.id = audit.resource_id
+                 where audit.resource_type = 'TEST_RUN'
+                   and audit.action = 'TEST_RUN_REGISTERED' and run.release_id = ?
+                """, Integer.class, release);
+    }
+
+    private int grantCount(UUID release) {
+        return db.queryForObject("""
+                select count(*) from test_run_reviewer_grants grant_row
+                  join test_runs run on run.id = grant_row.run_id
+                 where run.release_id = ?
+                """, Integer.class, release);
+    }
+
+    private void assertGrant(UUID runId) {
+        assertThat(db.queryForMap("""
+                select workspace_id, actor_id, reviewer_role
+                  from test_run_reviewer_grants where run_id = ?
+                """, runId)).containsEntry("workspace_id", AgentService.DEMO_WORKSPACE_ID)
+                .containsEntry("actor_id", ACTOR)
+                .containsEntry("reviewer_role", "AI_SECURITY_REVIEWER");
+        assertThat(db.queryForObject("""
+                select actor_id from audit_records
+                 where resource_type = 'TEST_RUN' and resource_id = ?
+                   and action = 'TEST_RUN_REGISTERED'
+                """, String.class, runId)).isEqualTo(ACTOR);
+    }
+
+    private int idempotencyCount(String key) {
+        return db.queryForObject("""
+                select count(*) from api_idempotency_records
+                 where idempotency_key = ? and request_path = '/api/v1/test-runs'
+                """, Integer.class, key);
+    }
+
+    private List<String> runAuditActions(UUID runId) {
+        return db.queryForList("""
+                select action from audit_records
+                 where (resource_type = 'TEST_RUN' and resource_id = ?)
+                    or (resource_type = 'EXECUTION_EVENT' and resource_id in
+                        (select id from execution_events where run_id = ?))
+                """, String.class, runId, runId);
+    }
+
+    private String runAuditMetadata(UUID runId) {
+        return db.queryForObject("""
+                select string_agg(metadata_json::text, ' ') from audit_records
+                 where (resource_type = 'TEST_RUN' and resource_id = ?)
+                    or (resource_type = 'EXECUTION_EVENT' and resource_id in
+                        (select id from execution_events where run_id = ?))
+                """, String.class, runId, runId);
+    }
+
+    private int runAuditCount(UUID runId) {
+        return runAuditActions(runId).size();
     }
 
     private int committedRunCount(UUID release) throws Exception {
