@@ -15,7 +15,8 @@ public final class ReleaseAssuranceDto {
                               PolicyLatencyCalculator.PolicyLatency policyLatency,
                               CompletionRateCalculator.CompletionRate completionRate,
                               TrialSuccessDistributionCalculator.Report trialSuccessDistribution,
-                              AttackRateBreakdownCalculator.Report attackRateBreakdown) {
+                              AttackRateBreakdownCalculator.Report attackRateBreakdown,
+                              CriticalInvariantAnySuccessCalculator.Report criticalInvariantAnySuccess) {
     }
 
     public record ReplaySummary(
