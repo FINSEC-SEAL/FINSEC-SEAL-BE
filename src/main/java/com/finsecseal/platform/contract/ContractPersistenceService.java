@@ -14,6 +14,8 @@ import com.finsecseal.contract.SafetyContractLifecyclePolicy.*;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import com.finsecseal.release.ReleaseService;
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.*;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -49,6 +51,7 @@ public class ContractPersistenceService {
             JsonNode validation, JsonNode review) {}
     public record ApprovedContract(Version version, String agentArtifactFingerprint, String releaseFingerprint) {}
     private record ReleaseState(UUID workspaceId, String policyHash, String artifact, String fingerprint, String state) {}
+    private record PatchReview(UUID findingId, UUID baseVersionId, String state, UUID releaseId) {}
 
     public record History(List<JsonNode> items, String nextCursor) {}
 
@@ -231,6 +234,55 @@ public class ContractPersistenceService {
     }
 
     public record StoredPatch(UUID patchProposalId, Version candidate) {}
+    public record RejectedPatch(UUID id, UUID findingId, UUID baseContractVersionId, String state, Instant decidedAt) {}
+
+    /** Reject the proposal without changing its candidate Contract or the Release's effective policy. */
+    @Transactional
+    public RejectedPatch rejectPatchProposal(UUID proposalId, String comment, ReviewerContext reviewer) {
+        // Resolve only the owning Release before checking reviewer authority or reading proposal content.
+        var scopes = db.queryForList("""
+            select f.release_id from patch_proposals p join findings f on f.id=p.finding_id where p.id=?
+            """, UUID.class, proposalId);
+        if (scopes.isEmpty()) fail(ErrorCode.RESOURCE_NOT_FOUND, "Patch proposal not found");
+        UUID releaseId = scopes.getFirst();
+        ReleaseState release = lockRelease(releaseId, reviewer);
+        if (comment == null || comment.isBlank() || comment.length() > 1000)
+            fail(ErrorCode.VALIDATION_ERROR, "Review comment is required and must not exceed 1000 characters");
+        // Approval takes the same Release lock before it locks proposal and Finding rows.
+        var reviews = db.query("""
+            select p.finding_id,p.base_contract_version_id,p.state,f.release_id
+            from patch_proposals p join findings f on f.id=p.finding_id where p.id=? for update of p,f
+            """, (rs,n) -> new PatchReview(rs.getObject(1,UUID.class), rs.getObject(2,UUID.class),
+                    rs.getString(3), rs.getObject(4,UUID.class)), proposalId);
+        if (reviews.isEmpty()) fail(ErrorCode.RESOURCE_NOT_FOUND, "Patch proposal not found");
+        PatchReview proposal = reviews.getFirst();
+        if (!releaseId.equals(proposal.releaseId()) || !"PROPOSED".equals(proposal.state())
+                || db.queryForObject("select count(*) from patch_approvals where patch_proposal_id=?",
+                    Integer.class, proposalId) != 0)
+            fail(ErrorCode.RESOURCE_CONFLICT, "Patch proposal is no longer pending review");
+        if (proposal.baseVersionId() == null)
+            fail(ErrorCode.EVIDENCE_INCOMPLETE, "Patch proposal base Contract is missing or foreign");
+        var baseReleases = db.queryForList("""
+            select c.release_id from safety_contract_versions v join safety_contracts c on c.id=v.contract_id
+            where v.id=?
+            """, UUID.class, proposal.baseVersionId());
+        if (baseReleases.size() != 1 || !releaseId.equals(baseReleases.getFirst()))
+            fail(ErrorCode.EVIDENCE_INCOMPLETE, "Patch proposal base Contract is missing or foreign");
+        Version base = find(proposal.baseVersionId(), reviewer);
+        int updated = db.update("update patch_proposals set state='REJECTED',updated_at=now() where id=? and state='PROPOSED'",
+                proposalId);
+        if (updated != 1) fail(ErrorCode.RESOURCE_CONFLICT, "Patch proposal is no longer pending review");
+        Instant decidedAt = Instant.now();
+        db.update("""
+            insert into patch_approvals(id,patch_proposal_id,decision,reviewer_actor_id,comment,base_hash,decided_at)
+            values(?,?,'REJECTED',?,?,?,?)
+            """, UuidV7.generate(), proposalId, reviewer.actorId(), comment, base.policyHash(), Timestamp.from(decidedAt));
+        audit.append(release.workspaceId(), reviewer.actorId(), "PATCH_PROPOSAL_REJECTED", "PATCH_PROPOSAL", proposalId,
+                null, null, json.createObjectNode().put("findingId", proposal.findingId().toString())
+                    .put("baseContractVersionId", base.id().toString()).put("state", "REJECTED")
+                    .put("basePolicyHash", base.policyHash()));
+        return new RejectedPatch(proposalId, proposal.findingId(), base.id(), "REJECTED", decidedAt);
+    }
 
     /** C/B supply a candidate, never an accepted flag; the server reloads all source facts and reruns C. */
     @Transactional
