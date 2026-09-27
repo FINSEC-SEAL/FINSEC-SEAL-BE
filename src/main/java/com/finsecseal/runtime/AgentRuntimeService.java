@@ -13,6 +13,7 @@ import com.finsecseal.runtime.ai.StatelessAgentStepClient.FinalResponseAction;
 import com.finsecseal.runtime.ai.StatelessAgentStepClient.ToolProposalAction;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import tools.jackson.databind.JsonNode;
@@ -22,21 +23,37 @@ import tools.jackson.databind.node.ObjectNode;
 @Service
 public class AgentRuntimeService {
 
+    private static final String CUSTOMER_DATA_READ_TOOL_NAME = "CUSTOMER_DATA_READ";
+
     private final ObjectProvider<AgentAiClient> aiClientProvider;
     private final ExecutionEventService eventService;
     private final ObjectMapper objectMapper;
     private final ToolProposalValidator proposalValidator;
+    private final CustomerFieldDeliveryEvidence customerFieldDeliveryEvidence;
 
+    @Autowired
+    public AgentRuntimeService(
+            ObjectProvider<AgentAiClient> aiClientProvider,
+            ExecutionEventService eventService,
+            ObjectMapper objectMapper,
+            ToolProposalValidator proposalValidator,
+            CustomerFieldDeliveryEvidence customerFieldDeliveryEvidence
+    ) {
+        this.aiClientProvider = aiClientProvider;
+        this.eventService = eventService;
+        this.objectMapper = objectMapper;
+        this.proposalValidator = proposalValidator;
+        this.customerFieldDeliveryEvidence = customerFieldDeliveryEvidence;
+    }
+
+    /** Source-compatible direct construction fails closed for customer delivery. */
     public AgentRuntimeService(
             ObjectProvider<AgentAiClient> aiClientProvider,
             ExecutionEventService eventService,
             ObjectMapper objectMapper,
             ToolProposalValidator proposalValidator
     ) {
-        this.aiClientProvider = aiClientProvider;
-        this.eventService = eventService;
-        this.objectMapper = objectMapper;
-        this.proposalValidator = proposalValidator;
+        this(aiClientProvider, eventService, objectMapper, proposalValidator, null);
     }
 
     public RuntimeTurn proposeTool(
@@ -189,13 +206,37 @@ public class AgentRuntimeService {
             String actorId
     ) {
         AgentAiClient aiClient = requireClient();
+        CustomerFieldDeliveryEvidence.Capture customerCapture = null;
+        if (CUSTOMER_DATA_READ_TOOL_NAME.equals(toolName)) {
+            if (customerFieldDeliveryEvidence == null || context == null || context.runId() == null
+                    || context.caseRunId() == null || context.traceId() == null
+                    || sourceEventId == null || sourceSequence <= 0) {
+                throw incompleteCustomerDelivery();
+            }
+            ExecutionEventDto.Event source;
+            try {
+                source = eventService.findById(sourceEventId);
+            } catch (BusinessException exception) {
+                throw incompleteCustomerDelivery();
+            }
+            if (source.eventType() != ExecutionEventType.TOOL_RESPONSE
+                    || !context.runId().equals(source.runId())
+                    || !context.caseRunId().equals(source.testCaseRunId())
+                    || !context.traceId().equals(source.traceId())
+                    || !toolName.equals(source.toolName())
+                    || source.sequence() != sourceSequence
+                    || !customerFieldDeliveryEvidence.matchesRedactedOutput(source, toolOutput)) {
+                throw incompleteCustomerDelivery();
+            }
+            customerCapture = customerFieldDeliveryEvidence.capture(context.caseRunId(), source, toolOutput);
+        }
 
         ObjectNode requestMetadata = objectMapper.createObjectNode();
         requestMetadata.put("turnType", "TOOL_RESULT_DELIVERY");
         requestMetadata.put("sourceEventId", sourceEventId.toString());
         requestMetadata.put("sourceSequence", sourceSequence);
         requestMetadata.put("variantHash", attackVariant.variantHash());
-        eventService.append(
+        ExecutionEventDto.Event deliveryRequestEvent = eventService.append(
                 context.runId(),
                 new ExecutionEventDto.AppendRequest(
                         context.caseRunId(),
@@ -210,6 +251,9 @@ public class AgentRuntimeService {
                 ),
                 actorId
         );
+        if (customerCapture != null && sourceSequence >= deliveryRequestEvent.sequence()) {
+            throw incompleteCustomerDelivery();
+        }
 
         AgentAiClient.ToolResultDeliveryResponse response = aiClient.deliverToolResult(
                 new AgentAiClient.ToolResultDeliveryRequest(
@@ -264,6 +308,12 @@ public class AgentRuntimeService {
         String reasonCode = delivered
                 ? "AGENT_TOOL_RESULT_DELIVERED"
                 : "AGENT_TOOL_RESULT_QUARANTINED";
+        ObjectNode deliveryMetadata = objectMapper.createObjectNode()
+                .put("turnType", "TOOL_RESULT_DELIVERY")
+                .put("variantHash", attackVariant.variantHash());
+        if (customerCapture != null) {
+            deliveryMetadata.set("customerFieldDeliveryEvidence", customerCapture.metadata(delivered));
+        }
         ExecutionEventDto.Event deliveryEvent = eventService.append(
                 context.runId(),
                 new ExecutionEventDto.AppendRequest(
@@ -275,9 +325,7 @@ public class AgentRuntimeService {
                         output,
                         null,
                         reasonCode,
-                        objectMapper.createObjectNode()
-                                .put("turnType", "TOOL_RESULT_DELIVERY")
-                                .put("variantHash", attackVariant.variantHash())
+                        deliveryMetadata
                 ),
                 actorId
         );
@@ -290,6 +338,11 @@ public class AgentRuntimeService {
                 response.nextAction(),
                 response.latencyMs()
         );
+    }
+
+    private BusinessException incompleteCustomerDelivery() {
+        return new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE,
+                "CUSTOMER_DATA_READ delivery is missing its verified source evidence");
     }
 
     private AgentAiClient requireClient() {
