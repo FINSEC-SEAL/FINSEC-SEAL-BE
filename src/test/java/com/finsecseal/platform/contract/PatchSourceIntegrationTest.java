@@ -110,6 +110,198 @@ class PatchSourceIntegrationTest {
         assertThat(jdbcTemplate.queryForObject("select resulting_contract_version_id from patch_approvals where patch_proposal_id=?",UUID.class,stored.patchProposalId())).isEqualTo(approved.id());
         assertThatThrownBy(()->jdbcTemplate.update("update patch_proposals set root_cause='changed' where id=?",stored.patchProposalId())).hasMessageContaining("immutable");
     }
+    @Test void rejectsPatchProposalWithOneScopedReviewAndAuditWithoutChangingCandidateOrRelease() throws Exception {
+        PatchFixture fixture=patchFixture();
+        UUID proposalId=fixture.stored().patchProposalId();
+        var beforeRelease=releaseService.find(fixture.source().releaseId());
+        var beforeCandidate=contracts.find(fixture.validated().id(),reviewer);
+
+        var rejected=contracts.rejectPatchProposal(proposalId,"Reviewed patch risk",reviewer);
+        assertThat(rejected.id()).isEqualTo(proposalId);
+        assertThat(rejected.findingId()).isEqualTo(fixture.source().findingId());
+        assertThat(rejected.baseContractVersionId()).isEqualTo(fixture.base().id());
+        assertThat(rejected.state()).isEqualTo("REJECTED");
+        assertThat(rejected.decidedAt()).isNotNull();
+        assertThat(proposalState(proposalId)).isEqualTo("REJECTED");
+        var review=jdbcTemplate.queryForMap("select * from patch_approvals where patch_proposal_id=?",proposalId);
+        assertThat(review.get("decision")).isEqualTo("REJECTED");
+        assertThat(review.get("reviewer_actor_id")).isEqualTo(reviewer.actorId());
+        assertThat(review.get("comment")).isEqualTo("Reviewed patch risk");
+        assertThat(review.get("base_hash")).isEqualTo(fixture.base().policyHash());
+        assertThat(review.get("resulting_contract_version_id")).isNull();
+        assertThat(review.get("result_hash")).isNull();
+        assertThat(jdbcTemplate.queryForObject("""
+            select count(*) from audit_records where resource_type='PATCH_PROPOSAL' and resource_id=?
+            and action='PATCH_PROPOSAL_REJECTED' and workspace_id=?
+            """,Integer.class,proposalId,reviewer.workspaceId())).isEqualTo(1);
+        String auditMetadata=jdbcTemplate.queryForObject("""
+            select metadata_json::text from audit_records where resource_type='PATCH_PROPOSAL' and resource_id=?
+            """,String.class,proposalId);
+        assertThat(auditMetadata).contains(fixture.base().policyHash()).doesNotContain("Reviewed patch risk","recommendedRule");
+        assertThat(contracts.find(beforeCandidate.id(),reviewer).state()).isEqualTo("VALIDATED");
+        assertThat(contracts.find(beforeCandidate.id(),reviewer).resourceHash()).isEqualTo(beforeCandidate.resourceHash());
+        var afterRelease=releaseService.find(fixture.source().releaseId());
+        assertThat(afterRelease.releaseFingerprint()).isEqualTo(beforeRelease.releaseFingerprint());
+        assertThat(afterRelease.safetyContractHash()).isEqualTo(beforeRelease.safetyContractHash());
+        assertThatThrownBy(()->contracts.approve(beforeCandidate.id(),'"'+beforeCandidate.resourceHash()+'"',
+                "review",proposalId,reviewer)).hasMessageContaining("pending");
+        assertThatThrownBy(()->contracts.rejectPatchProposal(proposalId,"again",reviewer)).hasMessageContaining("pending");
+        assertThat(jdbcTemplate.queryForObject("select count(*) from patch_approvals where patch_proposal_id=?",
+                Integer.class,proposalId)).isEqualTo(1);
+
+        // The V16 audit scope branch rejects both a mismatched workspace and an unknown proposal.
+        assertThatThrownBy(()->insertProposalAudit(UUID.randomUUID(),proposalId))
+                .hasMessageContaining("audit resource and workspace must match");
+        assertThatThrownBy(()->insertProposalAudit(reviewer.workspaceId(),UUID.randomUUID()))
+                .hasMessageContaining("audit resource does not exist");
+        assertThat(jdbcTemplate.queryForObject("select count(*) from audit_records where resource_type='PATCH_PROPOSAL' and resource_id=?",
+                Integer.class,proposalId)).isEqualTo(1);
+    }
+    @Test void rejectsOnlyAnAuthorizedPendingProposalWithAValidBaseAndComment() throws Exception {
+        PatchFixture fixture=patchFixture();
+        UUID proposalId=fixture.stored().patchProposalId();
+        var foreign=new com.finsecseal.contract.SafetyContractLifecyclePolicy.ReviewerContext(
+                UUID.randomUUID(),"reviewer","AI_SECURITY_REVIEWER","s",true,true,false);
+        var invalid=new com.finsecseal.contract.SafetyContractLifecyclePolicy.ReviewerContext(
+                reviewer.workspaceId(),"reviewer","AI_SECURITY_REVIEWER","s",false,true,false);
+        assertThatThrownBy(()->contracts.rejectPatchProposal(proposalId,"review",foreign)).hasMessageContaining("Trusted workspace");
+        assertThatThrownBy(()->contracts.rejectPatchProposal(proposalId,"review",invalid)).hasMessageContaining("Trusted workspace");
+        assertThatThrownBy(()->contracts.rejectPatchProposal(UUID.randomUUID(),"review",reviewer)).hasMessageContaining("not found");
+        assertThatThrownBy(()->contracts.rejectPatchProposal(proposalId,"   ",reviewer)).hasMessageContaining("comment");
+        assertThatThrownBy(()->contracts.rejectPatchProposal(proposalId,"x".repeat(1001),reviewer)).hasMessageContaining("comment");
+        assertThat(proposalState(proposalId)).isEqualTo("PROPOSED");
+        assertThat(jdbcTemplate.queryForObject("select count(*) from patch_approvals where patch_proposal_id=?",
+                Integer.class,proposalId)).isZero();
+        assertThat(jdbcTemplate.queryForObject("select count(*) from audit_records where resource_type='PATCH_PROPOSAL' and resource_id=?",
+                Integer.class,proposalId)).isZero();
+
+        jdbcTemplate.update("update patch_proposals set base_contract_version_id=null where id=?",proposalId);
+        assertThatThrownBy(()->contracts.rejectPatchProposal(proposalId,"review",reviewer)).hasMessageContaining("base Contract");
+        PatchFixture other=patchFixture();
+        jdbcTemplate.update("update patch_proposals set base_contract_version_id=? where id=?",other.base().id(),proposalId);
+        assertThatThrownBy(()->contracts.rejectPatchProposal(proposalId,"review",reviewer)).hasMessageContaining("base Contract");
+        jdbcTemplate.update("update patch_proposals set base_contract_version_id=? where id=?",fixture.base().id(),proposalId);
+        jdbcTemplate.update("update safety_contract_versions set policy_hash=? where id=?",HASH_A,fixture.base().id());
+        assertThatThrownBy(()->contracts.rejectPatchProposal(proposalId,"review",reviewer)).hasMessageContaining("integrity");
+        assertThat(proposalState(proposalId)).isEqualTo("PROPOSED");
+        assertThat(jdbcTemplate.queryForObject("select count(*) from patch_approvals where patch_proposal_id=?",
+                Integer.class,proposalId)).isZero();
+    }
+    @Test void competingPatchRejectionsCommitOneTerminalDecision() throws Exception {
+        PatchFixture fixture=patchFixture();
+        UUID proposalId=fixture.stored().patchProposalId();
+        var pool=java.util.concurrent.Executors.newFixedThreadPool(2);
+        boolean completed=false;
+        try {
+            var gate=new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.Callable<Boolean> attempt=()->{
+                gate.await();
+                try { contracts.rejectPatchProposal(proposalId,"review",reviewer); return true; }
+                catch(RuntimeException exception) { return false; }
+            };
+            var first=pool.submit(attempt);var second=pool.submit(attempt);gate.countDown();
+            assertThat(java.util.List.of(first.get(30,java.util.concurrent.TimeUnit.SECONDS),
+                    second.get(30,java.util.concurrent.TimeUnit.SECONDS))).containsExactlyInAnyOrder(true,false);
+            completed=true;
+        } finally {
+            pool.shutdownNow();
+            boolean terminated=pool.awaitTermination(5,java.util.concurrent.TimeUnit.SECONDS);
+            if(completed) assertThat(terminated).isTrue();
+        }
+        assertThat(proposalState(proposalId)).isEqualTo("REJECTED");
+        assertThat(jdbcTemplate.queryForObject("select count(*) from patch_approvals where patch_proposal_id=?",
+                Integer.class,proposalId)).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject("select count(*) from audit_records where resource_type='PATCH_PROPOSAL' and resource_id=?",
+                Integer.class,proposalId)).isEqualTo(1);
+    }
+    @Test void patchApprovalAndRejectionSerializeOnTheRelease() throws Exception {
+        PatchFixture fixture=patchFixture();
+        UUID proposalId=fixture.stored().patchProposalId();
+        var before=releaseService.find(fixture.source().releaseId());
+        var pool=java.util.concurrent.Executors.newFixedThreadPool(2);
+        boolean completed=false;
+        try {
+            var gate=new java.util.concurrent.CountDownLatch(1);
+            var reject=pool.submit(()->{gate.await();try {contracts.rejectPatchProposal(proposalId,"reject",reviewer);return true;}
+                catch(RuntimeException exception){return false;}});
+            var approve=pool.submit(()->{gate.await();try {contracts.approve(fixture.validated().id(),
+                '"'+fixture.validated().resourceHash()+'"',"approve",proposalId,reviewer);return true;}
+                catch(RuntimeException exception){return false;}});
+            gate.countDown();
+            assertThat(java.util.List.of(reject.get(30,java.util.concurrent.TimeUnit.SECONDS),
+                    approve.get(30,java.util.concurrent.TimeUnit.SECONDS))).containsExactlyInAnyOrder(true,false);
+            completed=true;
+        } finally {
+            pool.shutdownNow();
+            boolean terminated=pool.awaitTermination(5,java.util.concurrent.TimeUnit.SECONDS);
+            if(completed) assertThat(terminated).isTrue();
+        }
+        String decision=jdbcTemplate.queryForObject("select decision from patch_approvals where patch_proposal_id=?",String.class,proposalId);
+        assertThat(jdbcTemplate.queryForObject("select count(*) from patch_approvals where patch_proposal_id=?",
+                Integer.class,proposalId)).isEqualTo(1);
+        assertThat(proposalState(proposalId)).isEqualTo(decision);
+        if ("REJECTED".equals(decision)) {
+            assertThat(contracts.find(fixture.validated().id(),reviewer).state()).isEqualTo("VALIDATED");
+            assertThat(releaseService.find(fixture.source().releaseId()).releaseFingerprint()).isEqualTo(before.releaseFingerprint());
+        } else {
+            assertThat(decision).isEqualTo("APPROVED");
+            assertThat(contracts.find(fixture.validated().id(),reviewer).state()).isEqualTo("APPROVED");
+        }
+    }
+    @Test void reviewOrAuditInsertFailureRollsBackPatchRejection() throws Exception {
+        PatchFixture reviewFailure=patchFixture();
+        UUID reviewProposalId=reviewFailure.stored().patchProposalId();
+        var oversizedActor=new com.finsecseal.contract.SafetyContractLifecyclePolicy.ReviewerContext(
+                reviewer.workspaceId(),"x".repeat(121),"AI_SECURITY_REVIEWER","s",true,true,false);
+        assertThatThrownBy(()->contracts.rejectPatchProposal(reviewProposalId,"review",oversizedActor)).isInstanceOf(RuntimeException.class);
+        assertThat(proposalState(reviewProposalId)).isEqualTo("PROPOSED");
+        assertThat(jdbcTemplate.queryForObject("select count(*) from patch_approvals where patch_proposal_id=?",
+                Integer.class,reviewProposalId)).isZero();
+
+        PatchFixture auditFailure=patchFixture();
+        UUID auditProposalId=auditFailure.stored().patchProposalId();
+        String constraint="ck_patch_audit_test_"+auditProposalId.toString().replace("-","");
+        jdbcTemplate.execute("alter table audit_records add constraint "+constraint+
+                " check (resource_id <> '"+auditProposalId+"'::uuid or action <> 'PATCH_PROPOSAL_REJECTED')");
+        try {
+            assertThatThrownBy(()->contracts.rejectPatchProposal(auditProposalId,"review",reviewer))
+                    .hasMessageContaining(constraint);
+            assertThat(proposalState(auditProposalId)).isEqualTo("PROPOSED");
+            assertThat(jdbcTemplate.queryForObject("select count(*) from patch_approvals where patch_proposal_id=?",
+                    Integer.class,auditProposalId)).isZero();
+            assertThat(jdbcTemplate.queryForObject("select count(*) from audit_records where resource_type='PATCH_PROPOSAL' and resource_id=?",
+                    Integer.class,auditProposalId)).isZero();
+        } finally {
+            jdbcTemplate.execute("alter table audit_records drop constraint "+constraint);
+        }
+    }
+    private String proposalState(UUID id) {
+        return jdbcTemplate.queryForObject("select state from patch_proposals where id=?",String.class,id);
+    }
+    private void insertProposalAudit(UUID workspaceId,UUID proposalId) {
+        jdbcTemplate.update("""
+            insert into audit_records(id,workspace_id,actor_id,action,resource_type,resource_id,metadata_json,occurred_at)
+            values(?,?,?,'PATCH_PROPOSAL_REJECTED','PATCH_PROPOSAL',?,'{}'::jsonb,now())
+            """,UUID.randomUUID(),workspaceId,"reviewer",proposalId);
+    }
+    private PatchFixture patchFixture() throws Exception {
+        Seed source=seed("SEED",false,false);
+        jdbcTemplate.update("update agent_releases set lifecycle_state='REMEDIATION',effective_status='REMEDIATION' where id=?",source.releaseId());
+        ObjectNode policy=(ObjectNode)objectMapper.readTree(getClass().getResourceAsStream("/fixtures/loan-review-safety-contract.json"));
+        ObjectNode broad=policy.deepCopy();
+        ((tools.jackson.databind.node.ArrayNode)broad.at("/fieldPolicy/CUSTOMER_DATA_READ/allowed")).add("accountNumber");
+        var base=contracts.create(source.releaseId(),broad,reviewer);
+        var patch=new com.finsecseal.contract.SafetyContractPatchProposalFacts.ProposedPatch(policy.put("version",2),
+            java.util.List.of(new com.finsecseal.contract.SafetyContractPatchOperation.NarrowSet(
+                com.finsecseal.contract.SafetyContractPatchOperation.SetKind.ALLOWED_FIELDS,"CUSTOMER_DATA_READ",java.util.List.of("employmentStatus","incomeBand"))),
+            "Excessive fields","Required workflow fields retained","Create a reviewed replacement");
+        var stored=contracts.storePatch(source.findingId(),base.id(),patch,reviewer);
+        var candidate=stored.candidate();
+        var validated=contracts.validate(candidate.id(),'"'+candidate.resourceHash()+'"',reviewer);
+        return new PatchFixture(source,base,stored,validated);
+    }
+    private record PatchFixture(Seed source,ContractPersistenceService.Version base,
+                                ContractPersistenceService.StoredPatch stored,ContractPersistenceService.Version validated) {}
     private Seed seed(String partition, boolean hidden, boolean hiddenParent) throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         AgentDto.Response agent = agentService.create(new AgentDto.CreateRequest(

@@ -39,6 +39,7 @@ public class ContractAccessFilter extends OncePerRequestFilter {
         // Prefix matching also protects malformed/encoded descendants before MVC routing.
         return !path.startsWith("/api/v1/platform/contracts") && !path.startsWith("/api/v1/platform/patch-sources")
                 && !path.startsWith("/api/v1/contracts") && !path.startsWith("/api/v1/contract-versions")
+                && !path.startsWith("/api/v1/patch-proposals")
                 && !path.startsWith("/api/v1/reviewer-session")
                 && !path.startsWith("/api/v1/operations")
                 && !path.matches("/api/v1/releases/[^/]+/contracts:generate/?")
