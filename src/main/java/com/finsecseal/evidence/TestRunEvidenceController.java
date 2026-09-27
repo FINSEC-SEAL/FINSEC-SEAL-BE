@@ -4,8 +4,9 @@ import com.finsecseal.common.api.ApiResponse;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.api.TraceIdFilter;
-import jakarta.validation.Valid;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import jakarta.validation.Valid;
 import java.net.URI;
 import java.util.UUID;
 import org.springframework.http.MediaType;
@@ -73,25 +74,34 @@ public class TestRunEvidenceController {
     SseEmitter stream(
             @PathVariable UUID runId,
             @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId,
+            HttpServletRequest request,
             HttpServletResponse response
     ) {
+        long cursor = streamCursor(lastEventId, request.getParameterValues("after"));
         response.setHeader("Cache-Control", "no-cache");
         response.setHeader("X-Accel-Buffering", "no");
-        return eventStream.subscribe(runId, parseCursor(lastEventId));
+        return eventStream.subscribe(runId, cursor);
     }
 
-    private long parseCursor(String value) {
-        if (value == null || value.isBlank()) {
-            return 0;
+    private long streamCursor(String lastEventId, String[] afterValues) {
+        if (afterValues != null && afterValues.length != 1) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "after must be a single non-negative sequence");
+        }
+        Long after = afterValues == null ? null : parseCursor(afterValues[0], "after");
+        if (lastEventId != null && !lastEventId.isBlank()) {
+            return parseCursor(lastEventId, "Last-Event-ID");
+        }
+        return after == null ? 0 : after;
+    }
+
+    private long parseCursor(String value, String source) {
+        if (value == null || !value.matches("[0-9]+")) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, source + " must be a non-negative sequence");
         }
         try {
-            long cursor = Long.parseLong(value);
-            if (cursor < 0) {
-                throw new NumberFormatException("negative cursor");
-            }
-            return cursor;
+            return Long.parseLong(value);
         } catch (NumberFormatException exception) {
-            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Last-Event-ID must be non-negative");
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, source + " must be a non-negative sequence");
         }
     }
 }
