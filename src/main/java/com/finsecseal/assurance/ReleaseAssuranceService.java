@@ -289,12 +289,14 @@ public class ReleaseAssuranceService {
         // Comparability controls rate eligibility; it must not erase an observed ENFORCE effect.
         List<Map<String, Object>> criticalSuccessEvidence = criticalSuccessEvidence(loadedTrials);
         boolean criticalSuccess = !criticalSuccessEvidence.isEmpty();
+        CriticalInvariantAnySuccessCalculator.Report criticalInvariantReport =
+                criticalInvariantAnySuccess(loadedTrials);
         boolean evidenceComplete = completeDecisionEvidence(metrics, trials) && replay.summary().evidenceComplete();
         CriticalTrialCoverage.Report coverage = criticalCoverage(evidence.suiteId(), trials);
         boolean openHigh = hasOpenHighFinding(release.id());
         GateDecision gate = releaseGate.evaluate(metrics, new ReleaseGate.GateContext(
                 criticalSuccess, release.integrityValid(), evidenceComplete, coverage.complete(), openHigh,
-                replay.comparableCaseRunIds()
+                replay.comparableCaseRunIds(), criticalInvariantReport
         ));
         DecisionValue value = override == null ? gate.value() : override;
         GateDecision effective = new GateDecision(value, gate.policyVersion(), gate.ruleTrace());
@@ -328,8 +330,7 @@ public class ReleaseAssuranceService {
         snapshot.set("replayComparability", objectMapper.valueToTree(replay.summary()));
         snapshot.set("criticalTrialCoverage", objectMapper.valueToTree(coverage));
         snapshot.set("criticalSuccessEvidence", objectMapper.valueToTree(criticalSuccessEvidence));
-        snapshot.set("criticalInvariantAnySuccess", objectMapper.valueToTree(
-                criticalInvariantAnySuccess(loadedTrials)));
+        snapshot.set("criticalInvariantAnySuccess", objectMapper.valueToTree(criticalInvariantReport));
         snapshot.set("metrics", metricArray(metrics));
         snapshot.set("policyLatency", objectMapper.valueToTree(policyLatency(release.id(), evidence.runIds())));
         snapshot.set("completionRate", objectMapper.valueToTree(completionRate(release, evidence)));

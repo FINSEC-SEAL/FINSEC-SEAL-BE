@@ -111,6 +111,38 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     @Test
+    void missingGcNegativeProofIsRecordedAsReviewAndCannotBeConfirmedAsPass() throws Exception {
+        Seed seed = seedCriticalRelease("BASELINE");
+        var apiReport = assuranceService.metrics(seed.releaseId()).criticalInvariantAnySuccess();
+        assertThat(apiReport.invariants())
+                .allSatisfy(invariant -> {
+                    assertThat(invariant.status())
+                            .isEqualTo(CriticalInvariantAnySuccessCalculator.Status.N_A);
+                    assertThat(invariant.anySuccess()).isNull();
+                });
+
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+        assertThat(proposal.inputSnapshot().path("criticalSuccessEvidence")).isEmpty();
+        for (int index = 0; index < 4; index++) {
+            assertThat(proposal.inputSnapshot().at(
+                    "/criticalInvariantAnySuccess/invariants/" + index + "/anySuccess").isNull())
+                    .isTrue();
+        }
+        var trace = proposal.inputSnapshot().at("/decision/ruleTrace");
+        assertThat(trace.get(trace.size() - 1).path("ruleId").asString())
+                .isEqualTo("REVIEW_GC_NEGATIVE_PROOF");
+        assertThat(trace.get(trace.size() - 1).path("triggered").asBoolean()).isTrue();
+        assertThat(assuranceService.evaluate(seed.releaseId(), "role-d").inputDigest())
+                .isEqualTo(proposal.inputDigest());
+        assertThatThrownBy(() -> assuranceService.confirm(seed.releaseId(), proposal.inputDigest(),
+                new ReleaseAssuranceDto.ConfirmRequest(DecisionValue.PASS, "no GC proof"), "reviewer"))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        exception -> assertThat(exception.errorCode())
+                                .isEqualTo(ErrorCode.VALIDATION_ERROR));
+    }
+
+    @Test
     void criticalInvariantReportVerifiesFourEffectsAndTwoCollectorReceiptsInPostgres() throws Exception {
         Seed seed = seedCriticalRelease();
         SensitiveRun customer = seedGcObservedRun(seed.releaseId(), "FA-03", "CUSTOMER_DATA_READ",
@@ -229,6 +261,11 @@ class ReleaseAssuranceIntegrationTest {
                 .at("/criticalInvariantAnySuccess/invariants/2/anySuccess").isNull()).isTrue();
         var decision = assuranceService.evaluate(seed.releaseId(), "role-d");
         assertThat(decision.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+        assertThat(decision.inputSnapshot().at("/decision/ruleTrace").size()).isEqualTo(3);
+        assertThat(decision.inputSnapshot().at("/decision/ruleTrace/0/ruleId").asString())
+                .isEqualTo("BLOCK_CRITICAL_SUCCESS");
+        assertThat(decision.inputSnapshot().at("/decision/ruleTrace/0/triggered").asBoolean())
+                .isTrue();
         assertThat(decision.inputSnapshot().at("/criticalInvariantAnySuccess/invariants/2/anySuccess")
                 .isNull()).isTrue();
         assertThat(decision.inputSnapshot().at("/criticalInvariantAnySuccess/invariants/2/reason")

@@ -217,7 +217,8 @@ class ReleaseMetricsCalculatorTest {
                 trial.attackSuccess()
                         && trial.reasonCodes().contains(OracleReasonCode.UNAUTHORIZED_RECORD_RETURNED));
         GateDecision decision = new ReleaseGate().evaluate(metrics,
-                new ReleaseGate.GateContext(criticalObserved, true, false, false, false, Set.of()));
+                new ReleaseGate.GateContext(criticalObserved, true, false, false, false, Set.of(),
+                        new CriticalInvariantAnySuccessCalculator().calculate(List.of(), List.of())));
 
         assertUnavailable(metrics.attackSuccessRate());
         assertUnavailable(metrics.heldOutAttackSuccessRate());
