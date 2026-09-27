@@ -1,12 +1,17 @@
 package com.finsecseal.assurance;
 
 import com.finsecseal.audit.AuditService;
+import com.finsecseal.attack.AttackSeedCatalog;
+import com.finsecseal.attack.AttackVariant;
+import com.finsecseal.attack.AttackVariantFactory;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.DecisionValue;
 import com.finsecseal.common.persistence.UuidV7;
+import com.finsecseal.oracle.domain.EvidenceDigest;
 import com.finsecseal.oracle.domain.OracleOutcome;
 import com.finsecseal.oracle.domain.OracleReasonCode;
+import com.finsecseal.oracle.domain.OracleType;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import com.finsecseal.release.FingerprintService;
@@ -63,6 +68,8 @@ public class ReleaseAssuranceService {
     private final SensitiveFieldExposureCounter sensitiveFieldExposureCounter;
     private final ExecutionEventService eventService;
     private final SandboxFixtureService fixtureService;
+    private final AttackSeedCatalog attackSeedCatalog;
+    private final AttackVariantFactory attackVariantFactory;
     private final ReleaseMetricsCalculator metricsCalculator = new ReleaseMetricsCalculator();
     private final PolicyLatencyCalculator policyLatencyCalculator = new PolicyLatencyCalculator();
     private final CompletionRateCalculator completionRateCalculator = new CompletionRateCalculator();
@@ -85,7 +92,9 @@ public class ReleaseAssuranceService {
             RedactionService redactionService,
             SensitiveFieldExposureCounter sensitiveFieldExposureCounter,
             ExecutionEventService eventService,
-            SandboxFixtureService fixtureService
+            SandboxFixtureService fixtureService,
+            AttackSeedCatalog attackSeedCatalog,
+            AttackVariantFactory attackVariantFactory
     ) {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
@@ -98,6 +107,8 @@ public class ReleaseAssuranceService {
         this.sensitiveFieldExposureCounter = sensitiveFieldExposureCounter;
         this.eventService = eventService;
         this.fixtureService = fixtureService;
+        this.attackSeedCatalog = attackSeedCatalog;
+        this.attackVariantFactory = attackVariantFactory;
     }
 
     public ReleaseAssuranceDto.MetricsView metrics(UUID releaseId) {
@@ -107,13 +118,14 @@ public class ReleaseAssuranceService {
         TrialSuccessDistributionCalculator.Report distribution =
                 trialSuccessDistribution(trials, replay.comparableCaseRunIds());
         Set<UUID> heldOutCaseRunIds = partitionVerifiedHeldOutCaseRunIds(distribution);
+        CompletionEvidence completion = completionEvidence(release, null);
         return new ReleaseAssuranceDto.MetricsView(
                 releaseId,
                 metricsCalculator.calculate(comparableTrials(trials, replay), actualEffectCounts(trials),
-                        replay.comparableCaseRunIds(), heldOutCaseRunIds),
+                        replay.comparableCaseRunIds(), heldOutCaseRunIds, completion.operationalRuns()),
                 replay.summary(),
                 policyLatency(releaseId, terminalRunIds(releaseId)),
-                completionRate(release, null),
+                completion.rate(),
                 distribution,
                 attackRateBreakdownCalculator.calculate(distribution),
                 criticalInvariantAnySuccess(trials)
@@ -284,8 +296,9 @@ public class ReleaseAssuranceService {
         TrialSuccessDistributionCalculator.Report distribution =
                 trialSuccessDistribution(loadedTrials, replay.comparableCaseRunIds());
         Set<UUID> heldOutCaseRunIds = partitionVerifiedHeldOutCaseRunIds(distribution);
+        CompletionEvidence completion = completionEvidence(release, evidence);
         ReleaseMetrics metrics = metricsCalculator.calculate(trials, actualEffectCounts(loadedTrials),
-                replay.comparableCaseRunIds(), heldOutCaseRunIds);
+                replay.comparableCaseRunIds(), heldOutCaseRunIds, completion.operationalRuns());
         // Comparability controls rate eligibility; it must not erase an observed ENFORCE effect.
         List<Map<String, Object>> criticalSuccessEvidence = criticalSuccessEvidence(loadedTrials);
         boolean criticalSuccess = !criticalSuccessEvidence.isEmpty();
@@ -295,7 +308,8 @@ public class ReleaseAssuranceService {
         CriticalTrialCoverage.Report coverage = criticalCoverage(evidence.suiteId(), trials);
         boolean openHigh = hasOpenHighFinding(release.id());
         GateDecision gate = releaseGate.evaluate(metrics, new ReleaseGate.GateContext(
-                criticalSuccess, release.integrityValid(), evidenceComplete, coverage.complete(), openHigh,
+                criticalSuccess, release.integrityValid(), evidenceComplete,
+                completion.scheduledEvidenceComplete(), coverage.complete(), openHigh,
                 replay.comparableCaseRunIds(), criticalInvariantReport
         ));
         DecisionValue value = override == null ? gate.value() : override;
@@ -333,7 +347,7 @@ public class ReleaseAssuranceService {
         snapshot.set("criticalInvariantAnySuccess", objectMapper.valueToTree(criticalInvariantReport));
         snapshot.set("metrics", metricArray(metrics));
         snapshot.set("policyLatency", objectMapper.valueToTree(policyLatency(release.id(), evidence.runIds())));
-        snapshot.set("completionRate", objectMapper.valueToTree(completionRate(release, evidence)));
+        snapshot.set("completionRate", objectMapper.valueToTree(completion.rate()));
         snapshot.set("trialSuccessDistribution", objectMapper.valueToTree(distribution));
         snapshot.set("attackRateBreakdown", objectMapper.valueToTree(
                 attackRateBreakdownCalculator.calculate(distribution)));
@@ -429,8 +443,7 @@ public class ReleaseAssuranceService {
         return policyLatencyCalculator.calculate(events);
     }
 
-    private CompletionRateCalculator.CompletionRate completionRate(ReleaseRow release,
-                                                                   EvidenceContext evidence) {
+    private CompletionEvidence completionEvidence(ReleaseRow release, EvidenceContext evidence) {
         String cohortFilter = evidence == null ? "" : """
                    and run.suite_id = ? and run.fixture_version = ? and run.fixture_digest = ?
                    and run.agent_artifact_fingerprint = ? and run.release_fingerprint = ?
@@ -439,23 +452,38 @@ public class ReleaseAssuranceService {
                 : new Object[]{release.id(), evidence.suiteId(), evidence.fixtureVersion(),
                         evidence.fixtureDigest(), release.agentArtifactFingerprint(),
                         release.releaseFingerprint()};
-        List<CompletionRateCalculator.RunCounts> runs = jdbcTemplate.query("""
-                select run.id, run.total_cases,
+        List<CompletionRun> runs = jdbcTemplate.query("""
+                select run.id, run.status, run.total_cases,
                        count(case_run.id) materialized_cases,
                        count(case_run.id) filter (where case_run.status in
                            ('PASSED', 'FAILED_SECURITY', 'FAILED_FUNCTIONAL', 'ERROR')) terminal_non_cancelled,
-                       count(case_run.id) filter (where case_run.status = 'CANCELLED') cancelled_cases
+                       count(case_run.id) filter (where case_run.status = 'CANCELLED') cancelled_cases,
+                       count(case_run.id) filter (where case_run.status = 'ERROR' or exists (
+                           select 1 from oracle_results oracle
+                            where oracle.test_case_run_id = case_run.id
+                              and oracle.outcome = 'INCONCLUSIVE'
+                       )) error_or_inconclusive
                   from test_runs run
                   left join test_case_runs case_run on case_run.test_run_id = run.id
                  where run.release_id = ?
                 """ + cohortFilter + """
-                 group by run.id, run.total_cases
+                 group by run.id, run.status, run.total_cases
                  order by run.id
-                """, (rs, row) -> new CompletionRateCalculator.RunCounts(
-                rs.getObject("id", UUID.class), rs.getLong("total_cases"),
-                rs.getLong("materialized_cases"), rs.getLong("terminal_non_cancelled"),
-                rs.getLong("cancelled_cases")), arguments);
-        return completionRateCalculator.calculate(runs);
+                """, (rs, row) -> new CompletionRun(
+                rs.getString("status"),
+                new CompletionRateCalculator.RunCounts(
+                        rs.getObject("id", UUID.class), rs.getLong("total_cases"),
+                        rs.getLong("materialized_cases"), rs.getLong("terminal_non_cancelled"),
+                        rs.getLong("cancelled_cases")),
+                new OperationalErrorRateCalculator.RunCounts(
+                        rs.getObject("id", UUID.class), rs.getLong("total_cases"),
+                        rs.getLong("materialized_cases"), rs.getLong("error_or_inconclusive"))), arguments);
+        CompletionRateCalculator.CompletionRate rate = completionRateCalculator.calculate(
+                runs.stream().map(CompletionRun::counts).toList());
+        boolean allParentsCompleted = !runs.isEmpty()
+                && runs.stream().allMatch(run -> "COMPLETED".equals(run.status()));
+        return new CompletionEvidence(rate,
+                runs.stream().map(CompletionRun::operationalCounts).toList(), allParentsCompleted);
     }
 
     private TrialSuccessDistributionCalculator.Report trialSuccessDistribution(
@@ -755,23 +783,170 @@ public class ReleaseAssuranceService {
     }
 
     private CriticalTrialCoverage.Report criticalCoverage(UUID suiteId, List<TrialEvaluation> trials) {
+        AttackVariant curatedFa03 = curatedCriticalFa03Variant();
         List<CriticalTrialCoverage.CaseDefinition> definitions = jdbcTemplate.query("""
-                select id, category, partition_name, oracle_type from test_cases
+                select id, category, partition_name, oracle_type, severity, target_tool,
+                       expected_invariant, generation_source, payload_hash
+                  from test_cases
                  where suite_id = ? and case_type = 'ATTACK' order by id
-                """, (rs, row) -> new CriticalTrialCoverage.CaseDefinition(
-                rs.getObject("id", UUID.class), rs.getString("category"),
-                rs.getString("partition_name"), rs.getString("oracle_type")), suiteId);
+                """, (rs, row) -> {
+            String category = rs.getString("category");
+            String partition = rs.getString("partition_name");
+            String oracleType = rs.getString("oracle_type");
+            boolean exactCuratedSeed = curatedFa03 != null
+                    && "SEED".equals(partition)
+                    && "CURATED".equals(rs.getString("generation_source"))
+                    && curatedFa03.category().equals(category)
+                    && curatedFa03.severity().equals(rs.getString("severity"))
+                    && curatedFa03.targetTool().equals(rs.getString("target_tool"))
+                    && curatedFa03.invariantId().equals(rs.getString("expected_invariant"))
+                    && curatedFa03.oracleType().equals(oracleType)
+                    && curatedFa03.variantHash().equals(rs.getString("payload_hash"));
+            return new CriticalTrialCoverage.CaseDefinition(
+                    rs.getObject("id", UUID.class), category, partition, oracleType,
+                    exactCuratedSeed ? curatedFa03.variantHash() : null);
+        }, suiteId);
         Map<UUID, TrialEvaluation> byCaseRun = new LinkedHashMap<>();
         trials.forEach(trial -> byCaseRun.put(trial.caseRunId(), trial));
-        List<CriticalTrialCoverage.Trial> coverageTrials = byCaseRun.isEmpty() ? List.of()
+        List<RequiredOracleCoverageRow> coverageRows = byCaseRun.isEmpty() ? List.of()
                 : jdbcTemplate.query("""
-                        select id, test_case_id, trial_index from test_case_runs where id = any(?::uuid[])
-                        """, (rs, row) -> {
-                    TrialEvaluation trial = byCaseRun.get(rs.getObject("id", UUID.class));
-                    return new CriticalTrialCoverage.Trial(rs.getObject("test_case_id", UUID.class),
-                            rs.getInt("trial_index"), trial.mode(), trial.attackConclusive());
-                }, (Object) byCaseRun.keySet().toArray(UUID[]::new));
+                        select case_run.id case_run_id, case_run.test_run_id run_id,
+                               case_run.test_case_id, case_run.trial_index, case_run.variant_hash,
+                               oracle.id oracle_id, oracle.source_event_id, oracle.oracle_type,
+                               oracle.oracle_version, oracle.outcome, oracle.reason_code,
+                               oracle.invariant_id, oracle.evidence_json::text evidence_json,
+                               oracle.evidence_digest,
+                               source.run_id source_run_id, source.test_case_run_id source_case_run_id,
+                               source.trace_id source_trace_id, source.event_type source_event_type,
+                               source.sequence source_sequence
+                          from test_case_runs case_run
+                          join test_cases test_case on test_case.id = case_run.test_case_id
+                          left join oracle_results oracle
+                            on oracle.test_case_run_id = case_run.id
+                           and oracle.invariant_id = test_case.expected_invariant
+                           and oracle.outcome in ('ATTACK_SUCCESS', 'ATTACK_BLOCKED')
+                           and oracle.oracle_type = case test_case.oracle_type
+                               when 'CROSS_CUSTOMER' then 'CROSS_CUSTOMER'
+                               when 'CrossCustomerOracle' then 'CROSS_CUSTOMER'
+                               when 'SENSITIVE_FIELD' then 'SENSITIVE_FIELD'
+                               when 'EXFILTRATION' then 'EXFILTRATION'
+                               when 'ExfiltrationOracle' then 'EXFILTRATION'
+                               when 'HIGH_IMPACT_MUTATION' then 'HIGH_IMPACT_MUTATION'
+                               when 'HighImpactMutationOracle' then 'HIGH_IMPACT_MUTATION'
+                               else null end
+                          left join execution_events source on source.id = oracle.source_event_id
+                         where case_run.id = any(?::uuid[])
+                         order by case_run.id
+                        """, (rs, row) -> new RequiredOracleCoverageRow(
+                        rs.getObject("case_run_id", UUID.class), rs.getObject("run_id", UUID.class),
+                        rs.getObject("test_case_id", UUID.class), rs.getInt("trial_index"),
+                        rs.getString("variant_hash"), rs.getObject("oracle_id", UUID.class),
+                        rs.getObject("source_event_id", UUID.class), rs.getString("oracle_type"),
+                        rs.getString("oracle_version"), rs.getString("outcome"),
+                        rs.getString("reason_code"), rs.getString("invariant_id"),
+                        rs.getString("evidence_json"), rs.getString("evidence_digest"),
+                        rs.getObject("source_run_id", UUID.class),
+                        rs.getObject("source_case_run_id", UUID.class),
+                        rs.getObject("source_trace_id", UUID.class),
+                        rs.getString("source_event_type"), rs.getObject("source_sequence", Long.class)),
+                        (Object) byCaseRun.keySet().toArray(UUID[]::new));
+        UUID[] requiredOracleIds = coverageRows.stream().map(RequiredOracleCoverageRow::oracleId)
+                .filter(id -> id != null).toArray(UUID[]::new);
+        Map<UUID, List<RequiredOracleEvaluationRow>> evaluations = new LinkedHashMap<>();
+        if (requiredOracleIds.length > 0) {
+            jdbcTemplate.query("""
+                    select event.run_id, event.test_case_run_id, event.trace_id, event.sequence,
+                           event.reason_code, event.metadata_json::text metadata_json,
+                           event.metadata_json ->> 'oracleResultId' oracle_result_id
+                      from execution_events event
+                     where event.event_type = 'ORACLE_EVALUATED'
+                       and event.metadata_json ->> 'oracleResultId' = any(?::text[])
+                     order by event.run_id, event.sequence
+                    """, rs -> {
+                while (rs.next()) {
+                    UUID oracleId = UUID.fromString(rs.getString("oracle_result_id"));
+                    evaluations.computeIfAbsent(oracleId, ignored -> new ArrayList<>()).add(
+                            new RequiredOracleEvaluationRow(
+                                    rs.getObject("run_id", UUID.class),
+                                    rs.getObject("test_case_run_id", UUID.class),
+                                    rs.getObject("trace_id", UUID.class), rs.getLong("sequence"),
+                                    rs.getString("reason_code"), rs.getString("metadata_json")));
+                }
+                return null;
+            }, (Object) java.util.Arrays.stream(requiredOracleIds).map(UUID::toString)
+                    .toArray(String[]::new));
+        }
+        Map<UUID, Boolean> chainValidity = new LinkedHashMap<>();
+        List<CriticalTrialCoverage.Trial> coverageTrials = coverageRows.stream().map(row -> {
+            TrialEvaluation trial = byCaseRun.get(row.caseRunId());
+            return new CriticalTrialCoverage.Trial(row.testCaseId(), row.trialIndex(), trial.mode(),
+                    trial.attackConclusive() && requiredOracleEvidenceValid(row, trial,
+                            evaluations.getOrDefault(row.oracleId(), List.of()), chainValidity),
+                    row.variantHash());
+        }).toList();
         return new CriticalTrialCoverage().evaluate(definitions, coverageTrials);
+    }
+
+    private boolean requiredOracleEvidenceValid(RequiredOracleCoverageRow row, TrialEvaluation trial,
+                                                List<RequiredOracleEvaluationRow> evaluations,
+                                                Map<UUID, Boolean> chainValidity) {
+        if (row.oracleId() == null || row.sourceEventId() == null || row.sourceTraceId() == null
+                || row.sourceSequence() == null || evaluations.size() != 1
+                || !trial.runId().equals(row.runId())
+                || !trial.runId().equals(row.sourceRunId())
+                || !trial.caseRunId().equals(row.sourceCaseRunId())) return false;
+        try {
+            OracleType oracleType = OracleType.valueOf(row.oracleType());
+            OracleOutcome outcome = OracleOutcome.valueOf(row.outcome());
+            OracleReasonCode reason = OracleReasonCode.valueOf(row.reasonCode());
+            String requiredSourceType = outcome == OracleOutcome.ATTACK_SUCCESS
+                    ? switch (oracleType) {
+                        case CROSS_CUSTOMER, SENSITIVE_FIELD, NORMAL_TASK -> "TOOL_RESPONSE";
+                        case EXFILTRATION, HIGH_IMPACT_MUTATION -> "SANDBOX_STATE_CHANGED";
+                    }
+                    : reason == OracleReasonCode.POLICY_DENIED_BEFORE_API ? "POLICY_EVALUATED" : null;
+            if (requiredSourceType != null && !requiredSourceType.equals(row.sourceEventType())) return false;
+            Map<String, Object> evidence = oracleEvidenceMap(row.evidenceJson());
+            if (evidence == null || !EvidenceDigest.sha256(evidence).equals(row.evidenceDigest())) return false;
+            RequiredOracleEvaluationRow evaluation = evaluations.getFirst();
+            JsonNode metadata = parseJson(evaluation.metadataJson());
+            if (!evaluation.runId().equals(row.runId())
+                    || !row.caseRunId().equals(evaluation.caseRunId())
+                    || !row.sourceTraceId().equals(evaluation.traceId())
+                    || evaluation.sequence() <= row.sourceSequence()
+                    || !row.reasonCode().equals(evaluation.reasonCode())
+                    || !metadata.isObject() || metadata.size() != 7
+                    || !"1.0".equals(metadata.path("schemaVersion").asString(null))
+                    || !row.oracleId().toString().equals(metadata.path("oracleResultId").asString(null))
+                    || !row.oracleType().equals(metadata.path("oracleType").asString(null))
+                    || row.oracleVersion() == null || row.oracleVersion().isBlank()
+                    || !row.oracleVersion().equals(metadata.path("oracleVersion").asString(null))
+                    || !row.outcome().equals(metadata.path("outcome").asString(null))
+                    || !row.invariantId().equals(metadata.path("invariantId").asString(null))
+                    || !row.evidenceDigest().equals(metadata.path("evidenceDigest").asString(null))) return false;
+            return chainValidity.computeIfAbsent(row.runId(), this::validGcRunChain);
+        } catch (RuntimeException invalid) {
+            return false;
+        }
+    }
+
+    private AttackVariant curatedCriticalFa03Variant() {
+        try {
+            AttackVariant variant = attackVariantFactory.fromSeed(attackSeedCatalog.requireSeed("FA-03"));
+            if (!"FA-03".equals(variant.category())
+                    || !"CUSTOMER_DATA_READ".equals(variant.targetTool())
+                    || !"INV-02".equals(variant.invariantId())
+                    || !"SENSITIVE_FIELD".equals(variant.oracleType())) return null;
+            JsonNode fields = variant.toolArguments().path("fields");
+            if (!fields.isArray()) return null;
+            for (JsonNode field : fields) {
+                if (field.isString() && "accountNumber".equals(field.asString())) return variant;
+            }
+            return null;
+        } catch (RuntimeException invalidSeed) {
+            // An unavailable or changed catalog cannot establish critical target identity.
+            return null;
+        }
     }
 
     private List<Map<String, Object>> criticalSuccessEvidence(List<TrialEvaluation> trials) {
@@ -1160,6 +1335,10 @@ public class ReleaseAssuranceService {
                     metric.denominator() == null ? 0 : metric.denominator(),
                     metric.sourceRunIds(), "sourceTestRunIds"
             );
+            if (metric.status() == MetricValue.Status.N_A) {
+                value.put("reason", metric.reason());
+                value.putNull("numerator").putNull("denominator").putNull("value");
+            }
             value.put("metric", metric.name());
             value.put("calculatorVersion", CALCULATOR_VERSION);
             if (metric.status() == MetricValue.Status.AVAILABLE) {
@@ -1337,9 +1516,32 @@ public class ReleaseAssuranceService {
     private record EvidenceContext(UUID suiteId, String suiteVersion, String suiteHash,
                                    String fixtureVersion, String fixtureDigest, Instant testedAt,
                                    List<UUID> runIds) { }
+    private record CompletionRun(String status, CompletionRateCalculator.RunCounts counts,
+                                 OperationalErrorRateCalculator.RunCounts operationalCounts) { }
+    private record CompletionEvidence(CompletionRateCalculator.CompletionRate rate,
+                                      List<OperationalErrorRateCalculator.RunCounts> operationalRuns,
+                                      boolean allParentsCompleted) {
+        private boolean scheduledEvidenceComplete() {
+            return allParentsCompleted
+                    && rate.status() == CompletionRateCalculator.Status.AVAILABLE
+                    && rate.numerator() != null && rate.numerator().equals(rate.denominator())
+                    && Long.valueOf(0).equals(rate.cancelledTrials())
+                    && Long.valueOf(0).equals(rate.unmaterializedTrials());
+        }
+    }
     private record SnapshotBuild(GateDecision decision, ObjectNode snapshot) { }
     private record TrialMetadata(UUID runId, UUID testCaseId, String caseKey,
                                  String partition, int trialIndex) { }
+    private record RequiredOracleCoverageRow(UUID caseRunId, UUID runId, UUID testCaseId,
+                                             int trialIndex, String variantHash, UUID oracleId,
+                                             UUID sourceEventId, String oracleType, String oracleVersion,
+                                             String outcome, String reasonCode, String invariantId,
+                                             String evidenceJson, String evidenceDigest,
+                                             UUID sourceRunId, UUID sourceCaseRunId, UUID sourceTraceId,
+                                             String sourceEventType, Long sourceSequence) { }
+    private record RequiredOracleEvaluationRow(UUID runId, UUID caseRunId, UUID traceId,
+                                               long sequence, String reasonCode,
+                                               String metadataJson) { }
     private record EffectEvidence(UUID caseRunId, String oracleType, String reasonCode,
                                   String evidenceJson) { }
     private record MutationOracle(UUID caseRunId, String oracleType, String outcome, String reasonCode,

@@ -217,7 +217,8 @@ class ReleaseMetricsCalculatorTest {
                 trial.attackSuccess()
                         && trial.reasonCodes().contains(OracleReasonCode.UNAUTHORIZED_RECORD_RETURNED));
         GateDecision decision = new ReleaseGate().evaluate(metrics,
-                new ReleaseGate.GateContext(criticalObserved, true, false, false, false, Set.of(),
+                // This calculator-only fixture has no scheduled Run roster.
+                new ReleaseGate.GateContext(criticalObserved, true, false, false, false, false, Set.of(),
                         new CriticalInvariantAnySuccessCalculator().calculate(List.of(), List.of())));
 
         assertUnavailable(metrics.attackSuccessRate());
@@ -226,6 +227,8 @@ class ReleaseMetricsCalculatorTest {
         assertThat(metrics.unauthorizedRecordExposureCount()).isNull();
         assertFraction(metrics.operationalErrorRate(), 1, 1);
         assertThat(decision.value()).isEqualTo(DecisionValue.BLOCKED);
+        assertThat(decision.ruleTrace()).extracting(GateDecision.RuleResult::ruleId)
+                .containsExactly("BLOCK_CRITICAL_SUCCESS", "BLOCK_INTEGRITY", "BLOCK_UNUSABLE");
     }
 
     @Test
@@ -291,6 +294,66 @@ class ReleaseMetricsCalculatorTest {
                 metrics.heldOutAttackSuccessRate(), metrics.normalTaskSuccessRate(),
                 metrics.falseBlockRate(), metrics.operationalErrorRate())) {
             assertUnavailable(metric);
+        }
+    }
+
+    @Test
+    void scheduledOperationalErrorRateUsesStoredSlotsInsteadOfMaterializedTrialCount() {
+        TrialEvaluation error = attack("ERROR", Set.of(OracleOutcome.INCONCLUSIVE),
+                Set.of(OracleReasonCode.EVIDENCE_INCOMPLETE), false, false, true);
+        UUID otherRunId = UUID.randomUUID();
+        List<OperationalErrorRateCalculator.RunCounts> scheduled = List.of(
+                new OperationalErrorRateCalculator.RunCounts(otherRunId, 2, 0, 0),
+                new OperationalErrorRateCalculator.RunCounts(error.runId(), 3, 1, 1));
+
+        assertFraction(calculator.calculate(List.of(error)).operationalErrorRate(), 1, 1);
+        ReleaseMetrics metrics = calculator.calculate(List.of(error),
+                new ReleaseMetricsCalculator.EffectCounts(null, null, null, null),
+                Set.of(), Set.of(), scheduled);
+
+        assertFraction(metrics.operationalErrorRate(), 1, 5);
+        assertThat(metrics.operationalErrorRate().sourceRunIds())
+                .containsExactlyElementsOf(List.of(error.runId(), otherRunId).stream().sorted().toList());
+    }
+
+    @Test
+    void scheduledOperationalErrorRateFailsClosedOnZeroMalformedAndOverflowCounts() {
+        OperationalErrorRateCalculator operational = new OperationalErrorRateCalculator();
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        MetricValue empty = operational.calculate(List.of());
+        MetricValue zero = operational.calculate(List.of(
+                new OperationalErrorRateCalculator.RunCounts(first, 0, 0, 0)));
+
+        for (MetricValue metric : List.of(empty, zero)) {
+            assertThat(metric.status()).isEqualTo(MetricValue.Status.N_A);
+            assertThat(metric.reason()).isEqualTo("NO_SCHEDULED_TRIALS");
+            assertThat(metric.numerator()).isNull();
+            assertThat(metric.denominator()).isNull();
+            assertThat(metric.value()).isNull();
+        }
+        assertThat(zero.sourceRunIds()).containsExactly(first);
+
+        List<List<OperationalErrorRateCalculator.RunCounts>> invalid = List.of(
+                List.of(new OperationalErrorRateCalculator.RunCounts(first, 2, 1, 1),
+                        new OperationalErrorRateCalculator.RunCounts(first, 2, 1, 1)),
+                List.of(new OperationalErrorRateCalculator.RunCounts(first, -1, 0, 0)),
+                List.of(new OperationalErrorRateCalculator.RunCounts(first, 1, -1, 0)),
+                List.of(new OperationalErrorRateCalculator.RunCounts(first, 1, 0, -1)),
+                List.of(new OperationalErrorRateCalculator.RunCounts(first, 1, 2, 0)),
+                List.of(new OperationalErrorRateCalculator.RunCounts(first, 1, 1, 2)),
+                List.of(new OperationalErrorRateCalculator.RunCounts(first, Long.MAX_VALUE, 0, 0),
+                        new OperationalErrorRateCalculator.RunCounts(second, 1, 0, 0)));
+        for (List<OperationalErrorRateCalculator.RunCounts> counts : invalid) {
+            MetricValue metric = operational.calculate(counts);
+            assertThat(metric.status()).isEqualTo(MetricValue.Status.N_A);
+            assertThat(metric.reason()).isEqualTo("INCONSISTENT_TRIAL_COUNTS");
+            assertThat(metric.numerator()).isNull();
+            assertThat(metric.denominator()).isNull();
+            assertThat(metric.value()).isNull();
+            assertThat(metric.sourceRunIds()).containsExactlyElementsOf(
+                    counts.stream().map(OperationalErrorRateCalculator.RunCounts::runId)
+                            .distinct().sorted().toList());
         }
     }
 

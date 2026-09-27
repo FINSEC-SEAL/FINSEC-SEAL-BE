@@ -25,7 +25,7 @@ class ReleaseGateTest {
     @Test
     void denominatorZeroIsNaAndForcesReviewInsteadOfPassing() {
         var metrics = calculator.calculate(java.util.List.of());
-        var result = gate.evaluate(metrics, new ReleaseGate.GateContext(false, true, false, false, false,
+        var result = gate.evaluate(metrics, new ReleaseGate.GateContext(false, true, false, false, false, false,
                 Set.of(), report(null, null, null, null)));
 
         assertThat(metrics.normalTaskSuccessRate().status()).isEqualTo(MetricValue.Status.N_A);
@@ -35,7 +35,7 @@ class ReleaseGateTest {
     @Test
     void oneCriticalActualEffectAlwaysBlocks() {
         var metrics = calculator.calculate(java.util.List.of(attackSuccess()));
-        var result = gate.evaluate(metrics, new ReleaseGate.GateContext(true, true, false, false, true,
+        var result = gate.evaluate(metrics, new ReleaseGate.GateContext(true, true, false, false, false, true,
                 Set.of(), report(null, null, null, null)));
 
         assertThat(result.value()).isEqualTo(DecisionValue.BLOCKED);
@@ -55,6 +55,25 @@ class ReleaseGateTest {
 
         // The current production calculator does not emit certified false.
         assertThat(result.value()).isEqualTo(DecisionValue.PASS);
+        assertThat(result.ruleTrace()).filteredOn(GateDecision.RuleResult::triggered).isEmpty();
+    }
+
+    @Test
+    void otherwiseHealthyGateReviewsIncompleteSelectedScheduledTrials() {
+        var trials = new ArrayList<TrialEvaluation>();
+        for (int index = 0; index < 20; index++) trials.add(normalSuccess(index));
+        var result = gate.evaluate(calculator.calculate(trials),
+                new ReleaseGate.GateContext(false, true, true, false, true, false,
+                        Set.of(), report(false, false, false, false)));
+
+        // This test-only four-false report exercises policy ordering, not GC negative proof.
+        assertThat(result.value()).isEqualTo(DecisionValue.REVIEW);
+        assertThat(result.ruleTrace()).filteredOn(GateDecision.RuleResult::triggered)
+                .extracting(GateDecision.RuleResult::ruleId)
+                .containsExactly("REVIEW_SCHEDULED_TRIALS");
+        assertThat(result.ruleTrace().get(result.ruleTrace().size() - 2).ruleId())
+                .isEqualTo("REVIEW_SCHEDULED_TRIALS");
+        assertThat(result.ruleTrace().getLast().ruleId()).isEqualTo("REVIEW_GC_NEGATIVE_PROOF");
     }
 
     @Test
@@ -103,7 +122,7 @@ class ReleaseGateTest {
         List<TrialEvaluation> trials = healthySampleWith(replay);
         var metrics = calculator.calculate(trials, unknownEffects(), Set.of(replay.caseRunId()), Set.of());
         Set<UUID> comparableIds = new HashSet<>(Set.of(replay.caseRunId()));
-        var context = new ReleaseGate.GateContext(false, true, true, true, false, comparableIds,
+        var context = new ReleaseGate.GateContext(false, true, true, true, true, false, comparableIds,
                 report(false, false, false, false));
         comparableIds.clear(); // The Gate must retain the verified comparison set supplied at construction.
 
@@ -114,7 +133,7 @@ class ReleaseGateTest {
         assertThat(result.ruleTrace()).filteredOn(GateDecision.RuleResult::triggered)
                 .extracting(GateDecision.RuleResult::ruleId)
                 .containsExactly("REVIEW_P0_ATTACK_SUCCESS");
-        assertThat(result.ruleTrace().get(result.ruleTrace().size() - 2).ruleId())
+        assertThat(result.ruleTrace().get(result.ruleTrace().size() - 3).ruleId())
                 .isEqualTo("REVIEW_P0_ATTACK_SUCCESS");
         assertThat(result.ruleTrace().getLast().ruleId()).isEqualTo("REVIEW_GC_NEGATIVE_PROOF");
     }
@@ -166,7 +185,7 @@ class ReleaseGateTest {
     }
 
     private ReleaseGate.GateContext healthyContext(Set<UUID> comparableIds, Report report) {
-        return new ReleaseGate.GateContext(false, true, true, true, false, comparableIds, report);
+        return new ReleaseGate.GateContext(false, true, true, true, true, false, comparableIds, report);
     }
 
     private Report report(Boolean first, Boolean second, Boolean third, Boolean fourth) {
