@@ -280,7 +280,8 @@ public class ReleaseAssuranceService {
         CriticalTrialCoverage.Report coverage = criticalCoverage(evidence.suiteId(), trials);
         boolean openHigh = hasOpenHighFinding(release.id());
         GateDecision gate = releaseGate.evaluate(metrics, new ReleaseGate.GateContext(
-                criticalSuccess, release.integrityValid(), evidenceComplete, coverage.complete(), openHigh
+                criticalSuccess, release.integrityValid(), evidenceComplete, coverage.complete(), openHigh,
+                replay.comparableCaseRunIds()
         ));
         DecisionValue value = override == null ? gate.value() : override;
         GateDecision effective = new GateDecision(value, gate.policyVersion(), gate.ruleTrace());

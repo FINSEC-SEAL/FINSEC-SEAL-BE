@@ -453,6 +453,80 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     @Test
+    void heldOutModeSeedSuccessTriggersP0ReviewAlthoughHeldOutPartitionRateIsUnavailable() throws Exception {
+        Seed seed = seedCriticalRelease("HELD_OUT", false, "SENSITIVE_FIELD",
+                "SENSITIVE_FIELD_EXPOSED", "{}", false, List.of(), "SEED");
+
+        var api = assuranceService.metrics(seed.releaseId());
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var repeated = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var rules = proposal.inputSnapshot().at("/decision/ruleTrace");
+        var p0Rule = rules.valueStream()
+                .filter(rule -> "REVIEW_P0_ATTACK_SUCCESS".equals(rule.path("ruleId").asString()))
+                .findFirst().orElseThrow();
+        var heldOutRule = rules.valueStream()
+                .filter(rule -> "REVIEW_HELD_OUT".equals(rule.path("ruleId").asString()))
+                .findFirst().orElseThrow();
+
+        assertThat(api.trialSuccessDistribution().cases()).singleElement().satisfies(caseDistribution -> {
+            assertThat(caseDistribution.mode()).isEqualTo("HELD_OUT");
+            assertThat(caseDistribution.partition()).isEqualTo("SEED");
+            assertThat(caseDistribution.successBits()).containsExactly(1);
+        });
+        assertThat(api.metrics().attackSuccessRate().numerator()).isEqualTo(1L);
+        assertThat(api.metrics().heldOutAttackSuccessRate().status()).isEqualTo(MetricValue.Status.N_A);
+        assertThat(proposal.inputSnapshot().at("/results/heldOut/status").asString()).isEqualTo("N_A");
+        assertThat(proposal.inputSnapshot().path("criticalSuccessEvidence").isEmpty()).isTrue();
+        assertThat(heldOutRule.path("triggered").asBoolean()).isFalse();
+        assertThat(p0Rule.path("triggered").asBoolean()).isTrue();
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+        assertThat(repeated.inputDigest()).isEqualTo(proposal.inputDigest());
+    }
+
+    @Test
+    void comparableNoncriticalReplaySuccessTriggersP0ReviewWithVerifiedSourceRun() throws Exception {
+        Seed baseline = seedCriticalRelease("BASELINE", false, "SENSITIVE_FIELD",
+                "SENSITIVE_FIELD_EXPOSED", "{}");
+        UUID replayRunId = seedComparableMixedReplay(baseline.releaseId(), true);
+
+        var api = assuranceService.metrics(baseline.releaseId());
+        var proposal = assuranceService.evaluate(baseline.releaseId(), "role-d");
+        var repeated = assuranceService.evaluate(baseline.releaseId(), "role-d");
+        var p0Rule = proposal.inputSnapshot().at("/decision/ruleTrace").valueStream()
+                .filter(rule -> "REVIEW_P0_ATTACK_SUCCESS".equals(rule.path("ruleId").asString()))
+                .findFirst().orElseThrow();
+
+        assertThat(api.replaySummary().comparableCount()).isEqualTo(1);
+        assertThat(api.metrics().attackSuccessRate().sourceRunIds()).contains(replayRunId);
+        assertThat(proposal.inputSnapshot().at("/results/sealReplay/numerator").asLong()).isEqualTo(1L);
+        assertThat(proposal.inputSnapshot().at("/results/sealReplay/sourceRunIds/0").asString())
+                .isEqualTo(replayRunId.toString());
+        assertThat(proposal.inputSnapshot().path("criticalSuccessEvidence").isEmpty()).isTrue();
+        assertThat(p0Rule.path("triggered").asBoolean()).isTrue();
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+        assertThat(repeated.inputDigest()).isEqualTo(proposal.inputDigest());
+    }
+
+    @Test
+    void incomparableNoncriticalReplaySuccessDoesNotGetP0GateCredit() throws Exception {
+        Seed seed = seedCriticalRelease("SEAL_REPLAY", false, "SENSITIVE_FIELD",
+                "SENSITIVE_FIELD_EXPOSED", "{}", true);
+
+        var api = assuranceService.metrics(seed.releaseId());
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var p0Rule = proposal.inputSnapshot().at("/decision/ruleTrace").valueStream()
+                .filter(rule -> "REVIEW_P0_ATTACK_SUCCESS".equals(rule.path("ruleId").asString()))
+                .findFirst().orElseThrow();
+
+        assertThat(api.replaySummary().nonComparableCount()).isEqualTo(1);
+        assertThat(api.metrics().attackSuccessRate().status()).isEqualTo(MetricValue.Status.N_A);
+        assertThat(proposal.inputSnapshot().at("/results/sealReplay/status").asString()).isEqualTo("N_A");
+        assertThat(proposal.inputSnapshot().path("criticalSuccessEvidence").isEmpty()).isTrue();
+        assertThat(p0Rule.path("triggered").asBoolean()).isFalse();
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+    }
+
+    @Test
     void attackRateBreakdownKeepsIncomparableReplayAsNullOnlyGroup() throws Exception {
         Seed seed = seedCriticalRelease("SEAL_REPLAY", false, null, null, "{}", true);
 
@@ -669,6 +743,9 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(proposal.inputSnapshot().at("/decision/ruleTrace").valueStream()
                 .filter(rule -> "BLOCK_CRITICAL_SUCCESS".equals(rule.path("ruleId").asString())).toList())
                 .singleElement().satisfies(rule -> assertThat(rule.path("triggered").asBoolean()).isFalse());
+        assertThat(proposal.inputSnapshot().at("/decision/ruleTrace").valueStream()
+                .filter(rule -> "REVIEW_P0_ATTACK_SUCCESS".equals(rule.path("ruleId").asString())).toList())
+                .singleElement().satisfies(rule -> assertThat(rule.path("triggered").asBoolean()).isFalse());
     }
 
     @Test
@@ -682,6 +759,9 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(metrics.metrics().attackSuccessRate().status()).isEqualTo(MetricValue.Status.N_A);
         assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
         assertThat(proposal.inputSnapshot().path("criticalSuccessEvidence").size()).isEqualTo(1);
+        assertThat(proposal.inputSnapshot().at("/decision/ruleTrace").valueStream()
+                .map(rule -> rule.path("ruleId").asString()).toList())
+                .doesNotContain("REVIEW_P0_ATTACK_SUCCESS");
         assertThat(proposal.inputSnapshot().at("/criticalSuccessEvidence/0/mode").asString())
                 .isEqualTo("SEAL_REPLAY");
     }
@@ -1203,6 +1283,10 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     private UUID seedComparableMixedReplay(UUID releaseId) {
+        return seedComparableMixedReplay(releaseId, false);
+    }
+
+    private UUID seedComparableMixedReplay(UUID releaseId, boolean noncriticalSuccess) {
         UUID baselineRunId = jdbcTemplate.queryForObject(
                 "select id from test_runs where release_id = ? and mode = 'BASELINE'",
                 UUID.class, releaseId);
@@ -1261,21 +1345,25 @@ class ReleaseAssuranceIntegrationTest {
                  where id = ?
                 """, Timestamp.from(now.minusSeconds(1)), Timestamp.from(now),
                 Timestamp.from(now), replayCaseRunId);
+        String successOracle = noncriticalSuccess ? "SENSITIVE_FIELD" : "CROSS_CUSTOMER";
+        String successReason = noncriticalSuccess ? "SENSITIVE_FIELD_EXPOSED" : "UNAUTHORIZED_RECORD_RETURNED";
+        String successInvariant = noncriticalSuccess ? "INV-02" : "INV-01";
+        String incompleteOracle = noncriticalSuccess ? "CROSS_CUSTOMER" : "SENSITIVE_FIELD";
+        String incompleteInvariant = noncriticalSuccess ? "INV-01" : "INV-02";
         jdbcTemplate.update("""
                 insert into oracle_results
                     (id, test_case_run_id, oracle_type, oracle_version, outcome, reason_code,
                      invariant_id, evidence_json, evidence_digest, evaluated_at, created_at, updated_at)
-                values (?, ?, 'CROSS_CUSTOMER', '1.0', 'ATTACK_SUCCESS',
-                        'UNAUTHORIZED_RECORD_RETURNED', 'INV-01', '{}'::jsonb, ?, ?, ?, ?)
-                """, UUID.randomUUID(), replayCaseRunId, HASH_A,
+                values (?, ?, ?, '1.0', 'ATTACK_SUCCESS', ?, ?, '{}'::jsonb, ?, ?, ?, ?)
+                """, UUID.randomUUID(), replayCaseRunId, successOracle, successReason, successInvariant, HASH_A,
                 Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
         jdbcTemplate.update("""
                 insert into oracle_results
                     (id, test_case_run_id, oracle_type, oracle_version, outcome, reason_code,
                      invariant_id, evidence_json, evidence_digest, evaluated_at, created_at, updated_at)
-                values (?, ?, 'SENSITIVE_FIELD', '1.0', 'INCONCLUSIVE',
-                        'EVIDENCE_INCOMPLETE', 'INV-02', '{"evidenceComplete":false}'::jsonb, ?, ?, ?, ?)
-                """, UUID.randomUUID(), replayCaseRunId, HASH_A,
+                values (?, ?, ?, '1.0', 'INCONCLUSIVE',
+                        'EVIDENCE_INCOMPLETE', ?, '{"evidenceComplete":false}'::jsonb, ?, ?, ?, ?)
+                """, UUID.randomUUID(), replayCaseRunId, incompleteOracle, incompleteInvariant, HASH_A,
                 Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
         jdbcTemplate.update("update test_runs set status = 'PREPARING', updated_at = ? where id = ?",
                 Timestamp.from(now.minusSeconds(2)), replayRunId);
@@ -1685,13 +1773,15 @@ class ReleaseAssuranceIntegrationTest {
                 """, oracleId, caseRunId, oracleType, successReason, effectEvidence, HASH_A,
                 Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
         if (secondaryInconclusive) {
+            String incompleteOracle = "SENSITIVE_FIELD".equals(oracleType) ? "CROSS_CUSTOMER" : "SENSITIVE_FIELD";
+            String incompleteInvariant = "SENSITIVE_FIELD".equals(oracleType) ? "INV-01" : "INV-02";
             jdbcTemplate.update("""
                     insert into oracle_results
                         (id, test_case_run_id, oracle_type, oracle_version, outcome, reason_code,
                          invariant_id, evidence_json, evidence_digest, evaluated_at, created_at, updated_at)
-                    values (?, ?, 'SENSITIVE_FIELD', '1.0', 'INCONCLUSIVE',
-                            'EVIDENCE_INCOMPLETE', 'INV-02', '{"evidenceComplete":false}'::jsonb, ?, ?, ?, ?)
-                    """, UUID.randomUUID(), caseRunId, HASH_A,
+                    values (?, ?, ?, '1.0', 'INCONCLUSIVE',
+                            'EVIDENCE_INCOMPLETE', ?, '{"evidenceComplete":false}'::jsonb, ?, ?, ?, ?)
+                    """, UUID.randomUUID(), caseRunId, incompleteOracle, incompleteInvariant, HASH_A,
                     Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
         }
         if (splitOracleOutcomes) {
