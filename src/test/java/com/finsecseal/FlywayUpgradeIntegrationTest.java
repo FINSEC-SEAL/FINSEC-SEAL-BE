@@ -37,12 +37,13 @@ class FlywayUpgradeIntegrationTest {
         UUID legacyNamespace = insertLegacyDocument();
 
         Flyway current = flyway(null);
-        assertThat(current.migrate().migrationsExecuted).isEqualTo(10);
-        assertThat(appliedVersionCount()).isEqualTo(19);
+        assertThat(current.migrate().migrationsExecuted).isEqualTo(11);
+        assertThat(appliedVersionCount()).isEqualTo(20);
         assertThat(current.validateWithResult().validationSuccessful).isTrue();
-        assertThat(current.info().current().getVersion()).isEqualTo(MigrationVersion.fromVersion("16"));
+        assertThat(current.info().current().getVersion()).isEqualTo(MigrationVersion.fromVersion("17"));
         verifyDocumentSourceTimestamp(legacyNamespace);
         verifyReviewerSessionRevocationSchema();
+        verifyRunReviewerGrantSchemaWithoutBackfill(legacyNamespace);
 
         UUID leaseId = UUID.randomUUID();
         Instant now = Instant.now();
@@ -152,6 +153,31 @@ class FlywayUpgradeIntegrationTest {
             var names = new java.util.ArrayList<String>();
             while (columns.next()) names.add(columns.getString(1));
             assertThat(names).containsExactly("session_digest", "expires_at", "revoked_at");
+        }
+    }
+
+    private void verifyRunReviewerGrantSchemaWithoutBackfill(UUID legacyRun) throws SQLException {
+        try (var connection = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+             var statement = connection.createStatement();
+             var columns = statement.executeQuery("""
+                     select column_name from information_schema.columns
+                      where table_schema = 'public' and table_name = 'test_run_reviewer_grants'
+                      order by ordinal_position
+                     """)) {
+            var names = new java.util.ArrayList<String>();
+            while (columns.next()) names.add(columns.getString(1));
+            assertThat(names).containsExactly("run_id", "workspace_id", "actor_id", "reviewer_role",
+                    "session_digest", "authority_stamp", "authority_expires_at", "created_at");
+        }
+        try (var connection = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+             var query = connection.prepareStatement("select count(*) from test_run_reviewer_grants where run_id = ?")) {
+            query.setObject(1, legacyRun);
+            try (var rows = query.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+                assertThat(rows.getInt(1)).isZero();
+            }
         }
     }
 
