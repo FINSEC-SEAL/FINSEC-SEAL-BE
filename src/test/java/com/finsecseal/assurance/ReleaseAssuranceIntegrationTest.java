@@ -91,7 +91,7 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(proposal.inputSnapshot().at("/criticalTrialCoverage/cases/0/requiredTrials").asInt())
                 .isEqualTo(3);
         assertThat(proposal.inputSnapshot().at("/criticalTrialCoverage/cases/0/conclusiveTrials").asInt())
-                .isEqualTo(1);
+                .isZero(); // The legacy source-less direct Oracle row cannot prove coverage.
         assertThat(jdbcTemplate.queryForObject(
                 "select lifecycle_state from agent_releases where id = ?", String.class, seed.releaseId()
         )).isEqualTo("DECISION_PENDING");
@@ -219,6 +219,58 @@ class ReleaseAssuranceIntegrationTest {
                 .inputSnapshot().path("criticalSuccessEvidence")).isEmpty();
         assertThat(assuranceService.evaluate(matching.releaseId(), "role-d").inputDigest())
                 .isEqualTo(matchingProposal.inputDigest());
+    }
+
+    @Test
+    void requiredOracleCoverageRejectsIncompleteOrMismatchedRecordedChains() throws Exception {
+        for (RequiredOracleFault fault : List.of(
+                RequiredOracleFault.NULL_SOURCE, RequiredOracleFault.BAD_DIGEST,
+                RequiredOracleFault.MISSING_EVALUATION, RequiredOracleFault.DUPLICATE_EVALUATION,
+                RequiredOracleFault.MISMATCHED_EVALUATION, RequiredOracleFault.WRONG_SOURCE_TYPE,
+                RequiredOracleFault.WRONG_POLICY_DENIED_SOURCE,
+                RequiredOracleFault.WRONG_TRACE, RequiredOracleFault.WRONG_SEQUENCE,
+                RequiredOracleFault.WRONG_EVALUATION_CASE, RequiredOracleFault.BROKEN_RUN_HEAD)) {
+            RequiredOracleCohort cohort = seedHeldOutRequiredOracleCohort(
+                    "CROSS_CUSTOMER", "CROSS_CUSTOMER", "INV-01",
+                    fault == RequiredOracleFault.WRONG_SOURCE_TYPE ? "ATTACK_SUCCESS" : "ATTACK_BLOCKED",
+                    fault);
+            var proposal = assuranceService.evaluate(cohort.releaseId(), "role-d");
+            JsonNode coverage = coverageCase(proposal, cohort.caseId());
+
+            assertThat(coverage.path("conclusiveTrials").asInt()).as("%s coverage", fault)
+                    .isEqualTo(fault == RequiredOracleFault.BROKEN_RUN_HEAD ? 0 : 2);
+            assertThat(coverage.path("complete").asBoolean()).as("%s incomplete", fault).isFalse();
+            assertThat(proposal.proposedDecision()).as("%s Decision", fault).isEqualTo(DecisionValue.REVIEW);
+            assertThat(proposal.inputSnapshot().at("/criticalInvariantAnySuccess/invariants/0/anySuccess")
+                    .isNull()).as("%s GC remains unknown", fault).isTrue();
+            assertThat(assuranceService.evaluate(cohort.releaseId(), "role-d").inputDigest())
+                    .as("%s deterministic Decision", fault).isEqualTo(proposal.inputDigest());
+        }
+    }
+
+    @Test
+    void crossCaseRunOracleSourceIsRejectedByPostgresBeforeCoverage() throws Exception {
+        RequiredOracleCohort cohort = seedHeldOutRequiredOracleCohort(
+                "CROSS_CUSTOMER", "CROSS_CUSTOMER", "INV-01", "ATTACK_BLOCKED",
+                RequiredOracleFault.CROSS_CASE_SOURCE_REJECTED);
+        var proposal = assuranceService.evaluate(cohort.releaseId(), "role-d");
+
+        assertThat(coverageCase(proposal, cohort.caseId()).path("conclusiveTrials").asInt())
+                .isEqualTo(3);
+        assertThat(coverageCase(proposal, cohort.caseId()).path("complete").asBoolean()).isTrue();
+    }
+
+    @Test
+    void policyDeniedBlockedOracleWithMatchingPolicySourceStillCounts() throws Exception {
+        RequiredOracleCohort cohort = seedHeldOutRequiredOracleCohort(
+                "CROSS_CUSTOMER", "CROSS_CUSTOMER", "INV-01", "ATTACK_BLOCKED",
+                RequiredOracleFault.POLICY_DENIED_VALID);
+        var proposal = assuranceService.evaluate(cohort.releaseId(), "role-d");
+
+        assertThat(coverageCase(proposal, cohort.caseId()).path("conclusiveTrials").asInt())
+                .isEqualTo(3);
+        assertThat(coverageCase(proposal, cohort.caseId()).path("complete").asBoolean()).isTrue();
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
     }
 
     @Test
@@ -1943,6 +1995,15 @@ class ReleaseAssuranceIntegrationTest {
                                                                  String lastOracleType,
                                                                  String lastInvariant,
                                                                  String lastOutcome) throws Exception {
+        return seedHeldOutRequiredOracleCohort(caseOracleType, lastOracleType, lastInvariant,
+                lastOutcome, RequiredOracleFault.NONE);
+    }
+
+    private RequiredOracleCohort seedHeldOutRequiredOracleCohort(String caseOracleType,
+                                                                 String lastOracleType,
+                                                                 String lastInvariant,
+                                                                 String lastOutcome,
+                                                                 RequiredOracleFault fault) throws Exception {
         UUID releaseId = seedReleaseWithoutRuns();
         ReleaseDto.Response release = releaseService.find(releaseId);
         UUID contractVersionId = seedApprovedContract(releaseId);
@@ -1982,6 +2043,10 @@ class ReleaseAssuranceIntegrationTest {
                 """, runId, releaseId, suiteId, contractVersionId,
                 release.agentArtifactFingerprint(), release.releaseFingerprint(), HASH_A, HASH_A,
                 Timestamp.from(now), Timestamp.from(now));
+        UUID traceId = UUID.randomUUID();
+        startCoverageRun(runId, now, traceId);
+        UUID firstCaseRunId = null;
+        UUID firstSourceEventId = null;
         for (int index = 0; index < 3; index++) {
             UUID caseRunId = UUID.randomUUID();
             String oracleType = index == 2 ? lastOracleType : "CROSS_CUSTOMER";
@@ -2002,29 +2067,31 @@ class ReleaseAssuranceIntegrationTest {
                     Timestamp.from(now.minusSeconds(1)), Timestamp.from(now),
                     Timestamp.from(now), caseRunId);
             if (oracleType != null) {
-                jdbcTemplate.update("""
-                        insert into oracle_results
-                            (id, test_case_run_id, oracle_type, oracle_version, outcome,
-                             reason_code, invariant_id, evidence_json, evidence_digest,
-                             evaluated_at, created_at, updated_at)
-                        values (?, ?, ?, '1.0', ?, ?, ?, '{}'::jsonb, ?, ?, ?, ?)
-                        """, UUID.randomUUID(), caseRunId, oracleType, outcome,
-                        "INCONCLUSIVE".equals(outcome) ? "EVIDENCE_INCOMPLETE"
-                                : "ATTACK_SUCCESS".equals(outcome) ? "SENSITIVE_FIELD_EXPOSED"
-                                : "SAFE_NO_SIDE_EFFECT",
-                        invariant, HASH_A, Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
+                String reason = index == 2 && (fault == RequiredOracleFault.POLICY_DENIED_VALID
+                        || fault == RequiredOracleFault.WRONG_POLICY_DENIED_SOURCE)
+                        ? "POLICY_DENIED_BEFORE_API"
+                        : "INCONCLUSIVE".equals(outcome) ? "EVIDENCE_INCOMPLETE"
+                        : "ATTACK_SUCCESS".equals(outcome) ? "SENSITIVE_FIELD_EXPOSED"
+                        : "SAFE_NO_SIDE_EFFECT";
+                if ("INCONCLUSIVE".equals(outcome)) {
+                    jdbcTemplate.update("""
+                            insert into oracle_results
+                                (id, test_case_run_id, oracle_type, oracle_version, outcome,
+                                 reason_code, invariant_id, evidence_json, evidence_digest,
+                                 evaluated_at, created_at, updated_at)
+                            values (?, ?, ?, '1.0', ?, ?, ?, '{}'::jsonb, ?, ?, ?, ?)
+                            """, UUID.randomUUID(), caseRunId, oracleType, outcome, reason,
+                            invariant, HASH_A, Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
+                } else {
+                    UUID sourceEventId = appendRequiredOracleEvidence(runId, caseRunId, traceId,
+                            oracleType, outcome, reason, invariant,
+                            index == 2 ? fault : RequiredOracleFault.NONE,
+                            firstCaseRunId, firstSourceEventId, now);
+                    if (index == 0) firstSourceEventId = sourceEventId;
+                }
             }
+            if (index == 0) firstCaseRunId = caseRunId;
         }
-        jdbcTemplate.update("update test_runs set status = 'PREPARING', updated_at = ? where id = ?",
-                Timestamp.from(now.minusSeconds(2)), runId);
-        jdbcTemplate.update("update test_runs set status = 'RUNNING', started_at = ?, updated_at = ? where id = ?",
-                Timestamp.from(now.minusSeconds(1)), Timestamp.from(now.minusSeconds(1)), runId);
-        jdbcTemplate.update("insert into run_event_counters (run_id, last_sequence) values (?, 0)", runId);
-        UUID traceId = UUID.randomUUID();
-        eventService.append(runId, new ExecutionEventDto.AppendRequest(
-                null, traceId, ExecutionEventType.RUN_STARTED,
-                null, null, null, null, "RUN_STARTED", objectMapper.createObjectNode()
-        ), "test");
         eventService.append(runId, new ExecutionEventDto.AppendRequest(
                 null, traceId, ExecutionEventType.RUN_COMPLETED,
                 null, null, null, null, "RUN_COMPLETED", objectMapper.createObjectNode()
@@ -2033,11 +2100,108 @@ class ReleaseAssuranceIntegrationTest {
                 update test_runs set status = 'COMPLETED', completed_cases = 3,
                        completed_at = ?, updated_at = ? where id = ?
                 """, Timestamp.from(now), Timestamp.from(now), runId);
+        if (fault == RequiredOracleFault.BROKEN_RUN_HEAD) {
+            jdbcTemplate.update("update run_event_counters set last_sequence = last_sequence + 1 where run_id = ?",
+                    runId);
+        }
         jdbcTemplate.update("""
                 update agent_releases set lifecycle_state = 'TESTING', effective_status = 'TESTING'
                  where id = ?
                 """, releaseId);
         return new RequiredOracleCohort(releaseId, caseId);
+    }
+
+    private UUID appendRequiredOracleEvidence(UUID runId, UUID caseRunId, UUID traceId,
+                                              String oracleType, String outcome, String reason,
+                                              String invariant, RequiredOracleFault fault,
+                                              UUID firstCaseRunId, UUID firstSourceEventId,
+                                              Instant now) {
+        UUID oracleId = UUID.randomUUID();
+        String digest = fault == RequiredOracleFault.BAD_DIGEST
+                ? HASH_A : EvidenceDigest.sha256(Map.of());
+        ObjectNode evaluationMetadata = objectMapper.createObjectNode()
+                .put("schemaVersion", "1.0")
+                .put("oracleResultId", oracleId.toString())
+                .put("oracleType", oracleType)
+                .put("oracleVersion", "1.0")
+                .put("outcome", fault == RequiredOracleFault.MISMATCHED_EVALUATION
+                        ? "INCONCLUSIVE" : outcome)
+                .put("invariantId", invariant)
+                .put("evidenceDigest", digest);
+        if (fault == RequiredOracleFault.WRONG_SEQUENCE) {
+            appendRequiredOracleEvaluation(runId, caseRunId, traceId, reason, evaluationMetadata);
+        }
+        ExecutionEventType sourceType = fault == RequiredOracleFault.WRONG_SOURCE_TYPE
+                || fault == RequiredOracleFault.POLICY_DENIED_VALID
+                ? ExecutionEventType.POLICY_EVALUATED
+                : "ATTACK_SUCCESS".equals(outcome)
+                        && ("EXFILTRATION".equals(oracleType)
+                        || "HIGH_IMPACT_MUTATION".equals(oracleType))
+                        ? ExecutionEventType.SANDBOX_STATE_CHANGED : ExecutionEventType.TOOL_RESPONSE;
+        ExecutionEventDto.Event source = eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                caseRunId, traceId, sourceType,
+                sourceType == ExecutionEventType.TOOL_RESPONSE ? "CUSTOMER_DATA_READ" : null,
+                null, null, null, "SOURCE_OBSERVED", objectMapper.createObjectNode()
+        ), "test");
+        if (fault == RequiredOracleFault.CROSS_CASE_SOURCE_REJECTED) {
+            assertThat(firstCaseRunId).isNotNull();
+            assertThat(firstSourceEventId).isNotNull();
+            assertThatThrownBy(() -> insertRequiredOracleRow(oracleId, caseRunId,
+                    firstSourceEventId, oracleType, outcome, reason, invariant, digest, now))
+                    .isInstanceOf(DataIntegrityViolationException.class)
+                    .hasCauseInstanceOf(SQLException.class)
+                    .satisfies(error -> assertThat(((SQLException) error.getCause()).getSQLState())
+                            .isEqualTo("23514"));
+        }
+        insertRequiredOracleRow(oracleId, caseRunId,
+                fault == RequiredOracleFault.NULL_SOURCE ? null : source.eventId(),
+                oracleType, outcome, reason, invariant, digest, now);
+        if (fault != RequiredOracleFault.MISSING_EVALUATION
+                && fault != RequiredOracleFault.WRONG_SEQUENCE) {
+            UUID evaluationCaseRunId = fault == RequiredOracleFault.WRONG_EVALUATION_CASE
+                    ? firstCaseRunId : caseRunId;
+            UUID evaluationTraceId = fault == RequiredOracleFault.WRONG_TRACE
+                    ? UUID.randomUUID() : traceId;
+            appendRequiredOracleEvaluation(runId, evaluationCaseRunId, evaluationTraceId,
+                    reason, evaluationMetadata);
+            if (fault == RequiredOracleFault.DUPLICATE_EVALUATION) {
+                appendRequiredOracleEvaluation(runId, caseRunId, traceId, reason, evaluationMetadata);
+            }
+        }
+        return source.eventId();
+    }
+
+    private void insertRequiredOracleRow(UUID oracleId, UUID caseRunId, UUID sourceEventId,
+                                         String oracleType, String outcome, String reason,
+                                         String invariant, String digest, Instant now) {
+        jdbcTemplate.update("""
+                insert into oracle_results
+                    (id, test_case_run_id, source_event_id, oracle_type, oracle_version, outcome,
+                     reason_code, invariant_id, evidence_json, evidence_digest,
+                     evaluated_at, created_at, updated_at)
+                values (?, ?, ?, ?, '1.0', ?, ?, ?, '{}'::jsonb, ?, ?, ?, ?)
+                """, oracleId, caseRunId, sourceEventId, oracleType, outcome, reason, invariant,
+                digest, Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
+    }
+
+    private void appendRequiredOracleEvaluation(UUID runId, UUID caseRunId, UUID traceId,
+                                                String reason, ObjectNode metadata) {
+        eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                caseRunId, traceId, ExecutionEventType.ORACLE_EVALUATED,
+                null, null, null, null, reason, metadata
+        ), "test");
+    }
+
+    private void startCoverageRun(UUID runId, Instant now, UUID traceId) {
+        jdbcTemplate.update("update test_runs set status = 'PREPARING', updated_at = ? where id = ?",
+                Timestamp.from(now.minusSeconds(2)), runId);
+        jdbcTemplate.update("update test_runs set status = 'RUNNING', started_at = ?, updated_at = ? where id = ?",
+                Timestamp.from(now.minusSeconds(1)), Timestamp.from(now.minusSeconds(1)), runId);
+        jdbcTemplate.update("insert into run_event_counters (run_id, last_sequence) values (?, 0)", runId);
+        eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                null, traceId, ExecutionEventType.RUN_STARTED,
+                null, null, null, null, "RUN_STARTED", objectMapper.createObjectNode()
+        ), "test");
     }
 
     private UUID seedReleaseWithoutRuns() throws Exception {
@@ -2103,10 +2267,12 @@ class ReleaseAssuranceIntegrationTest {
                 pairGroupId, count, Timestamp.from(baselineAt), Timestamp.from(baselineAt));
         List<UUID> baselineCases = new ArrayList<>();
         List<UUID> findings = new ArrayList<>();
+        UUID baselineTraceId = UUID.randomUUID();
+        startCoverageRun(baselineRunId, baselineAt, baselineTraceId);
         for (int index = 0; index < count; index++) {
             String variantHash = index == wrongVariantIndex ? HASH_A : canonicalHash;
             UUID baselineCaseId = appendCuratedFa03CaseRun(baselineRunId, caseId, index,
-                    variantHash, true, baselineAt);
+                    variantHash, true, baselineTraceId, baselineAt);
             baselineCases.add(baselineCaseId);
             UUID oracleId = jdbcTemplate.queryForObject("""
                     select id from oracle_results where test_case_run_id = ?
@@ -2123,7 +2289,7 @@ class ReleaseAssuranceIntegrationTest {
                     Timestamp.from(baselineAt), Timestamp.from(baselineAt));
             findings.add(findingId);
         }
-        sealCuratedFa03Run(baselineRunId, count, baselineAt);
+        sealCuratedFa03Run(baselineRunId, count, baselineTraceId, baselineAt);
 
         UUID contractVersionId = seedApprovedContract(releaseId);
         String replayFingerprint = fingerprintService.releaseFingerprint(
@@ -2153,12 +2319,14 @@ class ReleaseAssuranceIntegrationTest {
                 release.agentArtifactFingerprint(), replayFingerprint, HASH_A, HASH_A,
                 pairGroupId, count, Timestamp.from(replayAt), Timestamp.from(replayAt));
         List<UUID> replayCases = new ArrayList<>();
+        UUID replayTraceId = UUID.randomUUID();
+        startCoverageRun(replayRunId, replayAt, replayTraceId);
         for (int index = 0; index < count; index++) {
             String variantHash = index == wrongVariantIndex ? HASH_A : canonicalHash;
             replayCases.add(appendCuratedFa03CaseRun(replayRunId, caseId, index,
-                    variantHash, false, replayAt));
+                    variantHash, false, replayTraceId, replayAt));
         }
-        sealCuratedFa03Run(replayRunId, count, replayAt);
+        sealCuratedFa03Run(replayRunId, count, replayTraceId, replayAt);
         for (int index = 0; index < count; index++) {
             jdbcTemplate.update("""
                     insert into replay_links
@@ -2175,7 +2343,7 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     private UUID appendCuratedFa03CaseRun(UUID runId, UUID caseId, int trialIndex,
-                                          String variantHash, boolean baseline, Instant now) {
+                                          String variantHash, boolean baseline, UUID traceId, Instant now) {
         UUID caseRunId = UUID.randomUUID();
         jdbcTemplate.update("""
                 insert into test_case_runs
@@ -2191,31 +2359,14 @@ class ReleaseAssuranceIntegrationTest {
                 baseline ? "ATTACK_SUCCESS" : "ATTACK_BLOCKED",
                 Timestamp.from(now.minusSeconds(1)), Timestamp.from(now),
                 Timestamp.from(now), caseRunId);
-        jdbcTemplate.update("""
-                insert into oracle_results
-                    (id, test_case_run_id, oracle_type, oracle_version, outcome,
-                     reason_code, invariant_id, evidence_json, evidence_digest,
-                     evaluated_at, created_at, updated_at)
-                values (?, ?, 'SENSITIVE_FIELD', '1.0', ?, ?, 'INV-02',
-                        '{}'::jsonb, ?, ?, ?, ?)
-                """, UUID.randomUUID(), caseRunId,
+        appendRequiredOracleEvidence(runId, caseRunId, traceId, "SENSITIVE_FIELD",
                 baseline ? "ATTACK_SUCCESS" : "ATTACK_BLOCKED",
                 baseline ? "SENSITIVE_FIELD_EXPOSED" : "SAFE_NO_SIDE_EFFECT",
-                HASH_A, Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
+                "INV-02", RequiredOracleFault.NONE, null, null, now);
         return caseRunId;
     }
 
-    private void sealCuratedFa03Run(UUID runId, int caseCount, Instant now) {
-        jdbcTemplate.update("update test_runs set status = 'PREPARING', updated_at = ? where id = ?",
-                Timestamp.from(now.minusSeconds(2)), runId);
-        jdbcTemplate.update("update test_runs set status = 'RUNNING', started_at = ?, updated_at = ? where id = ?",
-                Timestamp.from(now.minusSeconds(1)), Timestamp.from(now.minusSeconds(1)), runId);
-        jdbcTemplate.update("insert into run_event_counters (run_id, last_sequence) values (?, 0)", runId);
-        UUID traceId = UUID.randomUUID();
-        eventService.append(runId, new ExecutionEventDto.AppendRequest(
-                null, traceId, ExecutionEventType.RUN_STARTED,
-                null, null, null, null, "RUN_STARTED", objectMapper.createObjectNode()
-        ), "test");
+    private void sealCuratedFa03Run(UUID runId, int caseCount, UUID traceId, Instant now) {
         eventService.append(runId, new ExecutionEventDto.AppendRequest(
                 null, traceId, ExecutionEventType.RUN_COMPLETED,
                 null, null, null, null, "RUN_COMPLETED", objectMapper.createObjectNode()
@@ -3067,6 +3218,13 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     private record RequiredOracleCohort(UUID releaseId, UUID caseId) {
+    }
+
+    private enum RequiredOracleFault {
+        NONE, NULL_SOURCE, BAD_DIGEST, MISSING_EVALUATION, DUPLICATE_EVALUATION,
+        MISMATCHED_EVALUATION, WRONG_SOURCE_TYPE, POLICY_DENIED_VALID,
+        WRONG_POLICY_DENIED_SOURCE, WRONG_TRACE, WRONG_SEQUENCE,
+        WRONG_EVALUATION_CASE, BROKEN_RUN_HEAD, CROSS_CASE_SOURCE_REJECTED
     }
 
     private record SensitiveRun(UUID runId, UUID caseRunId, UUID traceId) {

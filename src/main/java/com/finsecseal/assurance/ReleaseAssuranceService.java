@@ -8,8 +8,10 @@ import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.DecisionValue;
 import com.finsecseal.common.persistence.UuidV7;
+import com.finsecseal.oracle.domain.EvidenceDigest;
 import com.finsecseal.oracle.domain.OracleOutcome;
 import com.finsecseal.oracle.domain.OracleReasonCode;
+import com.finsecseal.oracle.domain.OracleType;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import com.finsecseal.release.FingerprintService;
@@ -806,36 +808,126 @@ public class ReleaseAssuranceService {
         }, suiteId);
         Map<UUID, TrialEvaluation> byCaseRun = new LinkedHashMap<>();
         trials.forEach(trial -> byCaseRun.put(trial.caseRunId(), trial));
-        List<CriticalTrialCoverage.Trial> coverageTrials = byCaseRun.isEmpty() ? List.of()
+        List<RequiredOracleCoverageRow> coverageRows = byCaseRun.isEmpty() ? List.of()
                 : jdbcTemplate.query("""
-                        select case_run.id, case_run.test_case_id, case_run.trial_index,
-                               case_run.variant_hash,
-                               exists (
-                                   select 1 from oracle_results oracle
-                                    where oracle.test_case_run_id = case_run.id
-                                      and oracle.invariant_id = test_case.expected_invariant
-                                      and oracle.outcome in ('ATTACK_SUCCESS', 'ATTACK_BLOCKED')
-                                      and oracle.oracle_type = case test_case.oracle_type
-                                          when 'CROSS_CUSTOMER' then 'CROSS_CUSTOMER'
-                                          when 'CrossCustomerOracle' then 'CROSS_CUSTOMER'
-                                          when 'SENSITIVE_FIELD' then 'SENSITIVE_FIELD'
-                                          when 'EXFILTRATION' then 'EXFILTRATION'
-                                          when 'ExfiltrationOracle' then 'EXFILTRATION'
-                                          when 'HIGH_IMPACT_MUTATION' then 'HIGH_IMPACT_MUTATION'
-                                          when 'HighImpactMutationOracle' then 'HIGH_IMPACT_MUTATION'
-                                          else null end
-                               ) required_oracle_conclusive
+                        select case_run.id case_run_id, case_run.test_run_id run_id,
+                               case_run.test_case_id, case_run.trial_index, case_run.variant_hash,
+                               oracle.id oracle_id, oracle.source_event_id, oracle.oracle_type,
+                               oracle.oracle_version, oracle.outcome, oracle.reason_code,
+                               oracle.invariant_id, oracle.evidence_json::text evidence_json,
+                               oracle.evidence_digest,
+                               source.run_id source_run_id, source.test_case_run_id source_case_run_id,
+                               source.trace_id source_trace_id, source.event_type source_event_type,
+                               source.sequence source_sequence
                           from test_case_runs case_run
                           join test_cases test_case on test_case.id = case_run.test_case_id
+                          left join oracle_results oracle
+                            on oracle.test_case_run_id = case_run.id
+                           and oracle.invariant_id = test_case.expected_invariant
+                           and oracle.outcome in ('ATTACK_SUCCESS', 'ATTACK_BLOCKED')
+                           and oracle.oracle_type = case test_case.oracle_type
+                               when 'CROSS_CUSTOMER' then 'CROSS_CUSTOMER'
+                               when 'CrossCustomerOracle' then 'CROSS_CUSTOMER'
+                               when 'SENSITIVE_FIELD' then 'SENSITIVE_FIELD'
+                               when 'EXFILTRATION' then 'EXFILTRATION'
+                               when 'ExfiltrationOracle' then 'EXFILTRATION'
+                               when 'HIGH_IMPACT_MUTATION' then 'HIGH_IMPACT_MUTATION'
+                               when 'HighImpactMutationOracle' then 'HIGH_IMPACT_MUTATION'
+                               else null end
+                          left join execution_events source on source.id = oracle.source_event_id
                          where case_run.id = any(?::uuid[])
-                        """, (rs, row) -> {
-                    TrialEvaluation trial = byCaseRun.get(rs.getObject("id", UUID.class));
-                    return new CriticalTrialCoverage.Trial(rs.getObject("test_case_id", UUID.class),
-                            rs.getInt("trial_index"), trial.mode(),
-                            trial.attackConclusive() && rs.getBoolean("required_oracle_conclusive"),
-                            rs.getString("variant_hash"));
-                }, (Object) byCaseRun.keySet().toArray(UUID[]::new));
+                         order by case_run.id
+                        """, (rs, row) -> new RequiredOracleCoverageRow(
+                        rs.getObject("case_run_id", UUID.class), rs.getObject("run_id", UUID.class),
+                        rs.getObject("test_case_id", UUID.class), rs.getInt("trial_index"),
+                        rs.getString("variant_hash"), rs.getObject("oracle_id", UUID.class),
+                        rs.getObject("source_event_id", UUID.class), rs.getString("oracle_type"),
+                        rs.getString("oracle_version"), rs.getString("outcome"),
+                        rs.getString("reason_code"), rs.getString("invariant_id"),
+                        rs.getString("evidence_json"), rs.getString("evidence_digest"),
+                        rs.getObject("source_run_id", UUID.class),
+                        rs.getObject("source_case_run_id", UUID.class),
+                        rs.getObject("source_trace_id", UUID.class),
+                        rs.getString("source_event_type"), rs.getObject("source_sequence", Long.class)),
+                        (Object) byCaseRun.keySet().toArray(UUID[]::new));
+        UUID[] requiredOracleIds = coverageRows.stream().map(RequiredOracleCoverageRow::oracleId)
+                .filter(id -> id != null).toArray(UUID[]::new);
+        Map<UUID, List<RequiredOracleEvaluationRow>> evaluations = new LinkedHashMap<>();
+        if (requiredOracleIds.length > 0) {
+            jdbcTemplate.query("""
+                    select event.run_id, event.test_case_run_id, event.trace_id, event.sequence,
+                           event.reason_code, event.metadata_json::text metadata_json,
+                           event.metadata_json ->> 'oracleResultId' oracle_result_id
+                      from execution_events event
+                     where event.event_type = 'ORACLE_EVALUATED'
+                       and event.metadata_json ->> 'oracleResultId' = any(?::text[])
+                     order by event.run_id, event.sequence
+                    """, rs -> {
+                while (rs.next()) {
+                    UUID oracleId = UUID.fromString(rs.getString("oracle_result_id"));
+                    evaluations.computeIfAbsent(oracleId, ignored -> new ArrayList<>()).add(
+                            new RequiredOracleEvaluationRow(
+                                    rs.getObject("run_id", UUID.class),
+                                    rs.getObject("test_case_run_id", UUID.class),
+                                    rs.getObject("trace_id", UUID.class), rs.getLong("sequence"),
+                                    rs.getString("reason_code"), rs.getString("metadata_json")));
+                }
+                return null;
+            }, (Object) java.util.Arrays.stream(requiredOracleIds).map(UUID::toString)
+                    .toArray(String[]::new));
+        }
+        Map<UUID, Boolean> chainValidity = new LinkedHashMap<>();
+        List<CriticalTrialCoverage.Trial> coverageTrials = coverageRows.stream().map(row -> {
+            TrialEvaluation trial = byCaseRun.get(row.caseRunId());
+            return new CriticalTrialCoverage.Trial(row.testCaseId(), row.trialIndex(), trial.mode(),
+                    trial.attackConclusive() && requiredOracleEvidenceValid(row, trial,
+                            evaluations.getOrDefault(row.oracleId(), List.of()), chainValidity),
+                    row.variantHash());
+        }).toList();
         return new CriticalTrialCoverage().evaluate(definitions, coverageTrials);
+    }
+
+    private boolean requiredOracleEvidenceValid(RequiredOracleCoverageRow row, TrialEvaluation trial,
+                                                List<RequiredOracleEvaluationRow> evaluations,
+                                                Map<UUID, Boolean> chainValidity) {
+        if (row.oracleId() == null || row.sourceEventId() == null || row.sourceTraceId() == null
+                || row.sourceSequence() == null || evaluations.size() != 1
+                || !trial.runId().equals(row.runId())
+                || !trial.runId().equals(row.sourceRunId())
+                || !trial.caseRunId().equals(row.sourceCaseRunId())) return false;
+        try {
+            OracleType oracleType = OracleType.valueOf(row.oracleType());
+            OracleOutcome outcome = OracleOutcome.valueOf(row.outcome());
+            OracleReasonCode reason = OracleReasonCode.valueOf(row.reasonCode());
+            String requiredSourceType = outcome == OracleOutcome.ATTACK_SUCCESS
+                    ? switch (oracleType) {
+                        case CROSS_CUSTOMER, SENSITIVE_FIELD, NORMAL_TASK -> "TOOL_RESPONSE";
+                        case EXFILTRATION, HIGH_IMPACT_MUTATION -> "SANDBOX_STATE_CHANGED";
+                    }
+                    : reason == OracleReasonCode.POLICY_DENIED_BEFORE_API ? "POLICY_EVALUATED" : null;
+            if (requiredSourceType != null && !requiredSourceType.equals(row.sourceEventType())) return false;
+            Map<String, Object> evidence = oracleEvidenceMap(row.evidenceJson());
+            if (evidence == null || !EvidenceDigest.sha256(evidence).equals(row.evidenceDigest())) return false;
+            RequiredOracleEvaluationRow evaluation = evaluations.getFirst();
+            JsonNode metadata = parseJson(evaluation.metadataJson());
+            if (!evaluation.runId().equals(row.runId())
+                    || !row.caseRunId().equals(evaluation.caseRunId())
+                    || !row.sourceTraceId().equals(evaluation.traceId())
+                    || evaluation.sequence() <= row.sourceSequence()
+                    || !row.reasonCode().equals(evaluation.reasonCode())
+                    || !metadata.isObject() || metadata.size() != 7
+                    || !"1.0".equals(metadata.path("schemaVersion").asString(null))
+                    || !row.oracleId().toString().equals(metadata.path("oracleResultId").asString(null))
+                    || !row.oracleType().equals(metadata.path("oracleType").asString(null))
+                    || row.oracleVersion() == null || row.oracleVersion().isBlank()
+                    || !row.oracleVersion().equals(metadata.path("oracleVersion").asString(null))
+                    || !row.outcome().equals(metadata.path("outcome").asString(null))
+                    || !row.invariantId().equals(metadata.path("invariantId").asString(null))
+                    || !row.evidenceDigest().equals(metadata.path("evidenceDigest").asString(null))) return false;
+            return chainValidity.computeIfAbsent(row.runId(), this::validGcRunChain);
+        } catch (RuntimeException invalid) {
+            return false;
+        }
     }
 
     private AttackVariant curatedCriticalFa03Variant() {
@@ -1440,6 +1532,16 @@ public class ReleaseAssuranceService {
     private record SnapshotBuild(GateDecision decision, ObjectNode snapshot) { }
     private record TrialMetadata(UUID runId, UUID testCaseId, String caseKey,
                                  String partition, int trialIndex) { }
+    private record RequiredOracleCoverageRow(UUID caseRunId, UUID runId, UUID testCaseId,
+                                             int trialIndex, String variantHash, UUID oracleId,
+                                             UUID sourceEventId, String oracleType, String oracleVersion,
+                                             String outcome, String reasonCode, String invariantId,
+                                             String evidenceJson, String evidenceDigest,
+                                             UUID sourceRunId, UUID sourceCaseRunId, UUID sourceTraceId,
+                                             String sourceEventType, Long sourceSequence) { }
+    private record RequiredOracleEvaluationRow(UUID runId, UUID caseRunId, UUID traceId,
+                                               long sequence, String reasonCode,
+                                               String metadataJson) { }
     private record EffectEvidence(UUID caseRunId, String oracleType, String reasonCode,
                                   String evidenceJson) { }
     private record MutationOracle(UUID caseRunId, String oracleType, String outcome, String reasonCode,
