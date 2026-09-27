@@ -19,6 +19,7 @@ import tools.jackson.databind.ObjectMapper;
 public class ContractAccessFilter extends OncePerRequestFilter {
     public static final String CONTEXT = ContractAccessFilter.class.getName() + ".reviewer";
     public static final String SESSION = ContractAccessFilter.class.getName() + ".session";
+    private static final String RUN_START_PATH = "/api/v1/test-runs";
     private final ContractReviewerCredentials credentials;
     private final ContractReviewerSessionRevocations revocations;
     private final ObjectMapper json;
@@ -36,8 +37,11 @@ public class ContractAccessFilter extends OncePerRequestFilter {
         try { path = java.net.URLDecoder.decode(request.getRequestURI(), java.nio.charset.StandardCharsets.UTF_8); }
         catch (IllegalArgumentException exception) { path = request.getRequestURI(); }
         path = path.replaceAll(";[^/]*", "");
+        boolean runStart = "POST".equals(request.getMethod())
+                && (RUN_START_PATH.equals(path) || (RUN_START_PATH + "/").equals(path));
         // Prefix matching also protects malformed/encoded descendants before MVC routing.
-        return !path.startsWith("/api/v1/platform/contracts") && !path.startsWith("/api/v1/platform/patch-sources")
+        return !runStart && !path.startsWith("/api/v1/platform/contracts")
+                && !path.startsWith("/api/v1/platform/patch-sources")
                 && !path.startsWith("/api/v1/contracts") && !path.startsWith("/api/v1/contract-versions")
                 && !path.startsWith("/api/v1/patch-proposals")
                 && !path.startsWith("/api/v1/reviewer-session")
@@ -50,6 +54,11 @@ public class ContractAccessFilter extends OncePerRequestFilter {
             throws ServletException, IOException {
         if (request.getRequestURI().contains("%") || request.getRequestURI().contains(";")) {
             response.sendError(400, "Use the canonical contract API path");
+            return;
+        }
+        boolean runStart = "POST".equals(request.getMethod()) && RUN_START_PATH.equals(request.getRequestURI());
+        if ("POST".equals(request.getMethod()) && (RUN_START_PATH + "/").equals(request.getRequestURI())) {
+            response.sendError(400, "Use the canonical Run start path");
             return;
         }
         ReviewerContext reviewer = null;
@@ -71,7 +80,7 @@ public class ContractAccessFilter extends OncePerRequestFilter {
                 session = null;
                 reviewer = credentials.keyReviewer();
             }
-        } else if (credentials.keyValid(supplied)) {
+        } else if (!runStart && credentials.keyValid(supplied)) {
             reviewer = credentials.keyReviewer();
         }
         if ("DELETE".equals(request.getMethod()) && request.getRequestURI().startsWith("/api/v1/reviewer-session/")) {
