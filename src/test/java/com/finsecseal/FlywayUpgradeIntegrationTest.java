@@ -37,12 +37,13 @@ class FlywayUpgradeIntegrationTest {
         UUID legacyNamespace = insertLegacyDocument();
 
         Flyway current = flyway(null);
-        assertThat(current.migrate().migrationsExecuted).isEqualTo(6);
-        assertThat(appliedVersionCount()).isEqualTo(15);
+        assertThat(current.migrate().migrationsExecuted).isEqualTo(7);
+        assertThat(appliedVersionCount()).isEqualTo(16);
         assertThat(current.validateWithResult().validationSuccessful).isTrue();
-        assertThat(current.info().current().getVersion()).isEqualTo(MigrationVersion.fromVersion("14.1"));
+        assertThat(current.info().current().getVersion()).isEqualTo(MigrationVersion.fromVersion("14.2"));
         assertThat(current.info().current().getVersion()).isLessThan(MigrationVersion.fromVersion("15"));
         verifyDocumentSourceTimestamp(legacyNamespace);
+        verifyReviewerSessionRevocationSchema();
 
         UUID leaseId = UUID.randomUUID();
         Instant now = Instant.now();
@@ -137,6 +138,21 @@ class FlywayUpgradeIntegrationTest {
                 assertThat(created.next()).isTrue();
                 assertThat(created.getTimestamp("created_at").toInstant()).isEqualTo(sourceTime);
             }
+        }
+    }
+
+    private void verifyReviewerSessionRevocationSchema() throws SQLException {
+        try (var connection = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+             var statement = connection.createStatement();
+             var columns = statement.executeQuery("""
+                     select column_name from information_schema.columns
+                      where table_schema = 'public' and table_name = 'reviewer_session_revocations'
+                      order by ordinal_position
+                     """)) {
+            var names = new java.util.ArrayList<String>();
+            while (columns.next()) names.add(columns.getString(1));
+            assertThat(names).containsExactly("session_digest", "expires_at", "revoked_at");
         }
     }
 

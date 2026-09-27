@@ -202,6 +202,74 @@ class ContractPersistenceIntegrationTest {
         assertThat(json.readTree(restored.body()).at("/data/csrfToken").stringValue()).isEqualTo(csrf);
     }
 
+    @Test void revokesOnlyTheCurrentSignedSessionAndClearsCookieOnIdempotentRetries() throws Exception {
+        var issued = api("GET", "/api/v1/reviewer-session", null, Map.of("X-Contract-Reviewer-Key", KEY));
+        assertThat(issued.statusCode()).isEqualTo(200);
+        var data = json.readTree(issued.body()).path("data");
+        String sessionId = data.path("sessionId").stringValue();
+        String csrf = data.path("csrfToken").stringValue();
+        String cookie = issued.headers().firstValue("Set-Cookie").orElseThrow().split(";", 2)[0];
+        String path = "/api/v1/reviewer-session/" + sessionId;
+        var second = api("GET", "/api/v1/reviewer-session", null, Map.of("X-Contract-Reviewer-Key", KEY));
+        String secondCookie = second.headers().firstValue("Set-Cookie").orElseThrow().split(";", 2)[0];
+        String secondId = json.readTree(second.body()).at("/data/sessionId").stringValue();
+        assertThat(secondId).isNotEqualTo(sessionId);
+        String retryKey = UUID.randomUUID().toString();
+        var headers = Map.of("Cookie", cookie, "X-CSRF-Token", csrf, "Idempotency-Key", retryKey);
+
+        assertThat(api("DELETE", path, null, Map.of("Cookie", cookie, "Idempotency-Key", retryKey)).statusCode())
+                .isEqualTo(403);
+        assertThat(api("DELETE", path, null, Map.of("Cookie", cookie, "X-CSRF-Token", "wrong",
+                "Idempotency-Key", retryKey)).statusCode()).isEqualTo(403);
+        assertThat(api("DELETE", "/api/v1/reviewer-session/" + UUID.randomUUID(), null, headers).statusCode())
+                .isEqualTo(403);
+        assertThat(api("DELETE", path, null, Map.of("X-Contract-Reviewer-Key", KEY,
+                "Idempotency-Key", retryKey)).statusCode()).isEqualTo(403);
+        assertThat(db.queryForObject("select count(*) from reviewer_session_revocations", Integer.class)).isZero();
+        assertThat(db.queryForObject("select count(*) from api_idempotency_records where idempotency_key=?",
+                Integer.class, retryKey)).isZero();
+
+        var first = api("DELETE", path, null, headers);
+        assertThat(first.statusCode()).withFailMessage(first.body()).isEqualTo(204);
+        assertThat(first.headers().firstValue("Set-Cookie")).hasValueSatisfying(value ->
+                assertThat(value).contains(ContractReviewerCredentials.COOKIE + "=", "Max-Age=0", "HttpOnly",
+                        "Secure", "SameSite=Lax", "Path=/"));
+        assertThat(db.queryForObject("select count(*) from reviewer_session_revocations", Integer.class)).isEqualTo(1);
+        String storedDigest = db.queryForObject("select session_digest from reviewer_session_revocations", String.class);
+        assertThat(storedDigest).matches("sha256:[0-9a-f]{64}").doesNotContain(sessionId, csrf, cookie);
+        assertThat(api("GET", "/api/v1/reviewer-session", null, Map.of("Cookie", cookie)).statusCode())
+                .isEqualTo(403);
+        assertThat(api("GET", "/api/v1/contract-versions/" + UUID.randomUUID(), null,
+                Map.of("Cookie", cookie)).statusCode()).isEqualTo(403);
+        assertThat(api("GET", "/api/v1/contract-versions/" + UUID.randomUUID(), null,
+                Map.of("Cookie", cookie, "X-Contract-Reviewer-Key", KEY)).statusCode()).isEqualTo(403);
+        assertThat(api("GET", "/api/v1/contract-versions/" + UUID.randomUUID(), null,
+                Map.of("Cookie", cookie + "x", "X-Contract-Reviewer-Key", KEY)).statusCode()).isEqualTo(403);
+        var stillActive = api("GET", "/api/v1/reviewer-session", null, Map.of("Cookie", secondCookie));
+        assertThat(stillActive.statusCode()).isEqualTo(200);
+        assertThat(json.readTree(stillActive.body()).at("/data/sessionId").stringValue()).isEqualTo(secondId);
+
+        var replay = api("DELETE", path, null, headers);
+        assertThat(replay.statusCode()).isEqualTo(204);
+        assertThat(replay.headers().firstValue("Idempotent-Replayed")).contains("true");
+        assertThat(replay.headers().firstValue("Set-Cookie")).hasValueSatisfying(value ->
+                assertThat(value).contains("Max-Age=0"));
+        var newKeyRetry = api("DELETE", path, null, Map.of("Cookie", cookie, "X-CSRF-Token", csrf,
+                "Idempotency-Key", UUID.randomUUID().toString()));
+        assertThat(newKeyRetry.statusCode()).isEqualTo(204);
+        assertThat(newKeyRetry.headers().firstValue("Set-Cookie")).hasValueSatisfying(value ->
+                assertThat(value).contains("Max-Age=0"));
+        assertThat(db.queryForObject("select count(*) from reviewer_session_revocations", Integer.class)).isEqualTo(1);
+
+        var recovered = api("GET", "/api/v1/reviewer-session", null,
+                Map.of("Cookie", cookie, "X-Contract-Reviewer-Key", KEY));
+        assertThat(recovered.statusCode()).isEqualTo(200);
+        assertThat(json.readTree(recovered.body()).at("/data/sessionId").stringValue()).isNotEqualTo(sessionId);
+        assertThat(recovered.headers().firstValue("Set-Cookie")).isPresent();
+        assertThat(api("GET", "/api/v1/reviewer-session", null,
+                Map.of("Cookie", cookie + "x", "X-Contract-Reviewer-Key", KEY)).statusCode()).isEqualTo(200);
+    }
+
     private HttpResponse<String> api(String method,String path,String body,Map<String,String> headers) throws Exception {
         var builder=HttpRequest.newBuilder(URI.create("http://localhost:"+port+path));
         headers.forEach(builder::header);
