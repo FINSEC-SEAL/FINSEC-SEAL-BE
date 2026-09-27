@@ -359,6 +359,140 @@ class AttestationIntegrationTest {
     }
 
     @Test
+    void attestsScheduledOperationalErrorRateFromQueuedFailedAndCancelledParents() throws Exception {
+        Seed seed = seedDecision("scheduled-oer-selected", false, "REVIEW", snapshot -> {
+            UUID completed = effectSourceRun(snapshot, "COMPLETED");
+            UUID failed = effectSourceRun(snapshot, "FAILED");
+            UUID cancelled = scheduledBaselineRun(snapshot, "CANCELLED", 1);
+            UUID queued = scheduledBaselineRun(snapshot, "QUEUED", 1);
+            snapshot.withArray("metrics").add(scheduledOerMetric(
+                    List.of(completed, failed, cancelled, queued), 1L, 4L));
+        });
+
+        AttestationDto.View first = attestationService.findOrCreate(seed.releaseId(), "governance-reviewer");
+        AttestationDto.View second = attestationService.findOrCreate(seed.releaseId(), "report-viewer");
+        assertThat(first.id()).isEqualTo(second.id());
+        assertThat(first.documentHash()).isEqualTo(second.documentHash());
+        assertThat(canonicalJsonService.canonicalString(first.document().path("metrics")))
+                .isEqualTo(canonicalJsonService.canonicalString(seed.snapshot().path("metrics")));
+        assertThat(first.documentHash())
+                .isEqualTo(digestService.sha256(canonicalJsonService.canonicalize(first.document())));
+        assertThat(attestationService.export(seed.releaseId(), "json", "report-viewer").content())
+                .isEqualTo(canonicalJsonService.canonicalize(first.document()));
+        String html = new String(attestationService.export(seed.releaseId(), "html", "report-viewer").content(),
+                java.nio.charset.StandardCharsets.UTF_8);
+        assertThat(html).contains("OperationalErrorRate", "REVIEW");
+        assertThat(attestationAuditCount(first.id())).isEqualTo(1);
+    }
+
+    @Test
+    void attestsActiveScheduledParentsAndExplicitZeroSlotNa() throws Exception {
+        for (String status : List.of("PREPARING", "RUNNING", "CANCELLING")) {
+            Seed seed = seedDecision("scheduled-oer-" + status.toLowerCase(java.util.Locale.ROOT),
+                    false, "REVIEW", snapshot -> {
+                        UUID source = scheduledBaselineRun(snapshot, status, 1);
+                        snapshot.withArray("metrics").add(scheduledOerMetric(List.of(source), 0L, 1L));
+                    });
+            AttestationDto.View view = attestationService.findOrCreate(seed.releaseId(), "governance-reviewer");
+            assertThat(canonicalJsonService.canonicalString(view.document().path("metrics")))
+                    .isEqualTo(canonicalJsonService.canonicalString(seed.snapshot().path("metrics")));
+            assertThat(attestationAuditCount(view.id())).isEqualTo(1);
+        }
+
+        Seed zeroSlots = seedDecision("scheduled-oer-zero-slots", false, "REVIEW", snapshot -> {
+            UUID source = scheduledBaselineRun(snapshot, "QUEUED", 0);
+            snapshot.withArray("metrics").add(scheduledOerMetric(List.of(source), null, null));
+        });
+        AttestationDto.View unavailable = attestationService.findOrCreate(
+                zeroSlots.releaseId(), "governance-reviewer");
+        JsonNode metric = unavailable.document().path("metrics").get(4);
+        assertThat(metric.path("status").asString()).isEqualTo("N_A");
+        assertThat(metric.path("reason").asString()).isEqualTo("NO_SCHEDULED_TRIALS");
+        assertThat(metric.path("sourceTestRunIds").size()).isEqualTo(1);
+        assertThat(metric.path("numerator").isNull()).isTrue();
+        assertThat(metric.path("denominator").isNull()).isTrue();
+    }
+
+    @Test
+    void scheduledOerRejectsForeignCohortsWhileOtherMetricsAndResultsStayConclusive() throws Exception {
+        Seed foreign = seedDecision("oer-foreign-release", false, "REVIEW", snapshot -> {
+        });
+        UUID foreignRun = scheduledBaselineRun(foreign.snapshot(), "QUEUED", 1);
+        Seed foreignRelease = seedDecision("oer-target-release", false, "REVIEW", snapshot ->
+                snapshot.withArray("metrics").add(scheduledOerMetric(List.of(foreignRun), 0L, 1L)));
+        assertIncompleteAttestation(foreignRelease);
+
+        Seed otherSuite = seedDecision("oer-other-suite", false, "REVIEW", snapshot -> {
+        });
+        UUID foreignSuiteId = UUID.fromString(otherSuite.snapshot().at("/testSuite/id").asString());
+        Seed wrongSuite = seedDecision("oer-target-suite", false, "REVIEW", snapshot -> {
+            UUID source = scheduledBaselineRun(snapshot, "QUEUED", 1, foreignSuiteId,
+                    snapshot.at("/sandbox/fixtureVersion").asString(),
+                    snapshot.at("/sandbox/fixtureDigest").asString());
+            snapshot.withArray("metrics").add(scheduledOerMetric(List.of(source), 0L, 1L));
+        });
+        assertIncompleteAttestation(wrongSuite);
+
+        Seed wrongFixture = seedDecision("oer-target-fixture", false, "REVIEW", snapshot -> {
+            UUID source = scheduledBaselineRun(snapshot, "QUEUED", 1,
+                    UUID.fromString(snapshot.at("/testSuite/id").asString()), "other-fixture", HASH_B);
+            snapshot.withArray("metrics").add(scheduledOerMetric(List.of(source), 0L, 1L));
+        });
+        assertIncompleteAttestation(wrongFixture);
+
+        Seed wrongAgentFingerprint = seedDecision("oer-target-agent-fingerprint", false, "REVIEW", snapshot -> {
+            UUID source = scheduledBaselineRun(snapshot, "QUEUED", 1);
+            assertThat(snapshot.at("/release/agentArtifactFingerprint").asString()).isNotEqualTo(HASH_B);
+            corruptQueuedRunFingerprint(source, true);
+            snapshot.withArray("metrics").add(scheduledOerMetric(List.of(source), 0L, 1L));
+        });
+        assertIncompleteAttestation(wrongAgentFingerprint);
+
+        Seed wrongReleaseFingerprint = seedDecision("oer-target-release-fingerprint", false, "REVIEW", snapshot -> {
+            UUID source = scheduledBaselineRun(snapshot, "QUEUED", 1);
+            assertThat(snapshot.at("/release/fingerprint").asString()).isNotEqualTo(HASH_B);
+            corruptQueuedRunFingerprint(source, false);
+            snapshot.withArray("metrics").add(scheduledOerMetric(List.of(source), 0L, 1L));
+        });
+        assertIncompleteAttestation(wrongReleaseFingerprint);
+
+        Seed duplicateSource = seedDecision("oer-duplicate-source", false, "REVIEW", snapshot -> {
+            UUID source = scheduledBaselineRun(snapshot, "QUEUED", 1);
+            snapshot.withArray("metrics").add(scheduledOerMetric(List.of(source, source), 0L, 1L));
+        });
+        assertIncompleteAttestation(duplicateSource);
+
+        Seed malformedSource = seedDecision("oer-malformed-source", false, "REVIEW", snapshot -> {
+            ObjectNode metric = scheduledOerMetric(List.of(), 0L, 1L);
+            metric.withArray("sourceTestRunIds").add("not-a-uuid");
+            snapshot.withArray("metrics").add(metric);
+        });
+        assertIncompleteAttestation(malformedSource);
+
+        Seed otherMetric = seedDecision("oer-other-metric-strict", false, "REVIEW", snapshot -> {
+            UUID queued = scheduledBaselineRun(snapshot, "QUEUED", 1);
+            ObjectNode baseline = (ObjectNode) snapshot.path("metrics").get(0);
+            baseline.remove("reason");
+            baseline.put("status", "AVAILABLE").put("numerator", 0).put("denominator", 1)
+                    .put("evidenceDigest", HASH_A);
+            baseline.putArray("sourceTestRunIds").add(queued.toString());
+            snapshot.withArray("metrics").add(scheduledOerMetric(List.of(queued), 0L, 1L));
+        });
+        assertIncompleteAttestation(otherMetric);
+
+        Seed result = seedDecision("oer-result-strict", false, "REVIEW", snapshot -> {
+            UUID queued = scheduledBaselineRun(snapshot, "QUEUED", 1);
+            ObjectNode baseline = (ObjectNode) snapshot.path("results").path("baseline");
+            baseline.remove("reason");
+            baseline.put("status", "AVAILABLE").put("numerator", 0).put("denominator", 1)
+                    .put("evidenceDigest", HASH_A);
+            baseline.putArray("sourceRunIds").add(queued.toString());
+            snapshot.withArray("metrics").add(scheduledOerMetric(List.of(queued), 0L, 1L));
+        });
+        assertIncompleteAttestation(result);
+    }
+
+    @Test
     void rejectsMalformedCountEvidenceEvenWhenDecisionDigestIsRecomputed() throws Exception {
         Seed stringValue = effectDecision("string-effect-count", counts -> {
             ObjectNode first = (ObjectNode) counts.get(0);
@@ -929,6 +1063,109 @@ class AttestationIntegrationTest {
         }
         ((ObjectNode) snapshot.path("decision")).putArray("ruleTrace")
                 .add(objectMapper.createObjectNode().put("ruleId", "LEGACY_PASS"));
+    }
+
+    private ObjectNode scheduledOerMetric(List<UUID> runIds, Long numerator, Long denominator) {
+        ObjectNode metric = objectMapper.createObjectNode();
+        if (denominator == null) {
+            metric.put("status", "N_A").put("reason", "NO_SCHEDULED_TRIALS");
+        } else {
+            metric.put("status", "AVAILABLE").put("numerator", numerator).put("denominator", denominator);
+        }
+        ArrayNode sources = metric.putArray("sourceTestRunIds");
+        runIds.stream().sorted().forEach(runId -> sources.add(runId.toString()));
+        if (denominator == null) {
+            metric.putNull("numerator").putNull("denominator").putNull("value");
+        }
+        metric.put("metric", "OperationalErrorRate").put("calculatorVersion", "mvp-metrics/1");
+        if (denominator != null) {
+            metric.put("evidenceDigest", digestService.sha256(canonicalJsonService.canonicalize(metric)));
+        }
+        return metric;
+    }
+
+    private UUID scheduledBaselineRun(ObjectNode snapshot, String status, int totalCases) {
+        return scheduledBaselineRun(snapshot, status, totalCases,
+                UUID.fromString(snapshot.at("/testSuite/id").asString()),
+                snapshot.at("/sandbox/fixtureVersion").asString(),
+                snapshot.at("/sandbox/fixtureDigest").asString());
+    }
+
+    private UUID scheduledBaselineRun(ObjectNode snapshot, String status, int totalCases,
+                                      UUID suiteId, String fixtureVersion, String fixtureDigest) {
+        UUID runId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                insert into test_runs
+                    (id, release_id, suite_id, mode, status, agent_artifact_fingerprint,
+                     release_fingerprint, config_json, fixture_version, fixture_digest,
+                     model_config_hash, total_cases)
+                values (?, ?, ?, 'BASELINE', 'QUEUED', ?, ?, '{}'::jsonb, ?, ?, ?, ?)
+                """, runId, UUID.fromString(snapshot.at("/release/id").asString()), suiteId,
+                snapshot.at("/release/agentArtifactFingerprint").asString(),
+                snapshot.at("/release/fingerprint").asString(), fixtureVersion, fixtureDigest,
+                HASH_A, totalCases);
+        if ("QUEUED".equals(status)) {
+            return runId;
+        }
+        UUID traceId = UUID.randomUUID();
+        jdbcTemplate.update("insert into run_event_counters (run_id, last_sequence) values (?, 0)", runId);
+        eventService.append(runId, new ExecutionEventDto.AppendRequest(null, traceId,
+                ExecutionEventType.RUN_STARTED, null, null, null, null, "RUN_STARTED",
+                objectMapper.createObjectNode()), "attestation-test");
+        if ("PREPARING".equals(status) || "RUNNING".equals(status) || "CANCELLING".equals(status)) {
+            jdbcTemplate.update("update test_runs set status = 'PREPARING' where id = ?", runId);
+        }
+        if ("RUNNING".equals(status)) {
+            jdbcTemplate.update("update test_runs set status = 'RUNNING', started_at = now() where id = ?", runId);
+        } else if ("CANCELLING".equals(status)) {
+            eventService.append(runId, new ExecutionEventDto.AppendRequest(null, traceId,
+                    ExecutionEventType.RUN_CANCEL_REQUESTED, null, null, null, null, "RUN_CANCEL_REQUESTED",
+                    objectMapper.createObjectNode()), "attestation-test");
+            jdbcTemplate.update("update test_runs set status = 'CANCELLING', cancel_requested_at = now() where id = ?",
+                    runId);
+        } else if ("FAILED".equals(status)) {
+            eventService.append(runId, new ExecutionEventDto.AppendRequest(null, traceId,
+                    ExecutionEventType.RUN_FAILED, null, null, null, null, "RUN_FAILED",
+                    objectMapper.createObjectNode()), "attestation-test");
+            jdbcTemplate.update("update test_runs set status = 'FAILED', completed_at = now() where id = ?", runId);
+        } else if ("CANCELLED".equals(status)) {
+            eventService.append(runId, new ExecutionEventDto.AppendRequest(null, traceId,
+                    ExecutionEventType.RUN_CANCEL_REQUESTED, null, null, null, null, "RUN_CANCEL_REQUESTED",
+                    objectMapper.createObjectNode()), "attestation-test");
+            jdbcTemplate.update("""
+                    update test_runs set status = 'CANCELLED', cancel_requested_at = now(), completed_at = now()
+                     where id = ?
+                    """, runId);
+        } else if (!"PREPARING".equals(status) && !"RUNNING".equals(status)) {
+            throw new IllegalArgumentException("Unsupported scheduled test Run status " + status);
+        }
+        return runId;
+    }
+
+    private void corruptQueuedRunFingerprint(UUID runId, boolean agentArtifact) {
+        String column = agentArtifact ? "agent_artifact_fingerprint" : "release_fingerprint";
+        try (Connection connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            try (var statement = connection.createStatement()) {
+                // V4 correctly prevents application writes from changing a Run snapshot.
+                // This transaction creates an adversarial stored row solely to verify
+                // the independent Attestation source-closure predicate.
+                statement.execute("alter table test_runs disable trigger test_run_identity_guard");
+                try (var update = connection.prepareStatement(
+                        "update test_runs set " + column + " = ? where id = ?")) {
+                    update.setString(1, HASH_B);
+                    update.setObject(2, runId);
+                    assertThat(update.executeUpdate()).isEqualTo(1);
+                }
+                statement.execute("alter table test_runs enable trigger test_run_identity_guard");
+                connection.commit();
+            } catch (Exception exception) {
+                connection.rollback();
+                throw exception;
+            }
+        } catch (Exception exception) {
+            throw new IllegalStateException("Failed to create mismatched queued Run fixture", exception);
+        }
     }
 
     private UUID insertHistoricalPassAttestation(

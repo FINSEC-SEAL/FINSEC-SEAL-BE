@@ -510,7 +510,8 @@ public class AttestationService {
                 incomplete(path + " must be an object");
             }
             requireText(metric.path("metric"), path + ".metric");
-            if (!metricNames.add(metric.path("metric").asString())) {
+            String metricName = metric.path("metric").asString();
+            if (!metricNames.add(metricName)) {
                 incomplete("metric names must be unique");
             }
             requireText(metric.path("calculatorVersion"), path + ".calculatorVersion");
@@ -525,7 +526,9 @@ public class AttestationService {
                     decision,
                     snapshot,
                     metric.path("sourceTestRunIds"),
-                    path + ".sourceTestRunIds"
+                    path + ".sourceTestRunIds",
+                    "OperationalErrorRate".equals(metricName)
+                            ? RunSourceScope.SCHEDULED : RunSourceScope.COMPLETED
             );
             if ("PASS".equals(decision.decision()) && (notApplicable || sourceCount == 0)) {
                 incomplete("PASS Decision requires conclusive source evidence for " + path);
@@ -778,7 +781,7 @@ public class AttestationService {
             JsonNode sourceIds,
             String field
     ) {
-        return validateSourceRuns(decision, snapshot, sourceIds, field, false);
+        return validateSourceRuns(decision, snapshot, sourceIds, field, RunSourceScope.COMPLETED);
     }
 
     private int validateSourceRuns(
@@ -787,6 +790,17 @@ public class AttestationService {
             JsonNode sourceIds,
             String field,
             boolean effectSource
+    ) {
+        return validateSourceRuns(decision, snapshot, sourceIds, field,
+                effectSource ? RunSourceScope.ATTACK_EFFECT : RunSourceScope.COMPLETED);
+    }
+
+    private int validateSourceRuns(
+            DecisionSnapshot decision,
+            JsonNode snapshot,
+            JsonNode sourceIds,
+            String field,
+            RunSourceScope scope
     ) {
         if (!sourceIds.isArray()) {
             incomplete(field + " must be an array");
@@ -798,15 +812,22 @@ public class AttestationService {
             if (!unique.add(runId)) {
                 incomplete(field + " must not contain duplicate Run IDs");
             }
-            String sourceScope = effectSource ? """
-                       and run.status in ('COMPLETED', 'FAILED')
-                       and exists (
-                           select 1 from test_case_runs trial
-                           join test_cases test_case on test_case.id = trial.test_case_id
-                           where trial.test_run_id = run.id and test_case.suite_id = run.suite_id
-                             and test_case.case_type = 'ATTACK'
-                       )
-                    """ : " and run.status = 'COMPLETED'";
+            String sourceScope = switch (scope) {
+                case COMPLETED -> " and run.status = 'COMPLETED'";
+                case ATTACK_EFFECT -> """
+                           and run.status in ('COMPLETED', 'FAILED')
+                           and exists (
+                               select 1 from test_case_runs trial
+                               join test_cases test_case on test_case.id = trial.test_case_id
+                               where trial.test_run_id = run.id and test_case.suite_id = run.suite_id
+                                 and test_case.case_type = 'ATTACK'
+                           )
+                        """;
+                case SCHEDULED -> """
+                           and run.status in ('QUEUED', 'PREPARING', 'RUNNING', 'CANCELLING',
+                                              'COMPLETED', 'FAILED', 'CANCELLED')
+                        """;
+            };
             Integer matches = jdbcTemplate.queryForObject("""
                     select count(*) from test_runs run
                      where run.id = ? and run.release_id = ? and run.suite_id = ?
@@ -1000,6 +1021,12 @@ public class AttestationService {
 
     private void incomplete(String message) {
         throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, message);
+    }
+
+    private enum RunSourceScope {
+        COMPLETED,
+        ATTACK_EFFECT,
+        SCHEDULED
     }
 
     private record DecisionSnapshot(
