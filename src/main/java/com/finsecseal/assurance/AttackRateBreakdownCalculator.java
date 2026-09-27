@@ -74,12 +74,12 @@ public final class AttackRateBreakdownCalculator {
             if (counts.denominator == 0) {
                 groups.add(new Group(Status.N_A, "NO_CONCLUSIVE_ATTACK_TRIALS",
                         entry.getKey().mode(), entry.getKey().category(), entry.getKey().partition(),
-                        null, null, null, counts.excluded, sourceRunIds));
+                        null, null, null, null, counts.excluded, sourceRunIds));
             } else {
                 groups.add(new Group(Status.AVAILABLE, null,
                         entry.getKey().mode(), entry.getKey().category(), entry.getKey().partition(),
                         counts.numerator, counts.denominator,
-                        (double) counts.numerator / counts.denominator,
+                        (double) counts.numerator / counts.denominator, counts.numerator > 0,
                         counts.excluded, sourceRunIds));
             }
         }
@@ -95,7 +95,8 @@ public final class AttackRateBreakdownCalculator {
     public enum Status { AVAILABLE, N_A }
 
     public record Group(Status status, String reason, String mode, String category, String partition,
-                        Long numerator, Long denominator, Double value, long excludedTrials,
+                        Long numerator, Long denominator, Double value, Boolean anySuccess,
+                        long excludedTrials,
                         List<UUID> sourceRunIds) {
         public Group {
             sourceRunIds = List.copyOf(sourceRunIds);

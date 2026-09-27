@@ -328,13 +328,16 @@ class ReleaseAssuranceIntegrationTest {
                 .containsOnly("HELD_OUT");
         assertThat(apiBreakdown.groups().get(0).numerator()).isEqualTo(1L);
         assertThat(apiBreakdown.groups().get(0).denominator()).isEqualTo(1L);
+        assertThat(apiBreakdown.groups().get(0).anySuccess()).isTrue();
         assertThat(apiBreakdown.groups().get(0).excludedTrials()).isEqualTo(1L);
         assertThat(apiBreakdown.groups().get(0).sourceRunIds()).containsExactly(baselineRunId);
         assertThat(apiBreakdown.groups().get(1).numerator()).isZero();
         assertThat(apiBreakdown.groups().get(1).denominator()).isEqualTo(1L);
+        assertThat(apiBreakdown.groups().get(1).anySuccess()).isFalse();
         assertThat(apiBreakdown.groups().get(1).excludedTrials()).isEqualTo(1L);
         assertThat(apiBreakdown.groups().get(2).numerator()).isEqualTo(1L);
         assertThat(apiBreakdown.groups().get(2).denominator()).isEqualTo(1L);
+        assertThat(apiBreakdown.groups().get(2).anySuccess()).isTrue();
         assertThat(apiBreakdown.groups().get(2).sourceRunIds()).containsExactly(selectedRunId);
         assertThat(apiBreakdown.groups().stream().mapToLong(
                 AttackRateBreakdownCalculator.Group::numerator).sum())
@@ -356,6 +359,9 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(apiJson.at("/attackRateBreakdown/groups/1/partition").asString())
                 .isEqualTo("MUTATION");
         assertThat(apiJson.at("/attackRateBreakdown/groups/1/numerator").asLong()).isZero();
+        assertThat(apiJson.at("/attackRateBreakdown/groups/0/anySuccess").asBoolean()).isTrue();
+        assertThat(apiJson.at("/attackRateBreakdown/groups/1/anySuccess").asBoolean()).isFalse();
+        assertThat(apiJson.at("/attackRateBreakdown/groups/2/anySuccess").asBoolean()).isTrue();
         assertThat(decisionBreakdown.path("sourceRunIds").valueStream()
                 .map(node -> node.asString()).toList()).containsExactly(selectedRunId.toString());
         assertThat(decisionGroups).hasSize(3);
@@ -363,14 +369,17 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(decisionGroups.get(0).path("status").asString()).isEqualTo("N_A");
         assertThat(decisionGroups.get(0).path("numerator").isNull()).isTrue();
         assertThat(decisionGroups.get(0).path("denominator").isNull()).isTrue();
+        assertThat(decisionGroups.get(0).path("anySuccess").isNull()).isTrue();
         assertThat(decisionGroups.get(0).path("excludedTrials").asLong()).isEqualTo(1L);
         assertThat(decisionGroups.get(0).path("sourceRunIds").isEmpty()).isTrue();
         assertThat(decisionGroups.get(1).path("partition").asString()).isEqualTo("MUTATION");
         assertThat(decisionGroups.get(1).path("numerator").asLong()).isZero();
         assertThat(decisionGroups.get(1).path("denominator").asLong()).isEqualTo(1L);
+        assertThat(decisionGroups.get(1).path("anySuccess").asBoolean()).isFalse();
         assertThat(decisionGroups.get(2).path("partition").asString()).isEqualTo("SEED");
         assertThat(decisionGroups.get(2).path("numerator").asLong()).isEqualTo(1L);
         assertThat(decisionGroups.get(2).path("denominator").asLong()).isEqualTo(1L);
+        assertThat(decisionGroups.get(2).path("anySuccess").asBoolean()).isTrue();
         assertThat(decisionGroups.valueStream().mapToLong(group ->
                 group.path("numerator").asLong()).sum()).isEqualTo(decisionAsr.path("numerator").asLong());
         assertThat(decisionGroups.valueStream().mapToLong(group ->
@@ -411,6 +420,19 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(api.metrics().heldOutAttackSuccessRate().denominator()).isEqualTo(2L);
         assertThat(api.metrics().heldOutAttackSuccessRate().sourceRunIds())
                 .containsExactlyElementsOf(List.of(baselineRunId, selectedRunId).stream().sorted().toList());
+        assertThat(api.attackRateBreakdown().groups().stream()
+                .filter(group -> "HELD_OUT".equals(group.mode())
+                        && "HELD_OUT".equals(group.partition()))
+                .map(AttackRateBreakdownCalculator.Group::anySuccess).toList()).containsExactly(true);
+        var decisionHeldOutGroup = proposal.inputSnapshot().at("/attackRateBreakdown/groups").valueStream()
+                .filter(group -> "HELD_OUT".equals(group.path("mode").asString())
+                        && "HELD_OUT".equals(group.path("partition").asString()))
+                .findFirst().orElseThrow();
+        assertThat(decisionHeldOutGroup.path("anySuccess").asBoolean()).isFalse();
+        assertThat(decisionHeldOutGroup.path("numerator").asLong()).isZero();
+        assertThat(decisionHeldOutGroup.path("denominator").asLong()).isEqualTo(1L);
+        assertThat(decisionHeldOutGroup.at("/sourceRunIds/0").asString())
+                .isEqualTo(selectedRunId.toString());
         assertThat(decisionHeldOut.path("status").asString()).isEqualTo("AVAILABLE");
         assertThat(decisionHeldOut.path("numerator").asLong()).isZero();
         assertThat(decisionHeldOut.path("denominator").asLong()).isEqualTo(1L);
@@ -544,8 +566,11 @@ class ReleaseAssuranceIntegrationTest {
             assertThat(group.sourceRunIds()).isEmpty();
         });
         assertThat(apiJson.at("/attackRateBreakdown/groups/0/numerator").isNull()).isTrue();
+        assertThat(apiJson.at("/attackRateBreakdown/groups/0/anySuccess").isNull()).isTrue();
         assertThat(proposal.inputSnapshot().at("/attackRateBreakdown/groups/0/status").asString())
                 .isEqualTo("N_A");
+        assertThat(proposal.inputSnapshot().at("/attackRateBreakdown/groups/0/anySuccess").isNull())
+                .isTrue();
         assertThat(api.metrics().attackSuccessRate().status()).isEqualTo(MetricValue.Status.N_A);
         assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
     }
@@ -800,6 +825,14 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(metrics.attackSuccessRate().denominator()).isEqualTo(1L);
         assertThat(metrics.heldOutAttackSuccessRate().numerator()).isEqualTo(1L);
         assertThat(metrics.heldOutAttackSuccessRate().denominator()).isEqualTo(1L);
+        assertThat(api.attackRateBreakdown().groups()).singleElement().satisfies(group -> {
+            assertThat(group.mode()).isEqualTo("HELD_OUT");
+            assertThat(group.partition()).isEqualTo("HELD_OUT");
+            assertThat(group.anySuccess()).isTrue();
+            assertThat(group.sourceRunIds()).containsExactly(runId);
+        });
+        assertThat(proposal.inputSnapshot().at("/attackRateBreakdown/groups/0/anySuccess")
+                .asBoolean()).isTrue();
         assertThat(metrics.attackSuccessRate().sourceRunIds()).containsExactly(runId);
         assertThat(metrics.operationalErrorRate().numerator()).isEqualTo(1L);
         assertThat(metrics.operationalErrorRate().denominator()).isEqualTo(1L);
