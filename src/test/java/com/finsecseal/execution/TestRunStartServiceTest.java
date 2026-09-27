@@ -46,6 +46,7 @@ class TestRunStartServiceTest {
         UUID secondCaseId = UUID.randomUUID();
         UUID runId = UUID.randomUUID();
         String actorId = "frontend-b";
+        String fixtureVersion = "golden-v2";
         String fixtureDigest = "sha256:" + "a".repeat(64);
         String modelConfigHash = "sha256:" + "b".repeat(64);
 
@@ -53,7 +54,9 @@ class TestRunStartServiceTest {
         when(release.getManifestJson()).thenReturn(manifest);
         when(manifest.path("model")).thenReturn(model);
         when(fingerprintService.hash(model)).thenReturn(modelConfigHash);
-        when(fixtureService.fixtureDigest()).thenReturn(fixtureDigest);
+        when(jdbcTemplate.queryForObject("select fixture_version from test_suites where id = ?",
+                String.class, suiteId)).thenReturn(fixtureVersion);
+        when(fixtureService.fixtureDigest(fixtureVersion)).thenReturn(fixtureDigest);
         when(persistenceService.register(
                 any(TestRunPersistenceDto.RegisterRequest.class),
                 eq(actorId)
@@ -132,12 +135,15 @@ class TestRunStartServiceTest {
         UUID secondCaseId = UUID.randomUUID();
         UUID runId = UUID.randomUUID();
         String actorId = "frontend-b";
+        String fixtureVersion = "golden-v1";
 
         when(releaseRepository.findById(releaseId)).thenReturn(Optional.of(release));
         when(release.getManifestJson()).thenReturn(manifest);
         when(manifest.path("model")).thenReturn(model);
         when(fingerprintService.hash(model)).thenReturn("model-hash");
-        when(fixtureService.fixtureDigest()).thenReturn("fixture-digest");
+        when(jdbcTemplate.queryForObject("select fixture_version from test_suites where id = ?",
+                String.class, suiteId)).thenReturn(fixtureVersion);
+        when(fixtureService.fixtureDigest(fixtureVersion)).thenReturn("fixture-digest");
         when(jdbcTemplate.queryForList(
                 "select id from test_cases where suite_id = ? order by case_key",
                 UUID.class,
@@ -180,6 +186,7 @@ class TestRunStartServiceTest {
         ArgumentCaptor<TestRunPersistenceDto.RegisterRequest> requestCaptor =
                 ArgumentCaptor.forClass(TestRunPersistenceDto.RegisterRequest.class);
         verify(persistenceService).register(requestCaptor.capture(), eq(actorId));
+        assertThat(requestCaptor.getValue().fixtureDigest()).isEqualTo("fixture-digest");
         assertThat(requestCaptor.getValue().totalCases()).isEqualTo(2);
 
         ArgumentCaptor<Runnable> taskCaptor = ArgumentCaptor.forClass(Runnable.class);
