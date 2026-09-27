@@ -33,9 +33,10 @@ public class ExecutionEventStream {
     }
 
     public SseEmitter subscribe(UUID runId, long afterSequence) {
-        SseEmitter emitter = new SseEmitter(timeoutMillis);
         Object lock = lockFor(runId);
         synchronized (lock) {
+            ExecutionEventDto.History firstPage = eventService.streamReplayHistory(runId, afterSequence, 1000);
+            SseEmitter emitter = new SseEmitter(timeoutMillis);
             Set<SseEmitter> runSubscribers = subscribers.computeIfAbsent(
                     runId,
                     ignored -> ConcurrentHashMap.newKeySet()
@@ -49,8 +50,8 @@ public class ExecutionEventStream {
             emitter.onError(ignored -> remove(runId, emitter));
             try {
                 long cursor = afterSequence;
+                ExecutionEventDto.History history = firstPage;
                 while (true) {
-                    ExecutionEventDto.History history = eventService.history(runId, cursor, 1000);
                     for (ExecutionEventDto.Event event : history.items()) {
                         send(emitter, event);
                         cursor = event.sequence();
@@ -58,6 +59,7 @@ public class ExecutionEventStream {
                     if (history.nextCursor() == null) {
                         break;
                     }
+                    history = eventService.history(runId, cursor, 1000);
                 }
             } catch (RuntimeException | IOException exception) {
                 remove(runId, emitter);
@@ -66,8 +68,8 @@ public class ExecutionEventStream {
                         ? runtimeException
                         : new IllegalStateException("SSE replay failed", exception);
             }
+            return emitter;
         }
-        return emitter;
     }
 
     public void publish(ExecutionEventDto.Event event) {

@@ -10,13 +10,19 @@ import com.finsecseal.common.domain.ExecutionEventType;
 import com.finsecseal.common.domain.TestCaseRunStatus;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.common.domain.TestRunStatus;
+import com.finsecseal.common.persistence.UuidV7;
+import com.finsecseal.release.CanonicalJsonService;
+import com.finsecseal.release.DigestService;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.sql.Timestamp;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -52,6 +58,12 @@ class EventEvidenceIntegrationTest {
 
     @Autowired
     ObjectMapper objectMapper;
+
+    @Autowired
+    CanonicalJsonService canonicalJsonService;
+
+    @Autowired
+    DigestService digestService;
 
     @Autowired
     TestRunPersistenceService runPersistenceService;
@@ -311,6 +323,49 @@ class EventEvidenceIntegrationTest {
                 .doesNotContain("sse-raw-customer");
     }
 
+    @Test
+    void expiresOldSseCursorWhileKeepingIntactCanonicalHistory() throws Exception {
+        Seed seed = seedRun();
+        UUID oldEventId = insertOldStartedEvent(seed.runId());
+        assertThat(eventService.verifyChain(seed.runId()).valid()).isTrue();
+        assertThat(eventService.history(seed.runId(), 0, 10).items())
+                .extracting(ExecutionEventDto.Event::eventId)
+                .containsExactly(oldEventId);
+
+        String base = "http://localhost:" + port + "/api/v1/test-runs/" + seed.runId();
+        HttpResponse<String> canonical = HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create(base + "/event-history?after=0&limit=10"))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString()
+        );
+        assertThat(canonical.statusCode()).isEqualTo(200);
+        assertThat(canonical.body()).contains(oldEventId.toString());
+
+        HttpResponse<String> expired = HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create(base + "/events"))
+                        .header("Accept", "text/event-stream")
+                        .header("Last-Event-ID", "0")
+                        .timeout(Duration.ofSeconds(5))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString()
+        );
+        assertThat(expired.statusCode()).isEqualTo(410);
+        assertThat(expired.body()).contains("STREAM_CURSOR_EXPIRED");
+        assertThat(eventService.streamReplayHistory(seed.runId(), 1, 10).items()).isEmpty();
+
+        Seed newRun = seedRun();
+        assertThat(eventService.streamReplayHistory(newRun.runId(), 0, 10).items()).isEmpty();
+    }
+
+    @Test
+    void streamReplayCountWindowKeepsExactlyTenThousandEvents() {
+        assertThat(ExecutionEventService.firstStreamReplaySequence(1L, 10_000, null)).isEqualTo(1);
+        assertThat(ExecutionEventService.firstStreamReplaySequence(1L, 10_001, null)).isEqualTo(2);
+        assertThat(ExecutionEventService.firstStreamReplaySequence(1L, 10_001, 8_000L)).isEqualTo(8_001);
+        assertThat(ExecutionEventService.firstStreamReplaySequence(9_000L, 10_001, null)).isEqualTo(9_000);
+        assertThat(ExecutionEventService.firstStreamReplaySequence(null, 0, null)).isEqualTo(1);
+    }
+
     @RepeatedTest(10)
     void serializesConcurrentAppendsAndDetectsAStoredHashMismatch() throws Exception {
         Seed concurrentSeed = seedRun();
@@ -467,6 +522,36 @@ class EventEvidenceIntegrationTest {
                 "orchestrator-b"
         );
         return new Seed(registered.runId(), caseId);
+    }
+
+    private UUID insertOldStartedEvent(UUID runId) {
+        UUID eventId = UuidV7.generate();
+        UUID traceId = UUID.randomUUID();
+        Instant occurredAt = Instant.now().minus(Duration.ofDays(8)).truncatedTo(ChronoUnit.MICROS);
+        ObjectNode canonical = objectMapper.createObjectNode();
+        canonical.put("schemaVersion", "1.0");
+        canonical.put("eventId", eventId.toString());
+        canonical.put("traceId", traceId.toString());
+        canonical.put("runId", runId.toString());
+        canonical.putNull("testCaseRunId");
+        canonical.put("sequence", 1);
+        canonical.put("occurredAt", occurredAt.toString());
+        canonical.put("eventType", "RUN_STARTED");
+        canonical.putNull("toolName");
+        canonical.putNull("input");
+        canonical.putNull("output");
+        canonical.put("payloadDigest", HASH_A);
+        canonical.putNull("policyDecision");
+        canonical.putNull("reasonCode");
+        canonical.set("metadata", objectMapper.createObjectNode());
+        String eventHash = digestService.sha256(canonicalJsonService.canonicalize(canonical));
+        jdbcTemplate.update("""
+                insert into execution_events
+                    (id, workspace_id, run_id, trace_id, sequence, occurred_at, event_type,
+                     payload_digest, metadata_json, event_hash)
+                values (?, ?, ?, ?, 1, ?, 'RUN_STARTED', ?, '{}'::jsonb, ?)
+                """, eventId, WORKSPACE_ID, runId, traceId, Timestamp.from(occurredAt), HASH_A, eventHash);
+        return eventId;
     }
 
     private record Seed(UUID runId, UUID caseId) {
