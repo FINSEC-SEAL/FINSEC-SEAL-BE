@@ -12,6 +12,7 @@ import com.finsecseal.common.domain.TestCaseRunStatus;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.common.domain.TestRunStatus;
 import com.finsecseal.common.persistence.UuidV7;
+import com.finsecseal.platform.contract.ContractReviewerCredentials;
 import com.finsecseal.release.CanonicalJsonService;
 import com.finsecseal.release.DigestService;
 import java.io.BufferedReader;
@@ -44,7 +45,11 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ObjectNode;
 
 @Testcontainers
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
+        "finsec.contract-access.key=test-reviewer-key-at-least-32-bytes-long",
+        "finsec.contract-access.actor=evidence-integration-reviewer",
+        "finsec.contract-access.workspace=0198f1e2-0000-7000-8000-000000000001"
+})
 class EventEvidenceIntegrationTest {
 
     private static final String HASH_A = "sha256:" + "a".repeat(64);
@@ -78,6 +83,9 @@ class EventEvidenceIntegrationTest {
 
     @Autowired
     AuditService auditService;
+
+    @Autowired
+    ContractReviewerCredentials reviewerCredentials;
 
     @Autowired
     EventOutboxPublisher outboxPublisher;
@@ -354,9 +362,13 @@ class EventEvidenceIntegrationTest {
     @Test
     void keepsIdempotencyAdmissionOnOtherRunMutations() throws Exception {
         HttpClient client = HttpClient.newHttpClient();
+        var reviewerSession = reviewerCredentials.issue();
+        String reviewerCookie = ContractReviewerCredentials.COOKIE + "=" + reviewerSession.token();
         URI startUri = URI.create("http://localhost:" + port + "/api/v1/test-runs");
         HttpResponse<String> missingKey = client.send(HttpRequest.newBuilder(startUri)
                         .header("Content-Type", "application/json")
+                        .header("Cookie", reviewerCookie)
+                        .header("X-CSRF-Token", reviewerSession.csrfToken())
                         .POST(HttpRequest.BodyPublishers.ofString("{}"))
                         .build(), HttpResponse.BodyHandlers.ofString());
         assertThat(missingKey.statusCode()).isEqualTo(400);
@@ -366,6 +378,8 @@ class EventEvidenceIntegrationTest {
         String key = "run-start-" + UUID.randomUUID();
         HttpResponse<String> admitted = client.send(HttpRequest.newBuilder(startUri)
                         .header("Content-Type", "application/json")
+                        .header("Cookie", reviewerCookie)
+                        .header("X-CSRF-Token", reviewerSession.csrfToken())
                         .header("Idempotency-Key", key)
                         .POST(HttpRequest.BodyPublishers.ofString("{}"))
                         .build(), HttpResponse.BodyHandlers.ofString());
