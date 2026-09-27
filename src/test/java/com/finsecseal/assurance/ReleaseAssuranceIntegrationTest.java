@@ -17,8 +17,12 @@ import com.finsecseal.release.ReleaseService;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
@@ -253,6 +257,58 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(snapshotEffectCount(proposal, "UnauthorizedRecordExposureCount")
                 .path("sourceTestRunIds").valueStream().map(node -> node.asString()).toList())
                 .contains(failedRunId.toString());
+    }
+
+    @Test
+    void countsTwoLinkedHighImpactTransitionsInFailedTrialWithoutInflatingAttackRate() throws Exception {
+        Seed seed = seedCriticalRelease();
+        UUID failedRunId = seedFailedMutationRun(seed.releaseId(), 2, MutationFault.NONE);
+
+        var metrics = assuranceService.metrics(seed.releaseId()).metrics();
+
+        assertThat(metrics.attackSuccessRate().denominator()).isEqualTo(1L);
+        assertThat(metrics.attackSuccessRate().sourceRunIds()).doesNotContain(failedRunId);
+        assertThat(metrics.highImpactMutationCount()).isEqualTo(2L);
+        assertThat(metrics.sensitiveFieldExposureCount()).isNull();
+        assertThat(jdbcTemplate.queryForObject("""
+                select count(*) from execution_events
+                 where run_id = ? and event_type = 'SANDBOX_STATE_CHANGED'
+                   and tool_name = 'LOAN_DECISION_UPDATE'
+                """, Long.class, failedRunId)).isEqualTo(2L);
+        assertThat(assuranceService.metrics(seed.releaseId()).metrics().highImpactMutationCount())
+                .isEqualTo(2L);
+        assertThat(assuranceService.evaluate(seed.releaseId(), "role-d")
+                .inputSnapshot().path("observedEffectCounts").size()).isEqualTo(2);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = MutationFault.class, names = {"WRONG_SOURCE", "WRONG_SEQUENCE"})
+    void malformedHighImpactOracleSourceOrSequenceIsUnavailable(MutationFault fault) throws Exception {
+        Seed seed = seedCriticalRelease();
+        seedFailedMutationRun(seed.releaseId(), 1, fault);
+
+        assertThat(assuranceService.metrics(seed.releaseId()).metrics().highImpactMutationCount())
+                .isNull();
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = MutationFault.class, names = {"ORPHAN_STATE", "DUPLICATE_RESPONSE_LINK"})
+    void orphanOrDuplicateLinkedStateEventIsUnavailable(MutationFault fault) throws Exception {
+        Seed seed = seedCriticalRelease();
+        seedFailedMutationRun(seed.releaseId(), 2, fault);
+
+        assertThat(assuranceService.metrics(seed.releaseId()).metrics().highImpactMutationCount())
+                .isNull();
+    }
+
+    @Test
+    void conclusiveAttackWithoutHighImpactMutationHasZeroActualTransitions() throws Exception {
+        Seed seed = seedCriticalRelease();
+
+        var metrics = assuranceService.metrics(seed.releaseId()).metrics();
+
+        assertThat(metrics.highImpactMutationCount()).isZero();
+        assertThat(metrics.sensitiveFieldExposureCount()).isNull();
     }
 
     @Test
@@ -511,6 +567,15 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     private UUID seedFailedRun(UUID releaseId, String successfulRecordEvidence) {
+        return seedFailedRun(releaseId, successfulRecordEvidence, null);
+    }
+
+    private UUID seedFailedMutationRun(UUID releaseId, int transitions, MutationFault fault) {
+        return seedFailedRun(releaseId, null, new MutationFixture(transitions, fault));
+    }
+
+    private UUID seedFailedRun(UUID releaseId, String successfulRecordEvidence,
+                               MutationFixture mutationFixture) {
         UUID baselineRunId = jdbcTemplate.queryForObject(
                 "select id from test_runs where release_id = ? and status = 'COMPLETED'",
                 UUID.class,
@@ -563,6 +628,9 @@ class ReleaseAssuranceIntegrationTest {
                     """, UUID.randomUUID(), failedCaseRunId, successfulRecordEvidence, HASH_A,
                     Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
         }
+        if (mutationFixture != null) {
+            appendMutationEvidence(failedRunId, failedCaseRunId, traceId, now, mutationFixture);
+        }
         jdbcTemplate.update("""
                 update test_case_runs
                    set status = 'ERROR', started_at = ?, completed_at = ?, error_code = 'RUNTIME_EXECUTION_ERROR',
@@ -582,6 +650,47 @@ class ReleaseAssuranceIntegrationTest {
         return failedRunId;
     }
 
+    private void appendMutationEvidence(UUID runId, UUID caseRunId, UUID traceId, Instant now,
+                                        MutationFixture fixture) {
+        List<ExecutionEventDto.Event> responses = new ArrayList<>();
+        List<ExecutionEventDto.Event> stateEvents = new ArrayList<>();
+        for (int index = 0; index < fixture.transitions(); index++) {
+            var response = eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                    caseRunId, traceId, ExecutionEventType.TOOL_RESPONSE,
+                    "LOAN_DECISION_UPDATE", null, objectMapper.createObjectNode(), null,
+                    "TOOL_EXECUTED", objectMapper.createObjectNode().put("stateChanged", true)
+            ), "runtime-b");
+            responses.add(response);
+            UUID linkedResponseId = fixture.fault() == MutationFault.ORPHAN_STATE
+                    && index == fixture.transitions() - 1 ? UUID.randomUUID()
+                    : fixture.fault() == MutationFault.DUPLICATE_RESPONSE_LINK
+                    && index == fixture.transitions() - 1 ? responses.getFirst().eventId()
+                    : response.eventId();
+            var stateEvent = eventService.append(runId, new ExecutionEventDto.AppendRequest(
+                    caseRunId, traceId, ExecutionEventType.SANDBOX_STATE_CHANGED,
+                    "LOAN_DECISION_UPDATE", null, null, null, "SANDBOX_STATE_CHANGED",
+                    objectMapper.createObjectNode().put("stateChanged", true)
+                            .put("sourceToolResponseEventId", linkedResponseId.toString())
+            ), "runtime-b");
+            stateEvents.add(stateEvent);
+        }
+        ExecutionEventDto.Event lastState = stateEvents.getLast();
+        UUID sourceId = fixture.fault() == MutationFault.WRONG_SOURCE
+                ? responses.getLast().eventId() : lastState.eventId();
+        long sourceSequence = lastState.sequence()
+                + (fixture.fault() == MutationFault.WRONG_SEQUENCE ? 1 : 0);
+        jdbcTemplate.update("""
+                insert into oracle_results
+                    (id, test_case_run_id, source_event_id, oracle_type, oracle_version, outcome,
+                     reason_code, invariant_id, evidence_json, evidence_digest,
+                     evaluated_at, created_at, updated_at)
+                values (?, ?, ?, 'HIGH_IMPACT_MUTATION', '1.0', 'ATTACK_SUCCESS',
+                        'HIGH_IMPACT_STATE_MUTATED', 'INV-05', ?::jsonb, ?, ?, ?, ?)
+                """, UUID.randomUUID(), caseRunId, sourceId,
+                objectMapper.createObjectNode().put("mutationEventSequence", sourceSequence).toString(),
+                HASH_A, Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
+    }
+
     private UUID seedApprovedContract(UUID releaseId) {
         UUID contractId = UUID.randomUUID();
         UUID versionId = UUID.randomUUID();
@@ -599,6 +708,13 @@ class ReleaseAssuranceIntegrationTest {
     }
 
     private record Seed(UUID releaseId) {
+    }
+
+    private record MutationFixture(int transitions, MutationFault fault) {
+    }
+
+    private enum MutationFault {
+        NONE, WRONG_SOURCE, WRONG_SEQUENCE, ORPHAN_STATE, DUPLICATE_RESPONSE_LINK
     }
 
     private tools.jackson.databind.JsonNode snapshotEffectCount(ReleaseAssuranceDto.DecisionProposal proposal,
