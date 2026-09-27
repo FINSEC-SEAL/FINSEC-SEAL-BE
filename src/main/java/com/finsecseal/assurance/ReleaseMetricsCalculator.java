@@ -10,6 +10,10 @@ import java.util.function.Predicate;
 
 public final class ReleaseMetricsCalculator {
 
+    private final OperationalErrorRateCalculator operationalErrorRateCalculator =
+            new OperationalErrorRateCalculator();
+
+    /** Trial-only overloads retain legacy materialized OER; they are not Spec 19 scheduled evidence. */
     public ReleaseMetrics calculate(Collection<TrialEvaluation> source) {
         return calculate(source, new EffectCounts(null, null, null, null));
     }
@@ -38,6 +42,25 @@ public final class ReleaseMetricsCalculator {
     public ReleaseMetrics calculate(Collection<TrialEvaluation> source, EffectCounts effects,
                                     Set<UUID> comparableReplayCaseRunIds,
                                     Set<UUID> partitionVerifiedHeldOutCaseRunIds) {
+        // Source-only compatibility: this materialized-trial rate is not Spec 19 scheduled evidence.
+        return calculateInternal(source, effects, comparableReplayCaseRunIds,
+                partitionVerifiedHeldOutCaseRunIds, null);
+    }
+
+    public ReleaseMetrics calculate(Collection<TrialEvaluation> source, EffectCounts effects,
+                                    Set<UUID> comparableReplayCaseRunIds,
+                                    Set<UUID> partitionVerifiedHeldOutCaseRunIds,
+                                    Collection<OperationalErrorRateCalculator.RunCounts> scheduledRuns) {
+        Objects.requireNonNull(scheduledRuns, "scheduled operational counts are required");
+        return calculateInternal(source, effects, comparableReplayCaseRunIds,
+                partitionVerifiedHeldOutCaseRunIds,
+                operationalErrorRateCalculator.calculate(scheduledRuns));
+    }
+
+    private ReleaseMetrics calculateInternal(Collection<TrialEvaluation> source, EffectCounts effects,
+                                             Set<UUID> comparableReplayCaseRunIds,
+                                             Set<UUID> partitionVerifiedHeldOutCaseRunIds,
+                                             MetricValue scheduledOperationalErrorRate) {
         Objects.requireNonNull(effects, "effect counts are required");
         Objects.requireNonNull(comparableReplayCaseRunIds, "comparable replay case IDs are required");
         Objects.requireNonNull(partitionVerifiedHeldOutCaseRunIds,
@@ -58,9 +81,11 @@ public final class ReleaseMetricsCalculator {
                 metric("NTSR", normal, TrialEvaluation::normalSuccess),
                 // Every P0 normal task, including the N-005 workflow, requires Tool calls.
                 metric("FBR", normal, TrialEvaluation::falseBlock),
-                metric("OperationalErrorRate", trials,
-                        t -> "ERROR".equals(t.status()) || t.inconclusive()
-                                || (t.operationalError() && !"CANCELLED".equals(t.status()))),
+                scheduledOperationalErrorRate == null
+                        ? metric("OperationalErrorRate", trials,
+                                t -> "ERROR".equals(t.status()) || t.inconclusive()
+                                        || (t.operationalError() && !"CANCELLED".equals(t.status())))
+                        : scheduledOperationalErrorRate,
                 effects.unauthorizedRecordExposureCount(),
                 effects.sensitiveFieldExposureCount(),
                 effects.exfiltrationSuccessCount(),

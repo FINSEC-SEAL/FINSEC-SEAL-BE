@@ -131,6 +131,10 @@ class ReleaseAssuranceIntegrationTest {
 
         var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
         assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+        assertThat(assuranceService.metrics(seed.releaseId()).metrics()
+                .operationalErrorRate().numerator()).isZero();
+        assertThat(decisionMetric(proposal, "OperationalErrorRate").path("numerator").asLong())
+                .isZero();
         assertThat(proposal.inputSnapshot().path("criticalSuccessEvidence")).isEmpty();
         for (int index = 0; index < 4; index++) {
             assertThat(proposal.inputSnapshot().at(
@@ -580,6 +584,13 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(rate.path("sourceRunIds").valueStream().map(JsonNode::asString).toList())
                 .containsExactlyElementsOf(List.of(baselineRunId, queued.runId()).stream()
                         .sorted().map(UUID::toString).toList());
+        JsonNode operational = decisionMetric(incomplete, "OperationalErrorRate");
+        assertThat(operational.path("numerator").asLong()).isZero();
+        assertThat(operational.path("denominator").asLong()).isEqualTo(3L);
+        assertThat(operational.path("sourceTestRunIds").valueStream()
+                .map(JsonNode::asString).toList())
+                .containsExactlyElementsOf(List.of(baselineRunId, queued.runId()).stream()
+                        .sorted().map(UUID::toString).toList());
         assertThat(scheduledRule(incomplete).path("triggered").asBoolean()).isTrue();
         assertThat(incomplete.inputDigest()).isNotEqualTo(complete.inputDigest());
         assertThat(assuranceService.evaluate(seed.releaseId(), "role-d").inputDigest())
@@ -664,6 +675,90 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(serialized.at("/completionRate/status").asString()).isEqualTo("N_A");
         assertThat(serialized.at("/completionRate/numerator").isNull()).isTrue();
         assertThat(serialized.at("/completionRate/sourceRunIds").isEmpty()).isTrue();
+        MetricValue operational = api.metrics().operationalErrorRate();
+        assertThat(operational.status()).isEqualTo(MetricValue.Status.N_A);
+        assertThat(operational.reason()).isEqualTo("NO_SCHEDULED_TRIALS");
+        assertThat(operational.numerator()).isNull();
+        assertThat(operational.denominator()).isNull();
+        assertThat(operational.value()).isNull();
+        assertThat(operational.sourceRunIds()).isEmpty();
+        assertThat(serialized.at("/metrics/operationalErrorRate/status").asString()).isEqualTo("N_A");
+        assertThat(serialized.at("/metrics/operationalErrorRate/reason").asString())
+                .isEqualTo("NO_SCHEDULED_TRIALS");
+        assertThat(serialized.at("/metrics/operationalErrorRate/numerator").isNull()).isTrue();
+        assertThat(serialized.at("/metrics/operationalErrorRate/denominator").isNull()).isTrue();
+        assertThat(serialized.at("/metrics/operationalErrorRate/value").isNull()).isTrue();
+    }
+
+    @Test
+    void operationalErrorRateCountsErrorOrInconclusiveOnceOverSelectedScheduledSlots() throws Exception {
+        Seed seed = seedCriticalRelease();
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+        SensitiveRun otherSuite = seedSensitiveRun(seed.releaseId());
+        finishSensitiveRun(otherSuite, true);
+        PlannedRun active = seedPlannedRun(baselineRunId, "HELD_OUT", 3,
+                List.of("ERROR", "PASSED"), "RUNNING");
+        PlannedRun queued = seedPlannedRun(baselineRunId, "REGRESSION", 2,
+                List.of(), "QUEUED");
+        PlannedRun cancelled = seedPlannedRun(baselineRunId, "SEAL_REPLAY", 1,
+                List.of("CANCELLED"), "CANCELLED");
+        UUID errorCaseId = jdbcTemplate.queryForObject("""
+                select id from test_case_runs where test_run_id = ? and trial_index = 0
+                """, UUID.class, active.runId());
+        UUID passedCaseId = jdbcTemplate.queryForObject("""
+                select id from test_case_runs where test_run_id = ? and trial_index = 1
+                """, UUID.class, active.runId());
+        appendDistributionOracle(errorCaseId, "CROSS_CUSTOMER", "INCONCLUSIVE",
+                "EVIDENCE_INCOMPLETE", "INV-01");
+        appendDistributionOracle(errorCaseId, "SENSITIVE_FIELD", "INCONCLUSIVE",
+                "EVIDENCE_INCOMPLETE", "INV-02");
+
+        List<UUID> selectedIds = List.of(baselineRunId, active.runId(), queued.runId(),
+                cancelled.runId()).stream().sorted().toList();
+        List<UUID> releaseIds = List.of(baselineRunId, active.runId(), queued.runId(),
+                cancelled.runId(), otherSuite.runId()).stream().sorted().toList();
+        var apiBefore = assuranceService.metrics(seed.releaseId());
+        JsonNode apiBeforeJson = objectMapper.readTree(objectMapper.writeValueAsString(apiBefore));
+        var before = assuranceService.evaluate(seed.releaseId(), "role-d");
+        JsonNode beforeMetric = decisionMetric(before, "OperationalErrorRate");
+
+        assertThat(apiBefore.metrics().operationalErrorRate().numerator()).isEqualTo(2L);
+        assertThat(apiBefore.metrics().operationalErrorRate().denominator()).isEqualTo(8L);
+        assertThat(apiBefore.metrics().operationalErrorRate().sourceRunIds())
+                .containsExactlyElementsOf(releaseIds);
+        assertThat(apiBefore.completionRate().sourceRunIds()).containsExactlyElementsOf(releaseIds);
+        assertThat(apiBeforeJson.at("/metrics/operationalErrorRate/numerator").asLong()).isEqualTo(2L);
+        assertThat(apiBeforeJson.at("/metrics/operationalErrorRate/denominator").asLong()).isEqualTo(8L);
+        assertThat(apiBeforeJson.at("/metrics/operationalErrorRate/sourceRunIds").valueStream()
+                .map(JsonNode::asString).toList())
+                .containsExactlyElementsOf(releaseIds.stream().map(UUID::toString).toList());
+        assertThat(beforeMetric.path("status").asString()).isEqualTo("AVAILABLE");
+        assertThat(beforeMetric.path("numerator").asLong()).isEqualTo(1L);
+        assertThat(beforeMetric.path("denominator").asLong()).isEqualTo(7L);
+        assertThat(beforeMetric.path("sourceTestRunIds").valueStream().map(JsonNode::asString).toList())
+                .containsExactlyElementsOf(selectedIds.stream().map(UUID::toString).toList());
+        assertThat(before.inputSnapshot().at("/completionRate/sourceRunIds").valueStream()
+                .map(JsonNode::asString).toList())
+                .containsExactlyElementsOf(selectedIds.stream().map(UUID::toString).toList());
+        assertThat(before.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+        assertThat(before.inputSnapshot().at("/decision/ruleTrace/0/triggered").asBoolean()).isTrue();
+
+        appendDistributionOracle(passedCaseId, "CROSS_CUSTOMER", "INCONCLUSIVE",
+                "EVIDENCE_INCOMPLETE", "INV-01");
+        var apiAfter = assuranceService.metrics(seed.releaseId());
+        var after = assuranceService.evaluate(seed.releaseId(), "role-d");
+        JsonNode afterMetric = decisionMetric(after, "OperationalErrorRate");
+
+        assertThat(apiAfter.metrics().operationalErrorRate().numerator()).isEqualTo(3L);
+        assertThat(apiAfter.metrics().operationalErrorRate().denominator()).isEqualTo(8L);
+        assertThat(afterMetric.path("numerator").asLong()).isEqualTo(2L);
+        assertThat(afterMetric.path("denominator").asLong()).isEqualTo(7L);
+        assertThat(afterMetric.path("sourceTestRunIds")).isEqualTo(beforeMetric.path("sourceTestRunIds"));
+        assertThat(after.inputDigest()).isNotEqualTo(before.inputDigest());
+        assertThat(assuranceService.evaluate(seed.releaseId(), "role-d").inputDigest())
+                .isEqualTo(after.inputDigest());
+        assertThat(after.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
     }
 
     @Test
@@ -760,8 +855,8 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(decisionAsr.path("numerator").asLong()).isEqualTo(1L);
         assertThat(decisionAsr.path("denominator").asLong()).isEqualTo(2L);
         assertThat(decisionHeldOut.path("status").asString()).isEqualTo("N_A");
-        assertThat(decisionHeldOut.path("numerator").isMissingNode()).isTrue();
-        assertThat(decisionHeldOut.path("denominator").isMissingNode()).isTrue();
+        assertThat(decisionHeldOut.path("numerator").isNull()).isTrue();
+        assertThat(decisionHeldOut.path("denominator").isNull()).isTrue();
         assertThat(decisionHeldOut.path("sourceTestRunIds").isEmpty()).isTrue();
         assertThat(resultHeldOut.path("status").asString()).isEqualTo("N_A");
         assertThat(resultHeldOut.path("numerator").isMissingNode()).isTrue();
@@ -1994,6 +2089,12 @@ class ReleaseAssuranceIntegrationTest {
     private JsonNode coverageCase(ReleaseAssuranceDto.DecisionProposal proposal, UUID caseId) {
         return proposal.inputSnapshot().at("/criticalTrialCoverage/cases").valueStream()
                 .filter(item -> caseId.toString().equals(item.path("testCaseId").asString()))
+                .findFirst().orElseThrow();
+    }
+
+    private JsonNode decisionMetric(ReleaseAssuranceDto.DecisionProposal proposal, String name) {
+        return proposal.inputSnapshot().path("metrics").valueStream()
+                .filter(metric -> name.equals(metric.path("metric").asString()))
                 .findFirst().orElseThrow();
     }
 
