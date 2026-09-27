@@ -79,6 +79,9 @@ class ReleaseAssuranceIntegrationTest {
         var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
 
         assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.BLOCKED);
+        assertThat(proposal.inputSnapshot().at("/decision/ruleTrace").valueStream()
+                .map(rule -> rule.path("ruleId").asString()).toList())
+                .containsExactly("BLOCK_CRITICAL_SUCCESS", "BLOCK_INTEGRITY", "BLOCK_UNUSABLE");
         assertThat(proposal.inputSnapshot().path("metrics")).isNotEmpty();
         assertThat(assuranceService.metrics(seed.releaseId()).metrics().unauthorizedRecordExposureCount())
                 .isNull();
@@ -554,6 +557,97 @@ class ReleaseAssuranceIntegrationTest {
         assertThat(snapshotAfter.at("/numerator").asLong()).isEqualTo(2L);
         assertThat(snapshotAfter.at("/denominator").asLong()).isEqualTo(3L);
         assertThat(after.inputDigest()).isNotEqualTo(before.inputDigest());
+    }
+
+    @Test
+    void selectedQueuedSlotsTriggerScheduledReviewAndChangeDecisionDigest() throws Exception {
+        // A noncritical protected success keeps REVIEW trace available without a GC BLOCK.
+        Seed seed = seedCriticalRelease("HELD_OUT", true);
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+        var complete = assuranceService.evaluate(seed.releaseId(), "role-d");
+        assertThat(complete.inputSnapshot().at("/completionRate/numerator").asLong()).isEqualTo(1L);
+        assertThat(complete.inputSnapshot().at("/completionRate/denominator").asLong()).isEqualTo(1L);
+        assertThat(scheduledRule(complete).path("triggered").asBoolean()).isFalse();
+
+        PlannedRun queued = seedPlannedRun(baselineRunId, "REGRESSION", 2, List.of(), "QUEUED");
+        var incomplete = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var rate = incomplete.inputSnapshot().path("completionRate");
+        assertThat(incomplete.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+        assertThat(rate.path("numerator").asLong()).isEqualTo(1L);
+        assertThat(rate.path("denominator").asLong()).isEqualTo(3L);
+        assertThat(rate.path("unmaterializedTrials").asLong()).isEqualTo(2L);
+        assertThat(rate.path("sourceRunIds").valueStream().map(JsonNode::asString).toList())
+                .containsExactlyElementsOf(List.of(baselineRunId, queued.runId()).stream()
+                        .sorted().map(UUID::toString).toList());
+        assertThat(scheduledRule(incomplete).path("triggered").asBoolean()).isTrue();
+        assertThat(incomplete.inputDigest()).isNotEqualTo(complete.inputDigest());
+        assertThat(assuranceService.evaluate(seed.releaseId(), "role-d").inputDigest())
+                .isEqualTo(incomplete.inputDigest());
+
+        SensitiveRun otherSuite = seedSensitiveRun(seed.releaseId());
+        var releaseWide = assuranceService.metrics(seed.releaseId()).completionRate();
+        var selected = assuranceService.evaluate(seed.releaseId(), "role-d");
+        assertThat(releaseWide.sourceRunIds()).contains(otherSuite.runId());
+        assertThat(selected.inputSnapshot().path("completionRate")).isEqualTo(rate);
+        assertThat(scheduledRule(selected).path("triggered").asBoolean()).isTrue();
+    }
+
+    @Test
+    void runningParentWithTerminalErrorIsIncompleteEvenAtFullCompletionRate() throws Exception {
+        Seed seed = seedCriticalRelease("BASELINE");
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+        PlannedRun running = seedPlannedRun(baselineRunId, "BASELINE", 1,
+                List.of("ERROR"), "RUNNING");
+
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var rate = proposal.inputSnapshot().path("completionRate");
+        assertThat(jdbcTemplate.queryForObject("select status from test_runs where id = ?",
+                String.class, running.runId())).isEqualTo("RUNNING");
+        assertThat(rate.path("status").asString()).isEqualTo("AVAILABLE");
+        assertThat(rate.path("numerator").asLong()).isEqualTo(2L);
+        assertThat(rate.path("denominator").asLong()).isEqualTo(2L);
+        assertThat(rate.path("cancelledTrials").asLong()).isZero();
+        assertThat(rate.path("unmaterializedTrials").asLong()).isZero();
+        assertThat(scheduledRule(proposal).path("triggered").asBoolean()).isTrue();
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+    }
+
+    @Test
+    void failedParentWithSealedSlotsIsIncompleteEvenAtFullCompletionRate() throws Exception {
+        Seed seed = seedCriticalRelease("BASELINE");
+        UUID failedRunId = seedFailedRun(seed.releaseId());
+
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var rate = proposal.inputSnapshot().path("completionRate");
+        assertThat(jdbcTemplate.queryForObject("select status from test_runs where id = ?",
+                String.class, failedRunId)).isEqualTo("FAILED");
+        assertThat(rate.path("numerator").asLong()).isEqualTo(2L);
+        assertThat(rate.path("denominator").asLong()).isEqualTo(2L);
+        assertThat(rate.path("sourceRunIds").valueStream().map(JsonNode::asString).toList())
+                .contains(failedRunId.toString());
+        assertThat(scheduledRule(proposal).path("triggered").asBoolean()).isTrue();
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
+    }
+
+    @Test
+    void cancelledParentCannotCompleteSelectedScheduledEvidence() throws Exception {
+        Seed seed = seedCriticalRelease("BASELINE");
+        UUID baselineRunId = jdbcTemplate.queryForObject(
+                "select id from test_runs where release_id = ?", UUID.class, seed.releaseId());
+        PlannedRun cancelled = seedPlannedRun(baselineRunId, "BASELINE", 1,
+                List.of("CANCELLED"), "CANCELLED");
+
+        var proposal = assuranceService.evaluate(seed.releaseId(), "role-d");
+        var rate = proposal.inputSnapshot().path("completionRate");
+        assertThat(jdbcTemplate.queryForObject("select status from test_runs where id = ?",
+                String.class, cancelled.runId())).isEqualTo("CANCELLED");
+        assertThat(rate.path("numerator").asLong()).isEqualTo(1L);
+        assertThat(rate.path("denominator").asLong()).isEqualTo(2L);
+        assertThat(rate.path("cancelledTrials").asLong()).isEqualTo(1L);
+        assertThat(scheduledRule(proposal).path("triggered").asBoolean()).isTrue();
+        assertThat(proposal.proposedDecision()).isEqualTo(DecisionValue.REVIEW);
     }
 
     @Test
@@ -1900,6 +1994,12 @@ class ReleaseAssuranceIntegrationTest {
     private JsonNode coverageCase(ReleaseAssuranceDto.DecisionProposal proposal, UUID caseId) {
         return proposal.inputSnapshot().at("/criticalTrialCoverage/cases").valueStream()
                 .filter(item -> caseId.toString().equals(item.path("testCaseId").asString()))
+                .findFirst().orElseThrow();
+    }
+
+    private JsonNode scheduledRule(ReleaseAssuranceDto.DecisionProposal proposal) {
+        return proposal.inputSnapshot().at("/decision/ruleTrace").valueStream()
+                .filter(rule -> "REVIEW_SCHEDULED_TRIALS".equals(rule.path("ruleId").asString()))
                 .findFirst().orElseThrow();
     }
 

@@ -217,7 +217,8 @@ class ReleaseMetricsCalculatorTest {
                 trial.attackSuccess()
                         && trial.reasonCodes().contains(OracleReasonCode.UNAUTHORIZED_RECORD_RETURNED));
         GateDecision decision = new ReleaseGate().evaluate(metrics,
-                new ReleaseGate.GateContext(criticalObserved, true, false, false, false, Set.of(),
+                // This calculator-only fixture has no scheduled Run roster.
+                new ReleaseGate.GateContext(criticalObserved, true, false, false, false, false, Set.of(),
                         new CriticalInvariantAnySuccessCalculator().calculate(List.of(), List.of())));
 
         assertUnavailable(metrics.attackSuccessRate());
@@ -226,6 +227,8 @@ class ReleaseMetricsCalculatorTest {
         assertThat(metrics.unauthorizedRecordExposureCount()).isNull();
         assertFraction(metrics.operationalErrorRate(), 1, 1);
         assertThat(decision.value()).isEqualTo(DecisionValue.BLOCKED);
+        assertThat(decision.ruleTrace()).extracting(GateDecision.RuleResult::ruleId)
+                .containsExactly("BLOCK_CRITICAL_SUCCESS", "BLOCK_INTEGRITY", "BLOCK_UNUSABLE");
     }
 
     @Test

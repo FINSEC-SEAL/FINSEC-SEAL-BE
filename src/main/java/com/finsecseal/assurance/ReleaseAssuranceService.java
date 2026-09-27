@@ -302,9 +302,11 @@ public class ReleaseAssuranceService {
                 criticalInvariantAnySuccess(loadedTrials);
         boolean evidenceComplete = completeDecisionEvidence(metrics, trials) && replay.summary().evidenceComplete();
         CriticalTrialCoverage.Report coverage = criticalCoverage(evidence.suiteId(), trials);
+        CompletionEvidence completion = completionEvidence(release, evidence);
         boolean openHigh = hasOpenHighFinding(release.id());
         GateDecision gate = releaseGate.evaluate(metrics, new ReleaseGate.GateContext(
-                criticalSuccess, release.integrityValid(), evidenceComplete, coverage.complete(), openHigh,
+                criticalSuccess, release.integrityValid(), evidenceComplete,
+                completion.scheduledEvidenceComplete(), coverage.complete(), openHigh,
                 replay.comparableCaseRunIds(), criticalInvariantReport
         ));
         DecisionValue value = override == null ? gate.value() : override;
@@ -342,7 +344,7 @@ public class ReleaseAssuranceService {
         snapshot.set("criticalInvariantAnySuccess", objectMapper.valueToTree(criticalInvariantReport));
         snapshot.set("metrics", metricArray(metrics));
         snapshot.set("policyLatency", objectMapper.valueToTree(policyLatency(release.id(), evidence.runIds())));
-        snapshot.set("completionRate", objectMapper.valueToTree(completionRate(release, evidence)));
+        snapshot.set("completionRate", objectMapper.valueToTree(completion.rate()));
         snapshot.set("trialSuccessDistribution", objectMapper.valueToTree(distribution));
         snapshot.set("attackRateBreakdown", objectMapper.valueToTree(
                 attackRateBreakdownCalculator.calculate(distribution)));
@@ -440,6 +442,10 @@ public class ReleaseAssuranceService {
 
     private CompletionRateCalculator.CompletionRate completionRate(ReleaseRow release,
                                                                    EvidenceContext evidence) {
+        return completionEvidence(release, evidence).rate();
+    }
+
+    private CompletionEvidence completionEvidence(ReleaseRow release, EvidenceContext evidence) {
         String cohortFilter = evidence == null ? "" : """
                    and run.suite_id = ? and run.fixture_version = ? and run.fixture_digest = ?
                    and run.agent_artifact_fingerprint = ? and run.release_fingerprint = ?
@@ -448,8 +454,8 @@ public class ReleaseAssuranceService {
                 : new Object[]{release.id(), evidence.suiteId(), evidence.fixtureVersion(),
                         evidence.fixtureDigest(), release.agentArtifactFingerprint(),
                         release.releaseFingerprint()};
-        List<CompletionRateCalculator.RunCounts> runs = jdbcTemplate.query("""
-                select run.id, run.total_cases,
+        List<CompletionRun> runs = jdbcTemplate.query("""
+                select run.id, run.status, run.total_cases,
                        count(case_run.id) materialized_cases,
                        count(case_run.id) filter (where case_run.status in
                            ('PASSED', 'FAILED_SECURITY', 'FAILED_FUNCTIONAL', 'ERROR')) terminal_non_cancelled,
@@ -458,13 +464,19 @@ public class ReleaseAssuranceService {
                   left join test_case_runs case_run on case_run.test_run_id = run.id
                  where run.release_id = ?
                 """ + cohortFilter + """
-                 group by run.id, run.total_cases
+                 group by run.id, run.status, run.total_cases
                  order by run.id
-                """, (rs, row) -> new CompletionRateCalculator.RunCounts(
-                rs.getObject("id", UUID.class), rs.getLong("total_cases"),
-                rs.getLong("materialized_cases"), rs.getLong("terminal_non_cancelled"),
-                rs.getLong("cancelled_cases")), arguments);
-        return completionRateCalculator.calculate(runs);
+                """, (rs, row) -> new CompletionRun(
+                rs.getString("status"),
+                new CompletionRateCalculator.RunCounts(
+                        rs.getObject("id", UUID.class), rs.getLong("total_cases"),
+                        rs.getLong("materialized_cases"), rs.getLong("terminal_non_cancelled"),
+                        rs.getLong("cancelled_cases"))), arguments);
+        CompletionRateCalculator.CompletionRate rate = completionRateCalculator.calculate(
+                runs.stream().map(CompletionRun::counts).toList());
+        boolean allParentsCompleted = !runs.isEmpty()
+                && runs.stream().allMatch(run -> "COMPLETED".equals(run.status()));
+        return new CompletionEvidence(rate, allParentsCompleted);
     }
 
     private TrialSuccessDistributionCalculator.Report trialSuccessDistribution(
@@ -1384,6 +1396,17 @@ public class ReleaseAssuranceService {
     private record EvidenceContext(UUID suiteId, String suiteVersion, String suiteHash,
                                    String fixtureVersion, String fixtureDigest, Instant testedAt,
                                    List<UUID> runIds) { }
+    private record CompletionRun(String status, CompletionRateCalculator.RunCounts counts) { }
+    private record CompletionEvidence(CompletionRateCalculator.CompletionRate rate,
+                                      boolean allParentsCompleted) {
+        private boolean scheduledEvidenceComplete() {
+            return allParentsCompleted
+                    && rate.status() == CompletionRateCalculator.Status.AVAILABLE
+                    && rate.numerator() != null && rate.numerator().equals(rate.denominator())
+                    && Long.valueOf(0).equals(rate.cancelledTrials())
+                    && Long.valueOf(0).equals(rate.unmaterializedTrials());
+        }
+    }
     private record SnapshotBuild(GateDecision decision, ObjectNode snapshot) { }
     private record TrialMetadata(UUID runId, UUID testCaseId, String caseKey,
                                  String partition, int trialIndex) { }

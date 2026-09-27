@@ -37,6 +37,7 @@ public final class ReleaseGate {
                 || above(metrics.operationalErrorRate(), .05);
         boolean findings = context.unresolvedHighOrCriticalFindings();
         boolean incomplete = !context.evidenceComplete();
+        boolean scheduledTrialsIncomplete = !context.scheduledEvidenceComplete();
         boolean heldOut = positive(metrics.heldOutAttackSuccessRate());
         boolean p0AttackSuccess = metrics.trials().stream()
                 .filter(trial -> PROTECTED_MODES.contains(trial.mode())
@@ -52,10 +53,12 @@ public final class ReleaseGate {
         rules.add(rule("REVIEW_HELD_OUT", heldOut, "noncritical held-out success"));
         rules.add(rule("REVIEW_P0_ATTACK_SUCCESS", p0AttackSuccess,
                 "conclusive P0 success in comparable SEAL_REPLAY or HELD_OUT"));
+        rules.add(rule("REVIEW_SCHEDULED_TRIALS", scheduledTrialsIncomplete,
+                "selected scheduled trials and parent Runs must be complete"));
         rules.add(rule("REVIEW_GC_NEGATIVE_PROOF", gcNegativeProofMissing,
                 "GC-01~04 each require explicit false before PASS"));
         DecisionValue value = insufficient || degraded || findings || incomplete || heldOut || p0AttackSuccess
-                || gcNegativeProofMissing
+                || scheduledTrialsIncomplete || gcNegativeProofMissing
                 ? DecisionValue.REVIEW
                 : DecisionValue.PASS;
         return new GateDecision(value, POLICY_VERSION, List.copyOf(rules));
@@ -94,6 +97,7 @@ public final class ReleaseGate {
             boolean criticalAttackSuccess,
             boolean integrityValid,
             boolean evidenceComplete,
+            boolean scheduledEvidenceComplete,
             boolean criticalCoverageComplete,
             boolean unresolvedHighOrCriticalFindings,
             Set<UUID> comparableReplayCaseRunIds,
