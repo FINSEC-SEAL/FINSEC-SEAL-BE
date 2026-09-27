@@ -2,8 +2,10 @@ package com.finsecseal.sandbox.tool;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
 
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
@@ -18,7 +20,9 @@ import com.finsecseal.runtime.ToolProposal;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -75,6 +79,102 @@ class ReadOnlyToolResultWitnessCaptureTest {
         var consumed = witness.consume(key, captureId);
         assertThat(consumed.rawOutputDigest()).isEqualTo(expectedDigest);
         assertThat(consumed.reportedStateChanged()).isFalse();
+        assertThat(consumed.customerFields()).isEmpty(); // A matching synthetic Tool name is not an adapter identity.
+    }
+
+    @Test
+    void concreteCustomerAdapterWitnessesOnlyActuallyReturnedFieldsFromItsDigestSnapshot() {
+        InvocationKey key = key();
+        UUID captureId = UUID.randomUUID();
+        ObjectNode raw = customerResponse("incomeBand", "unexpectedField");
+        String expectedDigest = redaction.redact(raw.deepCopy()).originalDigest();
+        AtomicInteger calls = new AtomicInteger();
+        CustomerDataReadToolAdapter adapter = customerAdapter(calls, () -> result(raw));
+        ObjectNode requested = json.createObjectNode();
+        requested.putArray("fields").add("incomeBand").add("requestedButMissing");
+        ToolInvocation invocation = new ToolInvocation(new ToolProposal(TOOL, requested),
+                key.toolCallId(), key.requestDigest());
+
+        var captured = witness.executeCaptured(key, before(key, captureId), context(), invocation, adapter);
+        assertThat(calls).hasValue(1);
+        assertThat(captured.result().output()).isEqualTo(raw);
+        ((ObjectNode) raw.path("rows").path(0).path("fields")).remove("unexpectedField");
+        ((ObjectNode) captured.result().output().path("rows").path(0).path("fields"))
+                .put("afterCapture", "private value");
+
+        var consumed = witness.consume(key, captureId);
+        var fields = consumed.customerFields().orElseThrow();
+        assertThat(consumed.key()).isEqualTo(key);
+        assertThat(consumed.captureId()).isEqualTo(captureId);
+        assertThat(consumed.rawOutputDigest()).isEqualTo(expectedDigest);
+        assertThat(fields.rowCount()).isEqualTo(1);
+        assertThat(fields.fieldNamesByRow()).containsExactly(List.of("incomeBand", "unexpectedField"));
+        assertThat(fields.fieldNamesByRow().getFirst())
+                .doesNotContain("requestedButMissing", "afterCapture");
+        assertThat(fields.toString()).doesNotContain("incomeBand", "unexpectedField", "CUST-PRIVATE");
+        assertThat(consumed.toString()).doesNotContain("incomeBand", "unexpectedField", "CUST-PRIVATE");
+        assertThat(captured.toString()).doesNotContain("PRIVATE-VALUE", "CUST-PRIVATE", "incomeBand");
+        assertThat(captured.result().output().path("rows").path(0).path("fields")
+                .path("unexpectedField").asString()).isEqualTo("PRIVATE-VALUE");
+        assertIncomplete(() -> witness.consume(key, captureId));
+    }
+
+    @Test
+    void customerFieldsMustStayWithinBoundedReturnedEnvelopeBeforeDigestPublication() {
+        List<JsonNode> invalid = new ArrayList<>();
+        invalid.add(customerResponse("incomeBand").put("status", 201));
+        invalid.add(customerResponse("incomeBand").put("unlistedTopLevel", true));
+        ObjectNode wrongRow = customerResponse("incomeBand");
+        ((ObjectNode) wrongRow.path("rows").path(0)).put("unexpectedRowKey", true);
+        invalid.add(wrongRow);
+        ObjectNode tooManyFields = customerResponse();
+        ObjectNode fields = (ObjectNode) tooManyFields.path("rows").path(0).path("fields");
+        for (int index = 0; index <= 20; index++) fields.put("field" + index, "value");
+        invalid.add(tooManyFields);
+        invalid.add(customerResponse("x".repeat(81)));
+        ObjectNode tooManyRows = customerResponse("incomeBand");
+        ArrayNode rows = (ArrayNode) tooManyRows.path("rows");
+        for (int index = 1; index <= 20; index++) rows.add(rows.path(0).deepCopy());
+        invalid.add(tooManyRows);
+
+        for (JsonNode response : invalid) {
+            InvocationKey key = key();
+            UUID captureId = UUID.randomUUID();
+            AtomicInteger calls = new AtomicInteger();
+            var adapter = customerAdapter(calls, () -> result(response));
+            assertIncomplete(() -> witness.executeCaptured(key, before(key, captureId),
+                    context(), invocation(key), adapter));
+            assertIncomplete(() -> witness.consume(key, captureId));
+            assertIncomplete(() -> witness.executeCaptured(key, before(key, UUID.randomUUID()),
+                    context(), invocation(key), adapter));
+            assertThat(calls).hasValue(1);
+        }
+    }
+
+    @Test
+    void customerCancellationAndEmptyRowsDoNotPublishInventedFields() {
+        InvocationKey cancelledKey = key();
+        UUID cancelledCapture = UUID.randomUUID();
+        AtomicInteger calls = new AtomicInteger();
+        var adapter = customerAdapter(calls, () -> result(customerResponse("accountNumber")));
+        witness.executeCaptured(cancelledKey, before(cancelledKey, cancelledCapture),
+                context(), invocation(cancelledKey), adapter);
+        witness.cancel(cancelledKey, cancelledCapture);
+        assertIncomplete(() -> witness.consume(cancelledKey, cancelledCapture));
+        assertIncomplete(() -> witness.executeCaptured(cancelledKey,
+                before(cancelledKey, UUID.randomUUID()), context(), invocation(cancelledKey), adapter));
+        assertThat(calls).hasValue(1);
+
+        InvocationKey emptyKey = key();
+        UUID emptyCapture = UUID.randomUUID();
+        ObjectNode empty = json.createObjectNode().put("status", 200);
+        empty.putArray("rows");
+        var captured = witness.executeCaptured(emptyKey, before(emptyKey, emptyCapture),
+                context(), invocation(emptyKey), customerAdapter(new AtomicInteger(), () -> result(empty)));
+        assertThat(captured.result().output().path("rows").size()).isZero();
+        var inventory = witness.consume(emptyKey, emptyCapture).customerFields().orElseThrow();
+        assertThat(inventory.rowCount()).isZero();
+        assertThat(inventory.fieldNamesByRow()).isEmpty();
     }
 
     @Test
@@ -304,6 +404,26 @@ class ReadOnlyToolResultWitnessCaptureTest {
 
     private static ToolAdapter.ToolExecutionResult result(JsonNode output) {
         return new ToolAdapter.ToolExecutionResult(output, false);
+    }
+
+    private ObjectNode customerResponse(String... fieldNames) {
+        ObjectNode response = json.createObjectNode().put("status", 200);
+        ObjectNode fields = response.putArray("rows").addObject()
+                .put("customerId", "CUST-PRIVATE").putObject("fields");
+        for (String name : fieldNames) fields.put(name, "PRIVATE-VALUE");
+        return response;
+    }
+
+    private static CustomerDataReadToolAdapter customerAdapter(AtomicInteger calls,
+            Supplier<ToolAdapter.ToolExecutionResult> response) {
+        CustomerDataReadToolAdapter adapter = mock(CustomerDataReadToolAdapter.class);
+        when(adapter.toolName()).thenReturn(TOOL);
+        when(adapter.effect()).thenReturn(ToolEffect.READ_ONLY);
+        when(adapter.execute(any(), any())).thenAnswer(ignored -> {
+            calls.incrementAndGet();
+            return response.get();
+        });
+        return adapter;
     }
 
     private static ToolAdapter adapter(AtomicInteger calls,
