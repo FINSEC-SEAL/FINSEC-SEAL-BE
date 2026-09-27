@@ -20,8 +20,10 @@ final class CriticalTrialCoverage {
         boolean categoriesPresent = List.of("SEED", "HELD_OUT").stream().allMatch(partition ->
                 P0_CATEGORIES.stream().allMatch(category -> cases.stream().anyMatch(item ->
                         partition.equals(item.partition()) && category.equals(item.category()))));
-        return new Report(categoriesPresent && cases.stream().allMatch(CaseCoverage::complete),
-                categoriesPresent, cases);
+        boolean observedRequirementMet = categoriesPresent && cases.stream().allMatch(CaseCoverage::complete);
+        // Observed CaseRuns cannot certify the approved, suite-wide required slot cohort.
+        return new Report(false, observedRequirementMet, "N_A",
+                "REQUIRED_COHORT_CERTIFICATION_UNAVAILABLE", categoriesPresent, cases);
     }
 
     private CaseCoverage evaluateCase(CaseDefinition definition, Collection<Trial> trials) {
@@ -56,7 +58,9 @@ final class CriticalTrialCoverage {
     record CaseDefinition(UUID testCaseId, String category, String partition, String oracleType,
                           String criticalVariantHash) { }
     record Trial(UUID testCaseId, int trialIndex, String mode, boolean conclusive, String variantHash) { }
+    // complete here is only the observed per-case trial threshold, not release eligibility.
     record CaseCoverage(UUID testCaseId, String category, String partition, String mode,
                         Integer requiredTrials, long conclusiveTrials, boolean complete, String reason) { }
-    record Report(boolean complete, boolean requiredCategoriesPresent, List<CaseCoverage> cases) { }
+    record Report(boolean complete, boolean observedRequirementMet, String status, String reason,
+                  boolean requiredCategoriesPresent, List<CaseCoverage> cases) { }
 }
