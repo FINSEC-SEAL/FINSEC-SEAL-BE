@@ -67,9 +67,7 @@ public class Fa03ExecutionOrchestrator {
     public Result execute(UUID runId, UUID testCaseId, String actorId) {
         String normalizedActor = actorId == null || actorId.isBlank() ? "orchestrator-b" : actorId;
         ExecutionTarget target = requireTarget(runId, testCaseId);
-        if (target.mode() != TestRunMode.BASELINE) {
-            throw new BusinessException(ErrorCode.INVALID_STATE_TRANSITION, "FA-03 only supports BASELINE");
-        }
+        AttackExecutionModePolicy.requireSupported(target.mode(), target.category());
         if (target.status() != TestRunStatus.QUEUED && target.status() != TestRunStatus.RUNNING) {
             throw new BusinessException(
                     ErrorCode.INVALID_STATE_TRANSITION,
@@ -87,7 +85,13 @@ public class Fa03ExecutionOrchestrator {
         UUID caseRunId = null;
 
         try {
-            lifecycleService.ensureRunning(runId, traceId, target.category(), normalizedActor);
+            lifecycleService.ensureRunning(
+                    runId,
+                    traceId,
+                    target.category(),
+                    target.mode(),
+                    normalizedActor
+            );
 
             RunExecutionLifecycleService.CaseExecutionClaim claim = lifecycleService.claimCase(
                     runId, testCaseId, 0, variant.variantHash(), normalizedActor
