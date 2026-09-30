@@ -11,6 +11,9 @@ import com.finsecseal.sandbox.SandboxExecutionContext;
 import com.finsecseal.sandbox.tool.ToolDispatcher;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
+import java.util.function.Consumer;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -20,11 +23,32 @@ public class AgentToolLoopService {
     private final AgentRuntimeService runtimeService;
     private final ToolDispatcher toolDispatcher;
     private final int maxSteps;
+    private final Consumer<UUID> cancellationCheck;
 
+    @Autowired
     public AgentToolLoopService(
             AgentRuntimeService runtimeService,
             ToolDispatcher toolDispatcher,
-            @Value("${finsec.ai.max-steps:8}") int maxSteps
+            @Value("${finsec.ai.max-steps:8}") int maxSteps,
+            RunCancellationProbe cancellationProbe
+    ) {
+        this(runtimeService, toolDispatcher, maxSteps, cancellationProbe::throwIfCancellationRequested);
+    }
+
+    /** Source-compatible constructor for focused tests that do not own persisted Run state. */
+    public AgentToolLoopService(
+            AgentRuntimeService runtimeService,
+            ToolDispatcher toolDispatcher,
+            int maxSteps
+    ) {
+        this(runtimeService, toolDispatcher, maxSteps, runId -> { });
+    }
+
+    private AgentToolLoopService(
+            AgentRuntimeService runtimeService,
+            ToolDispatcher toolDispatcher,
+            int maxSteps,
+            Consumer<UUID> cancellationCheck
     ) {
         if (maxSteps < 1) {
             throw new IllegalArgumentException("finsec.ai.max-steps must be at least 1");
@@ -32,6 +56,7 @@ public class AgentToolLoopService {
         this.runtimeService = runtimeService;
         this.toolDispatcher = toolDispatcher;
         this.maxSteps = maxSteps;
+        this.cancellationCheck = cancellationCheck;
     }
 
     public LoopResult execute(
@@ -39,6 +64,7 @@ public class AgentToolLoopService {
             AttackVariant attackVariant,
             String actorId
     ) {
+        cancellationCheck.accept(context.runId());
         AgentRuntimeService.RuntimeTurn initialTurn = runtimeService.proposeTool(
                 context,
                 attackVariant,
@@ -53,6 +79,7 @@ public class AgentToolLoopService {
         long totalLatencyMs = initialTurn.aiResponse().latencyMs();
 
         while (true) {
+            cancellationCheck.accept(context.runId());
             if (steps.size() >= maxSteps) {
                 throw new BusinessException(
                         ErrorCode.EVIDENCE_INCOMPLETE,
@@ -96,6 +123,7 @@ public class AgentToolLoopService {
                 );
             }
 
+            cancellationCheck.accept(context.runId());
             AgentRuntimeService.DeliveryReceipt delivery = runtimeService.deliverToolResult(
                     context,
                     attackVariant,
@@ -139,6 +167,7 @@ public class AgentToolLoopService {
             }
 
             if (nextAction instanceof ToolProposalAction toolProposalAction) {
+                cancellationCheck.accept(context.runId());
                 currentInvocation = runtimeService.recordFollowUpToolProposal(
                         context,
                         attackVariant,

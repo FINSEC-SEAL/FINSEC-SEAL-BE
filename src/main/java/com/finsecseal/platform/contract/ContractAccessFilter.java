@@ -39,8 +39,11 @@ public class ContractAccessFilter extends OncePerRequestFilter {
         path = path.replaceAll(";[^/]*", "");
         boolean runStart = "POST".equals(request.getMethod())
                 && (RUN_START_PATH.equals(path) || (RUN_START_PATH + "/").equals(path));
+        boolean runCancellation = "POST".equals(request.getMethod())
+                && path.startsWith(RUN_START_PATH + "/")
+                && (path.endsWith(":cancel") || path.endsWith(":cancel/"));
         // Prefix matching also protects malformed/encoded descendants before MVC routing.
-        return !runStart && !path.startsWith("/api/v1/platform/contracts")
+        return !runStart && !runCancellation && !path.startsWith("/api/v1/platform/contracts")
                 && !path.startsWith("/api/v1/platform/patch-sources")
                 && !path.startsWith("/api/v1/contracts") && !path.startsWith("/api/v1/contract-versions")
                 && !path.startsWith("/api/v1/patch-proposals")
@@ -59,6 +62,15 @@ public class ContractAccessFilter extends OncePerRequestFilter {
         boolean runStart = "POST".equals(request.getMethod()) && RUN_START_PATH.equals(request.getRequestURI());
         if ("POST".equals(request.getMethod()) && (RUN_START_PATH + "/").equals(request.getRequestURI())) {
             response.sendError(400, "Use the canonical Run start path");
+            return;
+        }
+        boolean runCancellation = "POST".equals(request.getMethod())
+                && request.getRequestURI().startsWith(RUN_START_PATH + "/")
+                && request.getRequestURI().endsWith(":cancel");
+        if ("POST".equals(request.getMethod())
+                && request.getRequestURI().startsWith(RUN_START_PATH + "/")
+                && request.getRequestURI().endsWith(":cancel/")) {
+            response.sendError(400, "Use the canonical Run cancellation path");
             return;
         }
         ReviewerContext reviewer = null;
@@ -80,7 +92,7 @@ public class ContractAccessFilter extends OncePerRequestFilter {
                 session = null;
                 reviewer = credentials.keyReviewer();
             }
-        } else if (!runStart && credentials.keyValid(supplied)) {
+        } else if (!runStart && !runCancellation && credentials.keyValid(supplied)) {
             reviewer = credentials.keyReviewer();
         }
         if ("DELETE".equals(request.getMethod()) && request.getRequestURI().startsWith("/api/v1/reviewer-session/")) {

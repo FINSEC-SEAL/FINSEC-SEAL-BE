@@ -9,6 +9,7 @@ import com.finsecseal.evidence.TestRunPersistenceDto;
 import com.finsecseal.release.AgentReleaseEntity;
 import com.finsecseal.release.AgentReleaseRepository;
 import com.finsecseal.release.FingerprintService;
+import com.finsecseal.runtime.RunCancellationProbe;
 import com.finsecseal.sandbox.SandboxFixtureService;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.ArrayList;
@@ -48,6 +49,7 @@ public class TestRunStartService {
     private final AuthenticatedTestRunRegistrationService admissionService;
     private final ExecutionDispatchService dispatchService;
     private final RunExecutionLifecycleService lifecycleService;
+    private final RunCancellationProbe cancellationProbe;
     private final JdbcTemplate jdbcTemplate;
     private final Executor executor;
 
@@ -58,6 +60,7 @@ public class TestRunStartService {
             AuthenticatedTestRunRegistrationService admissionService,
             ExecutionDispatchService dispatchService,
             RunExecutionLifecycleService lifecycleService,
+            RunCancellationProbe cancellationProbe,
             JdbcTemplate jdbcTemplate,
             @Qualifier("testRunExecutor") Executor executor
     ) {
@@ -67,6 +70,7 @@ public class TestRunStartService {
         this.admissionService = admissionService;
         this.dispatchService = dispatchService;
         this.lifecycleService = lifecycleService;
+        this.cancellationProbe = cancellationProbe;
         this.jdbcTemplate = jdbcTemplate;
         this.executor = executor;
     }
@@ -142,6 +146,9 @@ public class TestRunStartService {
                 try {
                     executor.execute(() -> {
                         for (UUID caseId : executionCaseIds) {
+                            if (cancellationProbe.isCancellationRequested(admittedRunId)) {
+                                break;
+                            }
                             dispatchService.execute(admittedRunId, caseId, admittedActorId);
                         }
                     });

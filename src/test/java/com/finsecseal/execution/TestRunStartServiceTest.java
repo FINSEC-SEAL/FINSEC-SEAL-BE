@@ -21,6 +21,7 @@ import com.finsecseal.evidence.TestRunPersistenceDto;
 import com.finsecseal.release.AgentReleaseEntity;
 import com.finsecseal.release.AgentReleaseRepository;
 import com.finsecseal.release.FingerprintService;
+import com.finsecseal.runtime.RunCancellationProbe;
 import com.finsecseal.sandbox.SandboxFixtureService;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -85,6 +86,21 @@ class TestRunStartServiceTest {
         var ordered = inOrder(fixture.dispatch);
         ordered.verify(fixture.dispatch).execute(fixture.runId, first, ACTOR);
         ordered.verify(fixture.dispatch).execute(fixture.runId, second, ACTOR);
+    }
+
+    @Test
+    void stopsDispatchingUnstartedCasesAfterCancellation() {
+        UUID first = UUID.randomUUID(), second = UUID.randomUUID();
+        Fixture fixture = new Fixture(List.of(
+                new CaseRow(first, "SEED", false), new CaseRow(second, "MUTATION", false)));
+        fixture.service.start(
+                fixture.request(TestRunMode.BASELINE, List.of(first, second)), fixture.httpRequest);
+        when(fixture.cancellation.isCancellationRequested(fixture.runId)).thenReturn(false, true);
+
+        afterCommitTask(fixture.executor).run();
+
+        verify(fixture.dispatch).execute(fixture.runId, first, ACTOR);
+        verify(fixture.dispatch, org.mockito.Mockito.never()).execute(fixture.runId, second, ACTOR);
     }
 
     @Test
@@ -249,6 +265,7 @@ class TestRunStartServiceTest {
         final MockHttpServletRequest httpRequest = new MockHttpServletRequest();
         final ExecutionDispatchService dispatch = mock(ExecutionDispatchService.class);
         final RunExecutionLifecycleService lifecycle = mock(RunExecutionLifecycleService.class);
+        final RunCancellationProbe cancellation = mock(RunCancellationProbe.class);
         final Executor executor = mock(Executor.class);
         final FakeJdbcTemplate db;
         final TestRunStartService service;
@@ -266,8 +283,9 @@ class TestRunStartServiceTest {
                             new TestRunPersistenceDto.Registered(runId, TestRunStatus.QUEUED,
                                     "/api/v1/test-runs/" + runId,
                                     "/api/v1/test-runs/" + runId + "/events"), ACTOR));
+            when(cancellation.isCancellationRequested(runId)).thenReturn(false);
             service = new TestRunStartService(releases, fingerprints, fixtures,
-                    admission, dispatch, lifecycle, db, executor);
+                    admission, dispatch, lifecycle, cancellation, db, executor);
         }
 
         TestRunStartService.Request request(TestRunMode mode, List<UUID> ids) {

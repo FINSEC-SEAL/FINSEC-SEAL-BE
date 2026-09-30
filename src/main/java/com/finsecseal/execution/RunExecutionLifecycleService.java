@@ -146,6 +146,105 @@ public class RunExecutionLifecycleService {
     }
 
     @Transactional
+    public void requestCancellation(UUID runId, UUID traceId, String actorId) {
+        TestRunStatus status = lockRunStatus(runId);
+        if (status == TestRunStatus.CANCELLED) {
+            return;
+        }
+        if (status == TestRunStatus.COMPLETED || status == TestRunStatus.FAILED) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_STATE_TRANSITION,
+                    "Completed or failed TestRun cannot be cancelled"
+            );
+        }
+
+        if (status != TestRunStatus.CANCELLING) {
+            ensureRunStartedForCancellation(runId, traceId, status, actorId);
+            ObjectNode metadata = objectMapper.createObjectNode();
+            metadata.put("schemaVersion", "1.0");
+            metadata.put("requestedFromStatus", status.name());
+            eventService.append(
+                    runId,
+                    new ExecutionEventDto.AppendRequest(
+                            null,
+                            traceId,
+                            ExecutionEventType.RUN_CANCEL_REQUESTED,
+                            null,
+                            null,
+                            null,
+                            null,
+                            "OPERATOR_CANCEL_REQUESTED",
+                            metadata
+                    ),
+                    actorId
+            );
+            runPersistenceService.updateStatus(
+                    runId,
+                    new TestRunPersistenceDto.StatusRequest(
+                            TestRunStatus.CANCELLING,
+                            null,
+                            null,
+                            metadata
+                    ),
+                    actorId
+            );
+        }
+
+        List<UUID> activeCaseIds = jdbcTemplate.queryForList("""
+                select id
+                  from test_case_runs
+                 where test_run_id = ?
+                   and status in ('PENDING', 'EXECUTING', 'EVALUATING')
+                 order by id
+                 for update
+                """, UUID.class, runId);
+        for (UUID caseRunId : activeCaseIds) {
+            ObjectNode result = objectMapper.createObjectNode();
+            result.put("cancelled", true);
+            result.put("reasonCode", "OPERATOR_CANCEL_REQUESTED");
+            runPersistenceService.updateCaseStatus(
+                    runId,
+                    caseRunId,
+                    new TestRunPersistenceDto.CaseRunStatusRequest(
+                            TestCaseRunStatus.CANCELLED,
+                            null,
+                            "NOT_EVALUATED",
+                            null,
+                            objectMapper.createObjectNode(),
+                            "OPERATOR_CANCEL_REQUESTED",
+                            result
+                    ),
+                    actorId
+            );
+        }
+
+        RunCounts counts = readRunCounts(runId);
+        Integer cancelledCases = jdbcTemplate.queryForObject(
+                "select count(*) from test_case_runs where test_run_id = ? and status = 'CANCELLED'",
+                Integer.class,
+                runId
+        );
+        ObjectNode summary = objectMapper.createObjectNode();
+        summary.put("schemaVersion", "1.0");
+        summary.put("status", TestRunStatus.CANCELLED.name());
+        summary.put("plannedCases", counts.totalCases());
+        summary.put("materializedCases", counts.materializedCases());
+        summary.put("completedCases", counts.terminalCases());
+        summary.put("cancelledCases", cancelledCases == null ? 0 : cancelledCases);
+        summary.put("operationalErrorCount", counts.errorCases());
+        runPersistenceService.updateStatus(
+                runId,
+                new TestRunPersistenceDto.StatusRequest(
+                        TestRunStatus.CANCELLED,
+                        counts.terminalCases(),
+                        counts.errorCases(),
+                        summary
+                ),
+                actorId
+        );
+    }
+
+    @Transactional
     public CaseExecutionClaim claimCase(
             UUID runId,
             UUID testCaseId,
@@ -370,6 +469,39 @@ public class RunExecutionLifecycleService {
                     actorId
             );
         }
+    }
+
+    private void ensureRunStartedForCancellation(
+            UUID runId,
+            UUID traceId,
+            TestRunStatus status,
+            String actorId
+    ) {
+        Integer count = jdbcTemplate.queryForObject(
+                "select count(*) from execution_events where run_id = ?",
+                Integer.class,
+                runId
+        );
+        if (!Integer.valueOf(0).equals(count)) {
+            return;
+        }
+        eventService.append(
+                runId,
+                new ExecutionEventDto.AppendRequest(
+                        null,
+                        traceId,
+                        ExecutionEventType.RUN_STARTED,
+                        null,
+                        null,
+                        null,
+                        null,
+                        "CANCEL_BEFORE_EXECUTION",
+                        objectMapper.createObjectNode()
+                                .put("cancelBeforeExecution", true)
+                                .put("statusAtRequest", status.name())
+                ),
+                actorId
+        );
     }
 
     private RunCounts readRunCounts(UUID runId) {

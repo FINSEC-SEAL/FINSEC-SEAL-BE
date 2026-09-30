@@ -9,6 +9,7 @@ import com.finsecseal.common.api.ApiResponse;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.common.domain.TestRunStatus;
 import com.finsecseal.evidence.TestRunPersistenceDto;
+import com.finsecseal.evidence.TestRunDto;
 import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
@@ -21,7 +22,12 @@ class TestRunExecutionControllerTest {
     @Test
     void startsTestRunAndReturnsAcceptedResponse() {
         TestRunStartService startService = mock(TestRunStartService.class);
-        TestRunExecutionController controller = new TestRunExecutionController(startService);
+        AuthenticatedTestRunCancellationService cancellationService =
+                mock(AuthenticatedTestRunCancellationService.class);
+        TestRunExecutionController controller = new TestRunExecutionController(
+                startService,
+                cancellationService
+        );
 
         UUID releaseId = UUID.randomUUID();
         UUID suiteId = UUID.randomUUID();
@@ -79,5 +85,25 @@ class TestRunExecutionControllerTest {
                 ),
                 httpRequest
         );
+    }
+
+    @Test
+    void cancelsTestRunWithAuthenticatedRequest() {
+        TestRunStartService startService = mock(TestRunStartService.class);
+        AuthenticatedTestRunCancellationService cancellationService =
+                mock(AuthenticatedTestRunCancellationService.class);
+        TestRunExecutionController controller = new TestRunExecutionController(
+                startService,
+                cancellationService
+        );
+        UUID runId = UUID.randomUUID();
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        TestRunDto.Projection cancelled = mock(TestRunDto.Projection.class);
+        when(cancellationService.cancel(runId, request)).thenReturn(cancelled);
+
+        ApiResponse<TestRunDto.Projection> response = controller.cancel(runId, request);
+
+        assertThat(response.data()).isSameAs(cancelled);
+        verify(cancellationService).cancel(runId, request);
     }
 }
