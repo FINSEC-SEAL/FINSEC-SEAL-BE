@@ -2,6 +2,8 @@ package com.finsecseal.attack;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 
 import com.finsecseal.attack.AttackMutationCandidateValidator.TrustedSeed;
 import com.finsecseal.release.CanonicalJsonService;
@@ -75,5 +77,30 @@ class AttackGeneratorTest {
         assertThat(accepted.getFirst().insertionLocation()).isEqualTo("FOOTNOTE");
         assertThat(curated.toolArguments().toString()).isEqualTo(originalArguments);
         assertThat(accepted.getFirst()).isNotInstanceOf(AttackVariant.class);
+    }
+
+    @Test
+    void mutationGenerationDelegatesToTheFailClosedGenerationBoundary() {
+        AttackMutationGenerationService mutationService = mock(AttackMutationGenerationService.class);
+        AttackGenerator configured = new AttackGenerator(
+                new AttackVariantFactory(json, new CanonicalJsonService(json), digests),
+                validator,
+                mutationService
+        );
+        UUID parentId = UUID.fromString("0198f200-0000-7000-8000-000000000701");
+        TrustedSeed trusted = new TrustedSeed(
+                parentId,
+                "FA-01",
+                "HIGH",
+                "CUSTOMER_DATA_READ",
+                "INV-01",
+                "CROSS_CUSTOMER",
+                "DOCUMENT_CONTENT",
+                "Curated parent wording"
+        );
+
+        configured.generateMutationCandidates(trusted, 3);
+
+        verify(mutationService).generate(trusted, 3);
     }
 }

@@ -65,3 +65,4 @@ finsec:
     max-steps: ${FINSEC_AI_MAX_STEPS:8}
     max-total-tokens: ${FINSEC_AI_MAX_TOTAL_TOKENS:8192}
     execution-timeout: ${FINSEC_AI_EXECUTION_TIMEOUT:30s}
+    mutation-model: ${FINSEC_AI_MUTATION_MODEL:gpt-4o-mini}
