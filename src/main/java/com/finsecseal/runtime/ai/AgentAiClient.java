@@ -46,7 +46,8 @@ public interface AgentAiClient extends StatelessAgentStepClient {
                     response.model(),
                     response.finishReason(),
                     new ToolProposalAction(response.proposal()),
-                    response.latencyMs()
+                    response.latencyMs(),
+                    response.tokenUsage()
             );
         }
 
@@ -81,7 +82,8 @@ public interface AgentAiClient extends StatelessAgentStepClient {
                 response.model(),
                 finishReason,
                 response.nextAction(),
-                response.latencyMs()
+                response.latencyMs(),
+                response.tokenUsage()
         );
     }
 
@@ -106,8 +108,18 @@ public interface AgentAiClient extends StatelessAgentStepClient {
             String model,
             String finishReason,
             ToolProposal proposal,
-            long latencyMs
+            long latencyMs,
+            ModelTokenUsage tokenUsage
     ) {
+        public AgentTurnResponse(
+                String provider,
+                String model,
+                String finishReason,
+                ToolProposal proposal,
+                long latencyMs
+        ) {
+            this(provider, model, finishReason, proposal, latencyMs, ModelTokenUsage.ZERO);
+        }
     }
 
     record ToolResultDeliveryRequest(
@@ -129,7 +141,8 @@ public interface AgentAiClient extends StatelessAgentStepClient {
             String model,
             ToolResultDeliveryStatus status,
             AgentAction nextAction,
-            long latencyMs
+            long latencyMs,
+            ModelTokenUsage tokenUsage
     ) {
         /**
          * Source-compatible constructor for quarantine/failure fixtures that intentionally
@@ -141,7 +154,17 @@ public interface AgentAiClient extends StatelessAgentStepClient {
                 ToolResultDeliveryStatus status,
                 long latencyMs
         ) {
-            this(provider, model, status, null, latencyMs);
+            this(provider, model, status, null, latencyMs, ModelTokenUsage.ZERO);
+        }
+
+        public ToolResultDeliveryResponse(
+                String provider,
+                String model,
+                ToolResultDeliveryStatus status,
+                AgentAction nextAction,
+                long latencyMs
+        ) {
+            this(provider, model, status, nextAction, latencyMs, ModelTokenUsage.ZERO);
         }
 
         public boolean accepted() {

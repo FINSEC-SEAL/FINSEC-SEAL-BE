@@ -42,7 +42,17 @@ public interface StatelessAgentStepClient {
             String model,
             String finishReason,
             AgentAction action,
-            long latencyMs
+            long latencyMs,
+            ModelTokenUsage tokenUsage
     ) {
+        public AgentStepResponse(
+                String provider,
+                String model,
+                String finishReason,
+                AgentAction action,
+                long latencyMs
+        ) {
+            this(provider, model, finishReason, action, latencyMs, ModelTokenUsage.ZERO);
+        }
     }
 }

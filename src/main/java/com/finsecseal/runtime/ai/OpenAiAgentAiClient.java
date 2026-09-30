@@ -77,7 +77,8 @@ public final class OpenAiAgentAiClient implements AgentAiClient {
             response.model(),
             response.finishReason(),
             toolProposalAction.proposal(),
-            response.latencyMs()
+            response.latencyMs(),
+            response.tokenUsage()
         );
         }
 
@@ -103,7 +104,8 @@ public final class OpenAiAgentAiClient implements AgentAiClient {
             response.model(),
             ToolResultDeliveryStatus.DELIVERED,
             response.action(),
-            response.latencyMs()
+            response.latencyMs(),
+            response.tokenUsage()
         );
         }
 
@@ -136,16 +138,24 @@ public final class OpenAiAgentAiClient implements AgentAiClient {
                 .build();
 
         byte[] responseBody = sendRequestWithRetries(httpRequest);
-        String content = parseOpenAiChatContent(responseBody);
+        ChatCompletion completion = parseOpenAiChatContent(responseBody);
 
         JsonNode root;
         try {
-            root = objectMapper.readTree(content);
+            root = objectMapper.readTree(completion.content());
         } catch (Exception ex) {
             throw evidenceIncomplete("OpenAI response was not valid JSON: " + ex.getMessage());
         }
 
-        return toAgentStepResponse(root);
+        AgentStepResponse parsed = toAgentStepResponse(root);
+        return new AgentStepResponse(
+                parsed.provider(),
+                parsed.model(),
+                parsed.finishReason(),
+                parsed.action(),
+                parsed.latencyMs(),
+                completion.tokenUsage()
+        );
     }
 
     private byte[] buildPayload(AgentStepRequest request) {
@@ -300,7 +310,7 @@ public final class OpenAiAgentAiClient implements AgentAiClient {
         try { body.close(); } catch (IOException ignored) {}
     }
 
-    private String parseOpenAiChatContent(byte[] body) {
+    private ChatCompletion parseOpenAiChatContent(byte[] body) {
         try {
             JsonNode root = objectMapper.readTree(new String(body, StandardCharsets.UTF_8));
             JsonNode choices = root.path("choices");
@@ -315,10 +325,28 @@ public final class OpenAiAgentAiClient implements AgentAiClient {
             if (content == null) {
                 throw evidenceIncomplete("OpenAI response did not contain textual content");
             }
-            return content.trim();
+            JsonNode usage = root.path("usage");
+            if (!usage.isObject()) {
+                throw evidenceIncomplete("OpenAI response missing token usage");
+            }
+            JsonNode prompt = usage.path("prompt_tokens");
+            JsonNode completion = usage.path("completion_tokens");
+            JsonNode total = usage.path("total_tokens");
+            if (!prompt.isIntegralNumber() || !completion.isIntegralNumber() || !total.isIntegralNumber()) {
+                throw evidenceIncomplete("OpenAI token usage must contain integers");
+            }
+            ModelTokenUsage tokenUsage = new ModelTokenUsage(
+                    prompt.asLong(),
+                    completion.asLong(),
+                    total.asLong()
+            );
+            return new ChatCompletion(content.trim(), tokenUsage);
         } catch (Exception ex) {
             throw evidenceIncomplete("Could not parse OpenAI response: " + ex.getMessage());
         }
+    }
+
+    private record ChatCompletion(String content, ModelTokenUsage tokenUsage) {
     }
 
     private AgentStepResponse toAgentStepResponse(JsonNode root) {

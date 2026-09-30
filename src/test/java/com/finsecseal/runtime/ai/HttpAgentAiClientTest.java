@@ -49,7 +49,8 @@ class HttpAgentAiClientTest {
                         "toolName":"CUSTOMER_DATA_READ",
                         "arguments":{"customerIds":["CUST-1002"],"fields":["incomeBand"]}
                       },
-                      "latencyMs":3
+                      "latencyMs":3,
+                      "tokenUsage":{"promptTokens":11,"completionTokens":3,"totalTokens":14}
                     }
                     """);
         });
@@ -62,6 +63,7 @@ class HttpAgentAiClientTest {
         assertThat(response.proposal().toolName()).isEqualTo("CUSTOMER_DATA_READ");
         assertThat(response.proposal().arguments().path("customerIds").get(0).asString())
                 .isEqualTo("CUST-1002");
+        assertThat(response.tokenUsage()).isEqualTo(new ModelTokenUsage(11, 3, 14));
 
         JsonNode request = captured.get();
         assertThat(request.path("releaseId").asString()).isEqualTo(RELEASE_ID.toString());
@@ -89,7 +91,8 @@ class HttpAgentAiClientTest {
                         "type":"FINAL_RESPONSE",
                         "content":"Tool result received; agent step completed."
                       },
-                      "latencyMs":4
+                      "latencyMs":4,
+                      "tokenUsage":{"promptTokens":7,"completionTokens":2,"totalTokens":9}
                     }
                     """);
         });
@@ -134,7 +137,8 @@ class HttpAgentAiClientTest {
                     "toolName":"CUSTOMER_DATA_READ",
                     "arguments":{"customerIds":["CUST-1001"],"fields":["employmentStatus"]}
                   },
-                  "latencyMs":2
+                  "latencyMs":2,
+                  "tokenUsage":{"promptTokens":5,"completionTokens":1,"totalTokens":6}
                 }
                 """));
 
@@ -216,7 +220,8 @@ class HttpAgentAiClientTest {
                   "model":"stateless-contract-v1",
                   "finishReason":"stop",
                   "action":{"type":"FINAL_RESPONSE","content":"done"},
-                  "latencyMs":1
+                  "latencyMs":1,
+                  "tokenUsage":{"promptTokens":1,"completionTokens":1,"totalTokens":2}
                 }
                 """));
 
@@ -240,7 +245,8 @@ class HttpAgentAiClientTest {
                     "toolName":"CUSTOMER_DATA_READ",
                     "arguments":["not","an","object"]
                   },
-                  "latencyMs":1
+                  "latencyMs":1,
+                  "tokenUsage":{"promptTokens":1,"completionTokens":1,"totalTokens":2}
                 }
                 """));
 
@@ -250,6 +256,30 @@ class HttpAgentAiClientTest {
                 .isInstanceOfSatisfying(BusinessException.class, exception ->
                         assertThat(exception.errorCode()).isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE)
                 );
+    }
+
+    @Test
+    void missingOrInconsistentTokenUsageIsRejected() throws Exception {
+        startServer(exchange -> respond(exchange, 200, """
+                {
+                  "provider":"deterministic",
+                  "model":"stateless-contract-v1",
+                  "finishReason":"tool_call",
+                  "action":{
+                    "type":"TOOL_PROPOSAL",
+                    "toolName":"CUSTOMER_DATA_READ",
+                    "arguments":{}
+                  },
+                  "latencyMs":1,
+                  "tokenUsage":{"promptTokens":2,"completionTokens":1,"totalTokens":4}
+                }
+                """));
+
+        HttpAgentAiClient client = client(Duration.ofSeconds(2));
+
+        assertThatThrownBy(() -> client.propose(turnRequest()))
+                .isInstanceOfSatisfying(BusinessException.class, exception ->
+                        assertThat(exception.errorCode()).isEqualTo(ErrorCode.EVIDENCE_INCOMPLETE));
     }
 
     private HttpAgentAiClient client(Duration requestTimeout) {
@@ -333,7 +363,8 @@ class HttpAgentAiClientTest {
                     "toolName":"CUSTOMER_DATA_READ",
                     "arguments":{"customerIds":["CUST-1002"],"fields":["incomeBand"]}
                   },
-                  "latencyMs":1
+                  "latencyMs":1,
+                  "tokenUsage":{"promptTokens":1,"completionTokens":1,"totalTokens":2}
                 }
                 """;
     }

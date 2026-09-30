@@ -33,7 +33,9 @@ class OpenAiAgentAiClientRetryTest {
         HttpResponse<InputStream> response = (HttpResponse<InputStream>) mock(HttpResponse.class);
 
         String contentJson = "{\"provider\":\"openai\",\"model\":\"gpt-4o-mini\",\"finishReason\":\"stop\",\"latencyMs\":12,\"action\":{\"type\":\"FINAL_RESPONSE\",\"content\":\"ok\"}}";
-        String openAiEnvelope = "{\"choices\":[{\"message\":{\"content\":" + mapper.writeValueAsString(contentJson) + "}}]}";
+        String openAiEnvelope = "{\"choices\":[{\"message\":{\"content\":"
+                + mapper.writeValueAsString(contentJson)
+                + "}}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}";
 
         when(response.statusCode()).thenReturn(200);
         when(response.body()).thenReturn(new ByteArrayInputStream(openAiEnvelope.getBytes(StandardCharsets.UTF_8)));
