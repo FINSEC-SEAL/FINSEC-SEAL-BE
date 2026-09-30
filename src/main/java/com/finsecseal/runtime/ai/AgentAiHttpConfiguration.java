@@ -71,4 +71,27 @@ public class AgentAiHttpConfiguration {
                 apiKey
         );
     }
+
+    @Bean
+    AttackMutationAiClient attackMutationAiClient(
+            HttpClient finsecAiHttpClient,
+            ObjectMapper objectMapper,
+            @Value("${finsec.ai.base-url:http://localhost:8001}") URI baseUrl,
+            @Value("${finsec.ai.request-timeout:5s}") Duration requestTimeout,
+            @Value("${finsec.ai.mutation-model:gpt-4o-mini}") String modelName
+    ) {
+        String apiKey = System.getenv("OPENAI_API_KEY");
+        String configured = System.getProperty("finsec.ai.api-key");
+        if (configured != null && !configured.isBlank()) {
+            apiKey = configured;
+        }
+        return new HttpAttackMutationAiClient(
+                finsecAiHttpClient,
+                objectMapper,
+                baseUrl,
+                requestTimeout,
+                apiKey,
+                modelName
+        );
+    }
 }
