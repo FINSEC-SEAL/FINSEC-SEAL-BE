@@ -2,6 +2,7 @@ package com.finsecseal.execution;
 
 import com.finsecseal.attack.AttackSeed;
 import com.finsecseal.attack.AttackSeedCatalog;
+import com.finsecseal.attack.AttackMutationCandidateValidator.ValidatedCandidate;
 import com.finsecseal.attack.AttackVariant;
 import com.finsecseal.attack.AttackVariantFactory;
 import com.finsecseal.common.api.BusinessException;
@@ -15,6 +16,7 @@ import com.finsecseal.evidence.TestRunPersistenceService;
 import com.finsecseal.oracle.application.OracleAssessmentService;
 import com.finsecseal.oracle.domain.OracleOutcome;
 import com.finsecseal.oracle.domain.OracleResult;
+import com.finsecseal.release.EncryptionService;
 import com.finsecseal.runtime.AgentToolLoopService;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import com.finsecseal.sandbox.SandboxFixtureService;
@@ -40,6 +42,7 @@ public class Fa02ExecutionOrchestrator {
     private final ObjectMapper objectMapper;
     private final AttackSeedCatalog attackSeedCatalog;
     private final AttackVariantFactory attackVariantFactory;
+    private final EncryptionService encryptionService;
     private final TestRunPersistenceService runPersistenceService;
     private final AgentToolLoopService agentToolLoopService;
     private final SandboxFixtureService fixtureService;
@@ -52,6 +55,7 @@ public class Fa02ExecutionOrchestrator {
             ObjectMapper objectMapper,
             AttackSeedCatalog attackSeedCatalog,
             AttackVariantFactory attackVariantFactory,
+            EncryptionService encryptionService,
             TestRunPersistenceService runPersistenceService,
             AgentToolLoopService agentToolLoopService,
             SandboxFixtureService fixtureService,
@@ -63,6 +67,7 @@ public class Fa02ExecutionOrchestrator {
         this.objectMapper = objectMapper;
         this.attackSeedCatalog = attackSeedCatalog;
         this.attackVariantFactory = attackVariantFactory;
+        this.encryptionService = encryptionService;
         this.runPersistenceService = runPersistenceService;
         this.agentToolLoopService = agentToolLoopService;
         this.fixtureService = fixtureService;
@@ -88,8 +93,7 @@ public class Fa02ExecutionOrchestrator {
             );
         }
 
-        AttackSeed seed = attackSeedCatalog.requireSeed(target.category());
-        AttackVariant variant = attackVariantFactory.fromSeed(seed);
+        AttackVariant variant = resolveVariant(target);
         validateVariantAgainstTestCase(variant, target);
         UUID traceId = UUID.randomUUID();
         UUID caseRunId = null;
@@ -336,7 +340,8 @@ public class Fa02ExecutionOrchestrator {
     private ExecutionTarget requireTarget(UUID runId, UUID testCaseId) {
         List<ExecutionTarget> targets = jdbcTemplate.query("""
                 select run.mode, run.status, test_case.case_key, test_case.category,
-                       test_case.severity, test_case.target_tool, test_case.payload_hash,
+                       test_case.severity, test_case.target_tool, test_case.partition_name,
+                       test_case.payload_encrypted, test_case.payload_hash,
                        test_case.expected_invariant, test_case.oracle_type,
                        test_case.preconditions_json::text
                   from test_runs run
@@ -351,11 +356,15 @@ public class Fa02ExecutionOrchestrator {
                     resultSet.getString("category"),
                     resultSet.getString("severity"),
                     resultSet.getString("target_tool"),
+                    resultSet.getString("partition_name"),
+                    resultSet.getString("payload_encrypted"),
                     resultSet.getString("payload_hash"),
                     resultSet.getString("expected_invariant"),
                     resultSet.getString("oracle_type"),
                     preconditions.path("caseId").asString(null),
-                    preconditions.path("currentApplicantId").asString(null)
+                    preconditions.path("currentApplicantId").asString(null),
+                    preconditions.path("mutationInsertionLocation").asString(null),
+                    preconditions.path("mutationPayloadHash").asString(null)
             );
         }, runId, testCaseId);
         if (targets.isEmpty()) {
@@ -369,6 +378,40 @@ public class Fa02ExecutionOrchestrator {
             );
         }
         return target;
+    }
+
+    private AttackVariant resolveVariant(ExecutionTarget target) {
+        AttackSeed seed = attackSeedCatalog.requireSeed(target.category());
+        if ("SEED".equals(target.partitionName())) {
+            return attackVariantFactory.fromSeed(seed);
+        }
+        if (!("MUTATION".equals(target.partitionName()) || "HELD_OUT".equals(target.partitionName()))
+                || !"FA-01".equals(target.category())
+                || target.encryptedPayload() == null
+                || target.mutationInsertionLocation() == null
+                || target.mutationPayloadHash() == null) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Stored attack variant delivery evidence is incomplete"
+            );
+        }
+        String payload;
+        try {
+            payload = encryptionService.decrypt(target.encryptedPayload());
+        } catch (RuntimeException exception) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Stored attack variant payload cannot be decrypted"
+            );
+        }
+        return attackVariantFactory.fromDocumentMutation(
+                seed,
+                new ValidatedCandidate(
+                        payload,
+                        target.mutationInsertionLocation(),
+                        target.mutationPayloadHash()
+                )
+        );
     }
 
     private void validateVariantAgainstTestCase(AttackVariant variant, ExecutionTarget target) {
@@ -428,11 +471,15 @@ public class Fa02ExecutionOrchestrator {
             String category,
             String severity,
             String targetTool,
+            String partitionName,
+            String encryptedPayload,
             String payloadHash,
             String expectedInvariant,
             String oracleType,
             String sandboxCaseKey,
-            String currentApplicantId
+            String currentApplicantId,
+            String mutationInsertionLocation,
+            String mutationPayloadHash
     ) {
     }
 }
