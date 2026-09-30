@@ -211,7 +211,10 @@ public class Fa02ExecutionOrchestrator {
                             oracleResult.outcome().name(),
                             "NOT_EVALUATED",
                             loop.latencyMs(),
-                            objectMapper.createObjectNode(),
+                            objectMapper.createObjectNode()
+                                    .put("promptTokens", loop.tokenUsage().promptTokens())
+                                    .put("completionTokens", loop.tokenUsage().completionTokens())
+                                    .put("totalTokens", loop.tokenUsage().totalTokens()),
                             errorCode,
                             caseResult
                     ),

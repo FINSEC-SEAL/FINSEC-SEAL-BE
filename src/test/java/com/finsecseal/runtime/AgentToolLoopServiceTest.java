@@ -10,9 +10,11 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.finsecseal.attack.AttackVariant;
+import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.domain.ExecutionEventType;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.evidence.ExecutionEventDto;
@@ -20,6 +22,7 @@ import com.finsecseal.runtime.AgentRuntimeService.DeliveryReceipt;
 import com.finsecseal.runtime.AgentRuntimeService.RuntimeTurn;
 import com.finsecseal.runtime.ai.AgentAiClient.AgentTurnResponse;
 import com.finsecseal.runtime.ai.AgentAiClient.ToolResultDeliveryStatus;
+import com.finsecseal.runtime.ai.ModelTokenUsage;
 import com.finsecseal.runtime.ai.StatelessAgentStepClient.FinalResponseAction;
 import com.finsecseal.runtime.ai.StatelessAgentStepClient.ToolProposalAction;
 import com.finsecseal.sandbox.SandboxExecutionContext;
@@ -29,8 +32,11 @@ import com.finsecseal.sandbox.tool.PolicyGateway;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.LongSupplier;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
@@ -214,6 +220,66 @@ class AgentToolLoopServiceTest {
     }
 
     @Test
+    void initialModelTurnOverTokenBudgetFailsBeforeToolDispatch() {
+        ToolProposal proposal = proposal("customer_data_read", "customer-only");
+        when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(
+                initialTurn(proposal, new ModelTokenUsage(4, 2, 6))
+        );
+
+        AgentToolLoopService service = budgetedService(5, Duration.ofSeconds(1), System::nanoTime);
+
+        assertThatThrownBy(() -> service.execute(context, variant, ACTOR))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("token");
+        verifyNoInteractions(toolDispatcher);
+    }
+
+    @Test
+    void cumulativeTokenBudgetIncludesEveryModelTurn() {
+        ToolProposal proposal = proposal("customer_data_read", "customer-only");
+        RuntimeTurn initial = initialTurn(proposal, new ModelTokenUsage(3, 1, 4));
+        ToolInvocation invocation = invocation(initial);
+        ToolDispatcher.DispatchResult dispatch = allowedDispatch(proposal, 91L);
+        when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initial);
+        when(toolDispatcher.dispatch(context, invocation, ACTOR)).thenReturn(dispatch);
+        when(runtimeService.deliverToolResult(
+                eq(context), eq(variant), eq(proposal.toolName()), any(),
+                eq(dispatch.responseEvent().eventId()), eq(dispatch.responseEvent().sequence()), eq(ACTOR)
+        )).thenReturn(new DeliveryReceipt(
+                true,
+                ToolResultDeliveryStatus.DELIVERED,
+                UUID.randomUUID(),
+                100L,
+                new FinalResponseAction("done"),
+                1L,
+                new ModelTokenUsage(5, 2, 7)
+        ));
+
+        AgentToolLoopService service = budgetedService(10, Duration.ofSeconds(1), System::nanoTime);
+
+        assertThatThrownBy(() -> service.execute(context, variant, ACTOR))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("token");
+        verify(toolDispatcher).dispatch(context, invocation, ACTOR);
+    }
+
+    @Test
+    void wallClockBudgetIncludesTheInitialModelTurn() {
+        ToolProposal proposal = proposal("customer_data_read", "customer-only");
+        when(runtimeService.proposeTool(context, variant, ACTOR)).thenReturn(initialTurn(proposal));
+        long[] ticks = {0L, 0L, 11L};
+        AtomicInteger cursor = new AtomicInteger();
+        LongSupplier clock = () -> ticks[Math.min(cursor.getAndIncrement(), ticks.length - 1)];
+
+        AgentToolLoopService service = budgetedService(100, Duration.ofNanos(10), clock);
+
+        assertThatThrownBy(() -> service.execute(context, variant, ACTOR))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("timeout");
+        verifyNoInteractions(toolDispatcher);
+    }
+
+    @Test
     void deniedAndQuarantinedPathsTerminateWithoutBreakingExistingSemantics() {
         ToolProposal deniedProposal = proposal("customer_data_read", "customer-denied");
         RuntimeTurn deniedTurn = initialTurn(deniedProposal);
@@ -267,15 +333,36 @@ class AgentToolLoopServiceTest {
     }
 
     private RuntimeTurn initialTurn(ToolProposal proposal) {
+        return initialTurn(proposal, ModelTokenUsage.ZERO);
+    }
+
+    private RuntimeTurn initialTurn(ToolProposal proposal, ModelTokenUsage usage) {
         return new RuntimeTurn(
                 new AgentTurnResponse(
                         "fake",
                         "multi-step-test",
                         "tool_call",
                         proposal,
-                        1L
+                        1L,
+                        usage
                 ),
                 proposalEvent(proposal, 1L)
+        );
+    }
+
+    private AgentToolLoopService budgetedService(
+            long maxTotalTokens,
+            Duration timeout,
+            LongSupplier clock
+    ) {
+        return new AgentToolLoopService(
+                runtimeService,
+                toolDispatcher,
+                8,
+                maxTotalTokens,
+                timeout,
+                runId -> { },
+                clock
         );
     }
 

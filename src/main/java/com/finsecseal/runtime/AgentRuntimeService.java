@@ -8,6 +8,7 @@ import com.finsecseal.evidence.ExecutionEventDto;
 import com.finsecseal.evidence.ExecutionEventService;
 import com.finsecseal.runtime.ai.AgentAiClient;
 import com.finsecseal.runtime.ai.AgentAiClient.ToolResultDeliveryStatus;
+import com.finsecseal.runtime.ai.ModelTokenUsage;
 import com.finsecseal.runtime.ai.StatelessAgentStepClient.AgentAction;
 import com.finsecseal.runtime.ai.StatelessAgentStepClient.FinalResponseAction;
 import com.finsecseal.runtime.ai.StatelessAgentStepClient.ToolProposalAction;
@@ -104,6 +105,7 @@ public class AgentRuntimeService {
         modelResponse.put("model", response.model());
         modelResponse.put("finishReason", response.finishReason());
         modelResponse.put("latencyMs", response.latencyMs());
+        modelResponse.set("tokenUsage", tokenUsageJson(response.tokenUsage()));
         modelResponse.put("toolName", proposal.toolName());
         modelResponse.put("variantHash", attackVariant.variantHash());
         eventService.append(
@@ -146,7 +148,8 @@ public class AgentRuntimeService {
                         response.model(),
                         response.finishReason(),
                         proposal,
-                        response.latencyMs()
+                        response.latencyMs(),
+                        response.tokenUsage()
                 ),
                 proposalEvent
         );
@@ -296,6 +299,7 @@ public class AgentRuntimeService {
         output.put("accepted", delivered);
         output.put("deliveryStatus", response.status().name());
         output.put("latencyMs", response.latencyMs());
+        output.set("tokenUsage", tokenUsageJson(response.tokenUsage()));
         output.put("sourceEventId", sourceEventId.toString());
         output.put("sourceSequence", sourceSequence);
 
@@ -336,8 +340,19 @@ public class AgentRuntimeService {
                 deliveryEvent.eventId(),
                 deliveryEvent.sequence(),
                 response.nextAction(),
-                response.latencyMs()
+                response.latencyMs(),
+                response.tokenUsage()
         );
+    }
+
+    private ObjectNode tokenUsageJson(ModelTokenUsage usage) {
+        if (usage == null) {
+            throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "AI response is missing token usage");
+        }
+        return objectMapper.createObjectNode()
+                .put("promptTokens", usage.promptTokens())
+                .put("completionTokens", usage.completionTokens())
+                .put("totalTokens", usage.totalTokens());
     }
 
     private BusinessException incompleteCustomerDelivery() {
@@ -365,7 +380,8 @@ public class AgentRuntimeService {
             UUID deliveryEventId,
             long deliveryEventSequence,
             AgentAction nextAction,
-            long latencyMs
+            long latencyMs,
+            ModelTokenUsage tokenUsage
     ) {
         /** Source-compatible constructor for existing callers. */
         public DeliveryReceipt(
@@ -381,12 +397,25 @@ public class AgentRuntimeService {
                     deliveryEventId,
                     deliveryEventSequence,
                     null,
-                    latencyMs
+                    latencyMs,
+                    ModelTokenUsage.ZERO
             );
         }
 
+        public DeliveryReceipt(
+                boolean deliveredToAgent,
+                ToolResultDeliveryStatus status,
+                UUID deliveryEventId,
+                long deliveryEventSequence,
+                AgentAction nextAction,
+                long latencyMs
+        ) {
+            this(deliveredToAgent, status, deliveryEventId, deliveryEventSequence,
+                    nextAction, latencyMs, ModelTokenUsage.ZERO);
+        }
+
         public static DeliveryReceipt notDelivered() {
-            return new DeliveryReceipt(false, null, null, 0L, null, 0L);
+            return new DeliveryReceipt(false, null, null, 0L, null, 0L, ModelTokenUsage.ZERO);
         }
     }
 }

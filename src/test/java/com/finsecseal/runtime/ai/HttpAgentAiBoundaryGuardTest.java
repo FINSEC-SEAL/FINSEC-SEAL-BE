@@ -70,7 +70,8 @@ class HttpAgentAiBoundaryGuardTest {
                         "type":"FINAL_RESPONSE",
                         "content":"%s"
                       },
-                      "latencyMs":1
+                      "latencyMs":1,
+                      "tokenUsage":{"promptTokens":1,"completionTokens":1,"totalTokens":2}
                     }
                     """.formatted("x".repeat(300 * 1024));
             respond(exchange, 200, oversized);
@@ -97,7 +98,8 @@ class HttpAgentAiBoundaryGuardTest {
                     "toolName":"CUSTOMER_DATA_READ",
                     "arguments":{"customerIds":["CUST-1002"],"fields":["incomeBand"]}
                   },
-                  "latencyMs":1
+                  "latencyMs":1,
+                  "tokenUsage":{"promptTokens":1,"completionTokens":1,"totalTokens":2}
                 }
                 """));
 
@@ -123,7 +125,8 @@ class HttpAgentAiBoundaryGuardTest {
                     "type":"FINAL_RESPONSE",
                     "content":"done"
                   },
-                  "latencyMs":1
+                  "latencyMs":1,
+                  "tokenUsage":{"promptTokens":1,"completionTokens":1,"totalTokens":2}
                 }
                 """));
 
@@ -228,7 +231,8 @@ class HttpAgentAiBoundaryGuardTest {
                     "toolName":"CUSTOMER_DATA_READ",
                     "arguments":{"customerIds":["CUST-1002"],"fields":["incomeBand"]}
                   },
-                  "latencyMs":1
+                  "latencyMs":1,
+                  "tokenUsage":{"promptTokens":1,"completionTokens":1,"totalTokens":2}
                 }
                 """;
     }

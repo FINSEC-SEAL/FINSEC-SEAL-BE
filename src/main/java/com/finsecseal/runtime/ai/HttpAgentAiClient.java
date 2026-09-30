@@ -65,7 +65,8 @@ public final class HttpAgentAiClient implements AgentAiClient {
                 response.model(),
                 response.finishReason(),
                 toolProposalAction.proposal(),
-                response.latencyMs()
+                response.latencyMs(),
+                response.tokenUsage()
         );
     }
 
@@ -91,7 +92,8 @@ public final class HttpAgentAiClient implements AgentAiClient {
                 response.model(),
                 ToolResultDeliveryStatus.DELIVERED,
                 response.action(),
-                response.latencyMs()
+                response.latencyMs(),
+                response.tokenUsage()
         );
     }
 
@@ -257,13 +259,33 @@ public final class HttpAgentAiClient implements AgentAiClient {
             throw evidenceIncomplete("FINAL_RESPONSE requires finishReason=stop");
         }
 
+        ModelTokenUsage tokenUsage = parseTokenUsage(root.path("tokenUsage"));
+
         return new AgentStepResponse(
                 provider,
                 model,
                 finishReason,
                 action,
-                latencyNode.asLong()
+                latencyNode.asLong(),
+                tokenUsage
         );
+    }
+
+    private ModelTokenUsage parseTokenUsage(JsonNode node) {
+        if (!node.isObject()) {
+            throw evidenceIncomplete("AI step response tokenUsage must be an object");
+        }
+        JsonNode prompt = node.path("promptTokens");
+        JsonNode completion = node.path("completionTokens");
+        JsonNode total = node.path("totalTokens");
+        if (!prompt.isIntegralNumber() || !completion.isIntegralNumber() || !total.isIntegralNumber()) {
+            throw evidenceIncomplete("AI step response tokenUsage must contain integers");
+        }
+        try {
+            return new ModelTokenUsage(prompt.asLong(), completion.asLong(), total.asLong());
+        } catch (BusinessException exception) {
+            throw evidenceIncomplete("AI step response tokenUsage is invalid");
+        }
     }
 
     private ToolProposalAction parseToolProposalAction(JsonNode actionNode) {

@@ -160,7 +160,8 @@ class HttpAgentAiVariantHashValidationTest {
                     "toolName":"CUSTOMER_DATA_READ",
                     "arguments":{"customerIds":["CUST-1002"],"fields":["incomeBand"]}
                   },
-                  "latencyMs":1
+                  "latencyMs":1,
+                  "tokenUsage":{"promptTokens":1,"completionTokens":1,"totalTokens":2}
                 }
                 """;
     }

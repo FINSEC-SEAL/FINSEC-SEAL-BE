@@ -74,7 +74,8 @@ class HttpAgentAiContextSerializationTest {
                       "model":"stateless-contract-v1",
                       "finishReason":"stop",
                       "action":{"type":"FINAL_RESPONSE","content":"done"},
-                      "latencyMs":1
+                      "latencyMs":1,
+                      "tokenUsage":{"promptTokens":1,"completionTokens":1,"totalTokens":2}
                     }
                     """);
         });
@@ -249,7 +250,8 @@ class HttpAgentAiContextSerializationTest {
                     "toolName":"CUSTOMER_DATA_READ",
                     "arguments":{"customerIds":["CUST-1002"],"fields":["incomeBand"]}
                   },
-                  "latencyMs":1
+                  "latencyMs":1,
+                  "tokenUsage":{"promptTokens":1,"completionTokens":1,"totalTokens":2}
                 }
                 """;
     }

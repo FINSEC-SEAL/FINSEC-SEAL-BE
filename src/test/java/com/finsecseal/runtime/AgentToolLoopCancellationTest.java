@@ -16,6 +16,7 @@ import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.evidence.ExecutionEventDto;
 import com.finsecseal.runtime.ai.AgentAiClient;
+import com.finsecseal.runtime.ai.ModelTokenUsage;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import com.finsecseal.sandbox.tool.ToolDispatcher;
 import java.util.UUID;
@@ -54,6 +55,7 @@ class AgentToolLoopCancellationTest {
         AgentAiClient.AgentTurnResponse aiResponse = mock(AgentAiClient.AgentTurnResponse.class);
         ExecutionEventDto.Event proposalEvent = mock(ExecutionEventDto.Event.class);
         when(aiResponse.proposal()).thenReturn(proposal);
+        when(aiResponse.tokenUsage()).thenReturn(ModelTokenUsage.ZERO);
         when(proposalEvent.eventId()).thenReturn(UUID.randomUUID());
         when(proposalEvent.payloadDigest()).thenReturn("sha256:" + "b".repeat(64));
         when(runtimeService.proposeTool(any(), any(), anyString())).thenReturn(

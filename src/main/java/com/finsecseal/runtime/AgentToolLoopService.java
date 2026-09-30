@@ -4,15 +4,18 @@ import com.finsecseal.attack.AttackVariant;
 import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.runtime.ai.AgentAiClient.ToolResultDeliveryStatus;
+import com.finsecseal.runtime.ai.ModelTokenUsage;
 import com.finsecseal.runtime.ai.StatelessAgentStepClient.AgentAction;
 import com.finsecseal.runtime.ai.StatelessAgentStepClient.FinalResponseAction;
 import com.finsecseal.runtime.ai.StatelessAgentStepClient.ToolProposalAction;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import com.finsecseal.sandbox.tool.ToolDispatcher;
 import java.util.ArrayList;
+import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -23,16 +26,22 @@ public class AgentToolLoopService {
     private final AgentRuntimeService runtimeService;
     private final ToolDispatcher toolDispatcher;
     private final int maxSteps;
+    private final long maxTotalTokens;
+    private final long executionTimeoutNanos;
     private final Consumer<UUID> cancellationCheck;
+    private final LongSupplier nanoTime;
 
     @Autowired
     public AgentToolLoopService(
             AgentRuntimeService runtimeService,
             ToolDispatcher toolDispatcher,
             @Value("${finsec.ai.max-steps:8}") int maxSteps,
+            @Value("${finsec.ai.max-total-tokens:8192}") long maxTotalTokens,
+            @Value("${finsec.ai.execution-timeout:30s}") Duration executionTimeout,
             RunCancellationProbe cancellationProbe
     ) {
-        this(runtimeService, toolDispatcher, maxSteps, cancellationProbe::throwIfCancellationRequested);
+        this(runtimeService, toolDispatcher, maxSteps, maxTotalTokens, executionTimeout,
+                cancellationProbe::throwIfCancellationRequested, System::nanoTime);
     }
 
     /** Source-compatible constructor for focused tests that do not own persisted Run state. */
@@ -41,22 +50,50 @@ public class AgentToolLoopService {
             ToolDispatcher toolDispatcher,
             int maxSteps
     ) {
-        this(runtimeService, toolDispatcher, maxSteps, runId -> { });
+        this(runtimeService, toolDispatcher, maxSteps, 8_192L, Duration.ofSeconds(30),
+                runId -> { }, System::nanoTime);
     }
 
-    private AgentToolLoopService(
+    /** Source-compatible constructor for cancellation-focused tests. */
+    AgentToolLoopService(
             AgentRuntimeService runtimeService,
             ToolDispatcher toolDispatcher,
             int maxSteps,
-            Consumer<UUID> cancellationCheck
+            RunCancellationProbe cancellationProbe
+    ) {
+        this(runtimeService, toolDispatcher, maxSteps, 8_192L, Duration.ofSeconds(30),
+                cancellationProbe::throwIfCancellationRequested, System::nanoTime);
+    }
+
+    AgentToolLoopService(
+            AgentRuntimeService runtimeService,
+            ToolDispatcher toolDispatcher,
+            int maxSteps,
+            long maxTotalTokens,
+            Duration executionTimeout,
+            Consumer<UUID> cancellationCheck,
+            LongSupplier nanoTime
     ) {
         if (maxSteps < 1) {
             throw new IllegalArgumentException("finsec.ai.max-steps must be at least 1");
         }
+        if (maxTotalTokens < 1) {
+            throw new IllegalArgumentException("finsec.ai.max-total-tokens must be at least 1");
+        }
+        if (executionTimeout == null || executionTimeout.isZero() || executionTimeout.isNegative()) {
+            throw new IllegalArgumentException("finsec.ai.execution-timeout must be positive");
+        }
         this.runtimeService = runtimeService;
         this.toolDispatcher = toolDispatcher;
         this.maxSteps = maxSteps;
+        this.maxTotalTokens = maxTotalTokens;
+        try {
+            this.executionTimeoutNanos = executionTimeout.toNanos();
+        } catch (ArithmeticException exception) {
+            throw new IllegalArgumentException("finsec.ai.execution-timeout is too large", exception);
+        }
         this.cancellationCheck = cancellationCheck;
+        this.nanoTime = nanoTime;
     }
 
     public LoopResult execute(
@@ -64,7 +101,9 @@ public class AgentToolLoopService {
             AttackVariant attackVariant,
             String actorId
     ) {
+        long startedNanos = nanoTime.getAsLong();
         cancellationCheck.accept(context.runId());
+        enforceTimeBudget(startedNanos);
         AgentRuntimeService.RuntimeTurn initialTurn = runtimeService.proposeTool(
                 context,
                 attackVariant,
@@ -77,9 +116,12 @@ public class AgentToolLoopService {
         );
         List<ToolStep> steps = new ArrayList<>();
         long totalLatencyMs = initialTurn.aiResponse().latencyMs();
+        ModelTokenUsage totalTokenUsage = requireTokenUsage(initialTurn.aiResponse().tokenUsage());
+        enforceBudgets(startedNanos, totalTokenUsage);
 
         while (true) {
             cancellationCheck.accept(context.runId());
+            enforceBudgets(startedNanos, totalTokenUsage);
             if (steps.size() >= maxSteps) {
                 throw new BusinessException(
                         ErrorCode.EVIDENCE_INCOMPLETE,
@@ -92,6 +134,7 @@ public class AgentToolLoopService {
                     currentInvocation,
                     actorId
             );
+            enforceTimeBudget(startedNanos);
 
             if (dispatch.policyDecision() == null) {
                 throw new BusinessException(
@@ -110,7 +153,8 @@ public class AgentToolLoopService {
                         List.copyOf(steps),
                         null,
                         TerminationReason.POLICY_DENIED,
-                        totalLatencyMs
+                        totalLatencyMs,
+                        totalTokenUsage
                 );
             }
 
@@ -124,6 +168,7 @@ public class AgentToolLoopService {
             }
 
             cancellationCheck.accept(context.runId());
+            enforceTimeBudget(startedNanos);
             AgentRuntimeService.DeliveryReceipt delivery = runtimeService.deliverToolResult(
                     context,
                     attackVariant,
@@ -134,6 +179,8 @@ public class AgentToolLoopService {
                     actorId
             );
             totalLatencyMs += delivery.latencyMs();
+            totalTokenUsage = totalTokenUsage.plus(requireTokenUsage(delivery.tokenUsage()));
+            enforceBudgets(startedNanos, totalTokenUsage);
             steps.add(new ToolStep(
                     currentInvocation.proposal(),
                     dispatch,
@@ -145,7 +192,8 @@ public class AgentToolLoopService {
                         List.copyOf(steps),
                         null,
                         TerminationReason.QUARANTINED,
-                        totalLatencyMs
+                        totalLatencyMs,
+                        totalTokenUsage
                 );
             }
 
@@ -162,12 +210,14 @@ public class AgentToolLoopService {
                         List.copyOf(steps),
                         finalResponse,
                         TerminationReason.FINAL_RESPONSE,
-                        totalLatencyMs
+                        totalLatencyMs,
+                        totalTokenUsage
                 );
             }
 
             if (nextAction instanceof ToolProposalAction toolProposalAction) {
                 cancellationCheck.accept(context.runId());
+                enforceBudgets(startedNanos, totalTokenUsage);
                 currentInvocation = runtimeService.recordFollowUpToolProposal(
                         context,
                         attackVariant,
@@ -186,6 +236,33 @@ public class AgentToolLoopService {
         }
     }
 
+    private ModelTokenUsage requireTokenUsage(ModelTokenUsage usage) {
+        if (usage == null) {
+            throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "AI response is missing token usage");
+        }
+        return usage;
+    }
+
+    private void enforceBudgets(long startedNanos, ModelTokenUsage usage) {
+        enforceTimeBudget(startedNanos);
+        if (usage.totalTokens() > maxTotalTokens) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Agent tool loop exceeded total token limit: " + maxTotalTokens
+            );
+        }
+    }
+
+    private void enforceTimeBudget(long startedNanos) {
+        long elapsedNanos = nanoTime.getAsLong() - startedNanos;
+        if (elapsedNanos < 0 || elapsedNanos > executionTimeoutNanos) {
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "Agent tool loop exceeded execution timeout"
+            );
+        }
+    }
+
     public record ToolStep(
             ToolProposal proposal,
             ToolDispatcher.DispatchResult dispatch,
@@ -197,7 +274,8 @@ public class AgentToolLoopService {
             List<ToolStep> toolSteps,
             FinalResponseAction finalResponse,
             TerminationReason terminationReason,
-            long latencyMs
+            long latencyMs,
+            ModelTokenUsage tokenUsage
     ) {
         public ToolStep lastToolStep() {
             return toolSteps.isEmpty() ? null : toolSteps.getLast();
