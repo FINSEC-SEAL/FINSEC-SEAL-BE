@@ -77,12 +77,7 @@ public class Fa05ExecutionOrchestrator {
 
         ExecutionTarget target = requireTarget(runId, testCaseId);
 
-        if (target.mode() != TestRunMode.BASELINE) {
-            throw new BusinessException(
-                    ErrorCode.INVALID_STATE_TRANSITION,
-                    "FA-05 only supports BASELINE"
-            );
-        }
+        AttackExecutionModePolicy.requireSupported(target.mode(), target.category());
         if (!"FA-05".equals(target.category())) {
             throw new BusinessException(
                     ErrorCode.VALIDATION_ERROR,
@@ -120,6 +115,7 @@ public class Fa05ExecutionOrchestrator {
                     runId,
                     traceId,
                     target.category(),
+                    target.mode(),
                     normalizedActor
             );
 

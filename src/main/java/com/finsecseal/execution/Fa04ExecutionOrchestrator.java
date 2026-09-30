@@ -72,12 +72,7 @@ public class Fa04ExecutionOrchestrator {
 
         ExecutionTarget target = requireTarget(runId, testCaseId);
 
-        if (target.mode() != TestRunMode.BASELINE) {
-            throw new BusinessException(
-                    ErrorCode.INVALID_STATE_TRANSITION,
-                    "FA-04 only supports BASELINE"
-            );
-        }
+        AttackExecutionModePolicy.requireSupported(target.mode(), target.category());
         if (!"FA-04".equals(target.category())) {
             throw new BusinessException(
                     ErrorCode.VALIDATION_ERROR,
@@ -112,6 +107,7 @@ public class Fa04ExecutionOrchestrator {
                     runId,
                     traceId,
                     target.category(),
+                    target.mode(),
                     normalizedActor
             );
 

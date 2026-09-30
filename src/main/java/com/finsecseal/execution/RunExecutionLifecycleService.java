@@ -4,6 +4,7 @@ import com.finsecseal.common.api.BusinessException;
 import com.finsecseal.common.api.ErrorCode;
 import com.finsecseal.common.domain.ExecutionEventType;
 import com.finsecseal.common.domain.TestCaseRunStatus;
+import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.common.domain.TestRunStatus;
 import com.finsecseal.evidence.ExecutionEventDto;
 import com.finsecseal.evidence.ExecutionEventService;
@@ -89,7 +90,14 @@ public class RunExecutionLifecycleService {
     }
 
     @Transactional
-    public void ensureRunning(UUID runId, UUID traceId, String category, String actorId) {
+    public void ensureRunning(
+            UUID runId,
+            UUID traceId,
+            String category,
+            TestRunMode mode,
+            String actorId
+    ) {
+        AttackExecutionModePolicy.requireSupported(mode, category);
         TestRunStatus status = lockRunStatus(runId);
         if (status == TestRunStatus.RUNNING) {
             if (!fixtureService.verifyIntegrity(runId)) {
@@ -114,8 +122,10 @@ public class RunExecutionLifecycleService {
                         null,
                         null,
                         null,
-                        "BASELINE",
-                        objectMapper.createObjectNode().put("category", category)
+                        mode.name(),
+                        objectMapper.createObjectNode()
+                                .put("category", category)
+                                .put("mode", mode.name())
                 ),
                 actorId
         );
