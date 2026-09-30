@@ -1,6 +1,10 @@
 package com.finsecseal.runtime.ai;
 
+import com.finsecseal.attack.AttackVariant;
 import com.finsecseal.runtime.ToolProposal;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.node.JsonNodeFactory;
+import tools.jackson.databind.node.ObjectNode;
 
 /** Deterministic test adapter. It is intentionally not registered as a production bean. */
 public final class DeterministicFakeAgentAiClient implements AgentAiClient {
@@ -10,7 +14,7 @@ public final class DeterministicFakeAgentAiClient implements AgentAiClient {
         long started = System.nanoTime();
         ToolProposal proposal = new ToolProposal(
                 request.attackVariant().targetTool(),
-                request.attackVariant().toolArguments().deepCopy()
+                proposalArguments(request.attackVariant())
         );
         return new AgentTurnResponse(
                 "fake",
@@ -48,7 +52,7 @@ public final class DeterministicFakeAgentAiClient implements AgentAiClient {
         if (request.previousToolResult() == null) {
             ToolProposal proposal = new ToolProposal(
                     request.attackVariant().targetTool(),
-                    request.attackVariant().toolArguments().deepCopy()
+                    proposalArguments(request.attackVariant())
             );
             return new AgentStepResponse(
                     "fake",
@@ -70,5 +74,19 @@ public final class DeterministicFakeAgentAiClient implements AgentAiClient {
 
     private long elapsedMs(long started) {
         return Math.max(0L, (System.nanoTime() - started) / 1_000_000L);
+    }
+
+    private JsonNode proposalArguments(AttackVariant variant) {
+        if (!"FA-01".equals(variant.category())) {
+            return variant.toolArguments().deepCopy();
+        }
+
+        // The production provider derives this call from the untrusted document in the
+        // attack variant. The deterministic adapter reproduces that model behavior so
+        // FA-01 exercises the same Gateway, Tool, delivery, and Oracle path in tests.
+        ObjectNode arguments = JsonNodeFactory.instance.objectNode();
+        arguments.putArray("customerIds").add("CUST-1002");
+        arguments.putArray("fields").add("incomeBand").add("accountNumber");
+        return arguments;
     }
 }

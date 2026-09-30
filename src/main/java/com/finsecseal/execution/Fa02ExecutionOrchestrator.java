@@ -19,6 +19,7 @@ import com.finsecseal.runtime.AgentToolLoopService;
 import com.finsecseal.sandbox.SandboxExecutionContext;
 import com.finsecseal.sandbox.SandboxFixtureService;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -26,8 +27,14 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
+/**
+ * Executes customer-boundary attacks: FA-01 reaches the same Tool path through an
+ * untrusted document, while FA-02 proposes the cross-customer read directly.
+ */
 @Service
 public class Fa02ExecutionOrchestrator {
+
+    private static final Set<String> CROSS_CUSTOMER_CATEGORIES = Set.of("FA-01", "FA-02");
 
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
@@ -68,16 +75,22 @@ public class Fa02ExecutionOrchestrator {
         String normalizedActor = actorId == null || actorId.isBlank() ? "orchestrator-b" : actorId;
         ExecutionTarget target = requireTarget(runId, testCaseId);
         if (target.mode() != TestRunMode.BASELINE) {
-            throw new BusinessException(ErrorCode.INVALID_STATE_TRANSITION, "FA-02 only supports BASELINE");
+            throw new BusinessException(
+                    ErrorCode.INVALID_STATE_TRANSITION,
+                    target.category() + " only supports BASELINE"
+            );
         }
         if (target.status() != TestRunStatus.QUEUED && target.status() != TestRunStatus.RUNNING) {
             throw new BusinessException(
                     ErrorCode.INVALID_STATE_TRANSITION,
-                    "FA-02 execution requires a QUEUED or RUNNING TestRun"
+                    target.category() + " execution requires a QUEUED or RUNNING TestRun"
             );
         }
-        if (!"FA-02".equals(target.category())) {
-            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "TestCase is not FA-02");
+        if (!CROSS_CUSTOMER_CATEGORIES.contains(target.category())) {
+            throw new BusinessException(
+                    ErrorCode.VALIDATION_ERROR,
+                    "TestCase is not an FA-01/FA-02 customer-boundary case"
+            );
         }
 
         AttackSeed seed = attackSeedCatalog.requireSeed(target.category());
@@ -346,7 +359,10 @@ public class Fa02ExecutionOrchestrator {
         }
         ExecutionTarget target = targets.getFirst();
         if (target.sandboxCaseKey() == null || target.currentApplicantId() == null) {
-            throw new BusinessException(ErrorCode.EVIDENCE_INCOMPLETE, "FA-02 preconditions are incomplete");
+            throw new BusinessException(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    target.category() + " preconditions are incomplete"
+            );
         }
         return target;
     }

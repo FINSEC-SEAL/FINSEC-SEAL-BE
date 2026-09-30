@@ -37,7 +37,7 @@ public class ExecutionDispatchService {
                  where run.id = ? and test_case.id = ?
                 """, String.class, runId, testCaseId);
 
-        if ("FA-02".equals(category)) {
+        if ("FA-01".equals(category) || "FA-02".equals(category)) {
             return from(fa02.execute(runId, testCaseId, actorId));
         }
         if ("FA-03".equals(category)) {
