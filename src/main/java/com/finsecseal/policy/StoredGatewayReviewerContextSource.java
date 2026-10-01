@@ -1,6 +1,7 @@
 package com.finsecseal.policy;
 
 import com.finsecseal.contract.SafetyContractLifecyclePolicy.ReviewerContext;
+import com.finsecseal.contract.SafetyContractLifecyclePolicy;
 import com.finsecseal.evidence.StoredRunReviewerAuthoritySource;
 import com.finsecseal.policy.GatewayRuntimeObservations.InvocationKey;
 import com.finsecseal.sandbox.tool.StoredGatewayPreCallScopeSource;
@@ -198,22 +199,25 @@ public final class StoredGatewayReviewerContextSource implements GatewayReviewer
                 return null;
             }
             var authority = authorities.resolve(key, timeLeft(deadline));
+            if (authority == null || !key.equals(authority.key()) || authority.expiresAt() == null
+                    || !Instant.now().isBefore(authority.expiresAt())) return null;
+            // Validate C's reviewer contract; the unchanged A reader verifies credentials/stamps.
+            ReviewerContext reviewer = new ReviewerContext(authority.workspaceId(), authority.actorId(),
+                    authority.role(), authority.sessionReference(), true, true, false);
+            SafetyContractLifecyclePolicy.requireReviewerContext(reviewer, authority.workspaceId());
+            if (!reviewer.sessionId().matches("sha256:[0-9a-f]{64}")) return null;
             tightenNetworkTimeout(connection, deadline);
             var scope = scopes.resolve(key, timeLeft(deadline));
-            if (authority == null || scope == null || !key.equals(authority.key())
-                    || !key.equals(scope.key()) || !key.runId().equals(scope.namespace().namespaceId())
+            if (scope == null || !key.equals(scope.key()) || !key.runId().equals(scope.namespace().namespaceId())
                     || !key.runId().equals(scope.serverContext().runId())
                     || !key.caseRunId().equals(scope.serverContext().caseRunId())
                     || !key.traceId().equals(scope.serverContext().traceId())
-                    || !"AI_SECURITY_REVIEWER".equals(authority.role())
                     || !Instant.now().isBefore(authority.expiresAt())
                     || !sameBoundConnection(connection)
                     || System.nanoTime() >= deadline) {
                 return null;
             }
             // A verified this opaque digest at Run admission, not by a fresh browser CSRF exchange.
-            ReviewerContext reviewer = new ReviewerContext(authority.workspaceId(), authority.actorId(),
-                    authority.role(), authority.sessionReference(), true, true, false);
             return new ReviewedSnapshot(new Resolution(key, reviewer), authority.expiresAt());
         } catch (SQLException failure) {
             return null;

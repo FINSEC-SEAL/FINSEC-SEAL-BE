@@ -46,6 +46,8 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
@@ -53,10 +55,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.UnaryOperator;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -71,10 +76,12 @@ import org.springframework.boot.testcontainers.service.connection.ServiceConnect
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.AbstractDataSource;
+import org.springframework.jdbc.datasource.ConnectionHolder;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -95,6 +102,10 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
     private static final String OTHER_HASH = "sha256:" + "b".repeat(64);
     // Fixed table/key allowlist; no SQL identifier comes from a request or fixture value.
     private static final List<SnapshotTable> SNAPSHOT_TABLES = List.of(
+            new SnapshotTable("test_runs", "t.id"),
+            new SnapshotTable("test_case_runs", "t.id"),
+            new SnapshotTable("test_run_reviewer_grants", "t.run_id"),
+            new SnapshotTable("reviewer_session_revocations", "t.session_digest"),
             new SnapshotTable("sandbox_namespaces", "t.id"),
             new SnapshotTable("sandbox_customers", "t.namespace_id, t.customer_key"),
             new SnapshotTable("sandbox_loan_cases", "t.namespace_id, t.case_key"),
@@ -269,6 +280,162 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
     }
 
     @Test
+    void bothActualOwnerQueriesShareOneFreshReadOnlyRepeatableReadConnectionAndDecliningBudgets() throws Exception {
+        Fixture fixture = fixture();
+        List<OwnerRead> reads = new CopyOnWriteArrayList<>();
+        try (CountingPool pool = observedPool(reads)) {
+            var ownerA = spy(new StoredRunReviewerAuthoritySource(pool, credentials));
+            var ownerB = spy(new StoredGatewayPreCallScopeSource(pool, json));
+            AtomicReference<Duration> budgetA = new AtomicReference<>(), budgetB = new AtomicReference<>();
+            doAnswer(call -> { budgetA.set(call.getArgument(1)); return call.callRealMethod(); })
+                    .when(ownerA).resolve(any(InvocationKey.class), any(Duration.class));
+            doAnswer(call -> { budgetB.set(call.getArgument(1)); return call.callRealMethod(); })
+                    .when(ownerB).resolve(any(InvocationKey.class), any(Duration.class));
+            var source = new StoredGatewayReviewerContextSource(pool, ownerA, ownerB);
+            StoredDigest before = storedDigest();
+            assertThat(source.resolve(fixture.key(), Duration.ofSeconds(5))).isNotNull();
+            assertOwnerReads(reads, pool, 1);
+            assertThat(budgetA.get()).isLessThan(Duration.ofSeconds(5));
+            assertThat(budgetB.get()).isLessThan(budgetA.get()).isGreaterThan(Duration.ofSeconds(1));
+            assertThat(storedDigest()).isEqualTo(before);
+            OwnerRead first = reads.getFirst();
+
+            db.update("update sandbox_namespaces set state='SEALED' where id=?", fixture.key().runId());
+            StoredDigest afterSeal = storedDigest();
+            reads.clear();
+            assertThat(source.resolve(fixture.key(), Duration.ofSeconds(5))).isNull();
+            assertOwnerReads(reads, pool, 2);
+            assertThat(reads.getFirst().physical()).isNotSameAs(first.physical());
+            assertThat(reads.getFirst().backendPid()).isNotEqualTo(first.backendPid());
+            assertThat(storedDigest()).isEqualTo(afterSeal);
+            assertThat(TransactionSynchronizationManager.hasResource(pool)).isFalse();
+            assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
+        }
+    }
+
+    private void assertOwnerReads(List<OwnerRead> reads, CountingPool pool, int borrows) {
+        assertThat(pool.borrows).hasValue(borrows);
+        assertThat(reads).extracting(OwnerRead::owner).containsExactly("A", "B");
+        OwnerRead a = reads.getFirst(), b = reads.getLast();
+        assertThat(a.bound()).isNotNull().isSameAs(b.bound());
+        assertThat(a.physical()).isSameAs(b.physical());
+        assertThat(a.backendPid()).isEqualTo(b.backendPid());
+        for (OwnerRead read : reads) {
+            assertThat(read.autoCommit()).isFalse();
+            assertThat(read.readOnly()).isTrue();
+            assertThat(read.isolation()).isEqualTo(Connection.TRANSACTION_REPEATABLE_READ);
+            assertThat(read.springActive()).isTrue();
+            assertThat(read.springReadOnly()).isTrue();
+            assertThat(read.serverReadOnly()).isEqualTo("on");
+            assertThat(read.serverIsolation()).isEqualTo("repeatable read");
+        }
+        assertThat(pool.getHikariPoolMXBean().getActiveConnections()).isZero();
+    }
+
+    private CountingPool observedPool(List<OwnerRead> reads) {
+        AtomicReference<DataSource> resourceKey = new AtomicReference<>();
+        DataSource physical = new AbstractDataSource() {
+            @Override public Connection getConnection() throws SQLException {
+                Connection connection = DriverManager.getConnection(POSTGRES.getJdbcUrl(),
+                        POSTGRES.getUsername(), POSTGRES.getPassword());
+                return (Connection) Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[] {Connection.class},
+                        (proxy, method, arguments) -> {
+                            Object result = invoke(connection, method, arguments);
+                            if (method.getName().equals("prepareStatement") && arguments[0] instanceof String sql
+                                    && result instanceof PreparedStatement statement) {
+                                String owner = sql.contains("join test_run_reviewer_grants") ? "A"
+                                        : sql.contains("join sandbox_namespaces") ? "B" : null;
+                                if (owner != null) return Proxy.newProxyInstance(getClass().getClassLoader(),
+                                        new Class<?>[] {PreparedStatement.class}, (ignored, queryMethod, queryArguments) -> {
+                                            if (!queryMethod.getName().equals("executeQuery"))
+                                                return invoke(statement, queryMethod, queryArguments);
+                                            Object resource = TransactionSynchronizationManager.getResource(resourceKey.get());
+                                            Connection bound = resource instanceof ConnectionHolder holder ? holder.getConnection() : null;
+                                            OwnerRead observation;
+                                            try (Statement metadata = connection.createStatement()) {
+                                                metadata.setQueryTimeout(1);
+                                                try (ResultSet row = metadata.executeQuery("select pg_backend_pid(), "
+                                                        + "current_setting('transaction_read_only'), current_setting('transaction_isolation')")) {
+                                                    assertThat(row.next()).isTrue();
+                                                    observation = new OwnerRead(owner, connection, bound, row.getInt(1),
+                                                            connection.getAutoCommit(), connection.isReadOnly(), connection.getTransactionIsolation(),
+                                                            TransactionSynchronizationManager.isActualTransactionActive(),
+                                                            TransactionSynchronizationManager.isCurrentTransactionReadOnly(), row.getString(2), row.getString(3));
+                                                }
+                                            }
+                                            Object rows = invoke(statement, queryMethod, queryArguments);
+                                            reads.add(observation);
+                                            return rows;
+                                        });
+                            }
+                            return result;
+                        });
+            }
+            @Override public Connection getConnection(String username, String password) throws SQLException {
+                return getConnection();
+            }
+        };
+        HikariConfig config = new HikariConfig();
+        config.setDataSource(physical); config.setMaximumPoolSize(1); config.setMinimumIdle(0);
+        config.setConnectionTimeout(1_000);
+        CountingPool pool = new CountingPool(config);
+        resourceKey.set(pool);
+        return pool;
+    }
+
+    private record OwnerRead(String owner, Connection physical, Connection bound, int backendPid,
+            boolean autoCommit, boolean readOnly, int isolation, boolean springActive,
+            boolean springReadOnly, String serverReadOnly, String serverIsolation) { }
+
+    @Test
+    void malformedAuthorityIsRejectedBeforeTheSecondOwnerReadWithoutStoredChanges() {
+        Fixture fixture = fixture();
+        StoredDigest before = storedDigest();
+        List<UnaryOperator<StoredRunReviewerAuthoritySource.AuthoritySnapshot>> corruptions = List.of(
+                a -> new StoredRunReviewerAuthoritySource.AuthoritySnapshot(null, a.workspaceId(), a.actorId(), a.role(), a.sessionReference(), a.expiresAt()),
+                a -> new StoredRunReviewerAuthoritySource.AuthoritySnapshot(a.key(), null, a.actorId(), a.role(), a.sessionReference(), a.expiresAt()),
+                a -> new StoredRunReviewerAuthoritySource.AuthoritySnapshot(a.key(), a.workspaceId(), null, a.role(), a.sessionReference(), a.expiresAt()),
+                a -> new StoredRunReviewerAuthoritySource.AuthoritySnapshot(a.key(), a.workspaceId(), " padded ", a.role(), a.sessionReference(), a.expiresAt()),
+                a -> new StoredRunReviewerAuthoritySource.AuthoritySnapshot(a.key(), a.workspaceId(), "a".repeat(121), a.role(), a.sessionReference(), a.expiresAt()),
+                a -> new StoredRunReviewerAuthoritySource.AuthoritySnapshot(a.key(), a.workspaceId(), a.actorId(), "OTHER_ROLE", a.sessionReference(), a.expiresAt()),
+                a -> new StoredRunReviewerAuthoritySource.AuthoritySnapshot(a.key(), a.workspaceId(), a.actorId(), a.role(), null, a.expiresAt()),
+                a -> new StoredRunReviewerAuthoritySource.AuthoritySnapshot(a.key(), a.workspaceId(), a.actorId(), a.role(), "PRIVATE-CSRF-CANARY", a.expiresAt()),
+                a -> new StoredRunReviewerAuthoritySource.AuthoritySnapshot(a.key(), a.workspaceId(), a.actorId(), a.role(), a.sessionReference(), null),
+                a -> new StoredRunReviewerAuthoritySource.AuthoritySnapshot(a.key(), a.workspaceId(), a.actorId(), a.role(), a.sessionReference(), Instant.now().minusSeconds(1)));
+        for (var corrupt : corruptions) {
+            var ownerA = spy(new StoredRunReviewerAuthoritySource(dataSource, credentials));
+            var ownerB = mock(StoredGatewayPreCallScopeSource.class);
+            doAnswer(call -> corrupt.apply((StoredRunReviewerAuthoritySource.AuthoritySnapshot) call.callRealMethod()))
+                    .when(ownerA).resolve(any(InvocationKey.class), any(Duration.class));
+            assertThat(new StoredGatewayReviewerContextSource(dataSource, ownerA, ownerB)
+                    .resolve(fixture.key(), Duration.ofSeconds(5))).isNull();
+            verifyNoInteractions(ownerB);
+            assertThat(dataSource.getHikariPoolMXBean().getActiveConnections()).isZero();
+            assertThat(storedDigest()).isEqualTo(before);
+        }
+    }
+
+    @Test
+    void lockedAuthorityReadStopsInsideTheSharedBudgetAndRecoversWithoutWrites() throws Exception {
+        Fixture fixture = fixture();
+        StoredDigest before = storedDigest();
+        try (Connection blocker = DriverManager.getConnection(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())) {
+            blocker.setAutoCommit(false);
+            try (Statement lock = blocker.createStatement()) { lock.execute("lock table test_run_reviewer_grants in access exclusive mode"); }
+            long started = System.nanoTime();
+            assertThat(source().resolve(fixture.key(), Duration.ofSeconds(3))).isNull();
+            assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofMillis(3_750));
+            blocker.rollback();
+        }
+        long cleanupDeadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
+        while (dataSource.getHikariPoolMXBean().getActiveConnections() != 0 && System.nanoTime() < cleanupDeadline) Thread.sleep(20);
+        assertThat(dataSource.getHikariPoolMXBean().getActiveConnections()).isZero();
+        assertThat(storedDigest()).isEqualTo(before);
+        assertThat(source().resolve(fixture.key(), Duration.ofSeconds(5))).isNotNull();
+        assertThat(storedDigest()).isEqualTo(before);
+    }
+
+    @Test
     void revokedAdmissionAndMissingBCaseScopeFailClosed() {
         Fixture revoked = fixture();
         revocations.revoke(revoked.session());
@@ -345,7 +512,7 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
             }
             long started = System.nanoTime();
             assertThat(source().resolve(fixture.key(), Duration.ofSeconds(3))).isNull();
-            assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(5));
+            assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofMillis(3_750));
             blocker.rollback();
         }
         assertThat(counts(fixture)).isEqualTo(before);
@@ -443,6 +610,7 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
     void twoBlockedWatchdogsRejectAThirdStoredReviewerBeforeBorrowing() throws Exception {
         Fixture fixture = fixture();
         Counts before = counts(fixture);
+        StoredDigest rowsBefore = storedDigest();
         AtomicBoolean firstSleep = new AtomicBoolean();
         AtomicBoolean secondSleep = new AtomicBoolean();
         CountDownLatch firstAbort = new CountDownLatch(1);
@@ -497,16 +665,10 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
                 callers.shutdownNow();
                 assertThat(callers.awaitTermination(6, TimeUnit.SECONDS)).isTrue();
             }
-            long cleanupDeadline = System.nanoTime() + Duration.ofSeconds(8).toNanos();
-            while ((firstPool.getHikariPoolMXBean().getActiveConnections() != 0
-                    || secondPool.getHikariPoolMXBean().getActiveConnections() != 0)
-                    && System.nanoTime() < cleanupDeadline) {
-                Thread.sleep(20);
-            }
-            assertThat(firstPool.getHikariPoolMXBean().getActiveConnections()).isZero();
-            assertThat(secondPool.getHikariPoolMXBean().getActiveConnections()).isZero();
-            assertThat(source().resolve(fixture.key(), Duration.ofSeconds(5))).isNotNull();
+            long cleanupDeadline = awaitBothDeadlineLeases(firstPool, secondPool);
+            assertSingleHealthyRecovery(thirdPool, fixture, cleanupDeadline);
             assertThat(counts(fixture)).isEqualTo(before);
+            assertThat(storedDigest()).isEqualTo(rowsBefore);
         }
     }
 
@@ -602,15 +764,8 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
                 callers.shutdownNow();
                 assertThat(callers.awaitTermination(6, TimeUnit.SECONDS)).isTrue();
             }
-            long cleanupDeadline = System.nanoTime() + Duration.ofSeconds(8).toNanos();
-            while ((firstPool.getHikariPoolMXBean().getActiveConnections() != 0
-                    || secondPool.getHikariPoolMXBean().getActiveConnections() != 0)
-                    && System.nanoTime() < cleanupDeadline) {
-                Thread.sleep(20);
-            }
-            assertThat(firstPool.getHikariPoolMXBean().getActiveConnections()).isZero();
-            assertThat(secondPool.getHikariPoolMXBean().getActiveConnections()).isZero();
-            assertThat(source().resolve(fixture.key(), Duration.ofSeconds(5))).isNotNull();
+            long cleanupDeadline = awaitBothDeadlineLeases(firstPool, secondPool);
+            assertSingleHealthyRecovery(thirdPool, fixture, cleanupDeadline);
         }
         assertNoStoredGatewayWrite(fixture, before);
     }
@@ -754,6 +909,52 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
                     }
                     return invoke(delegate, method, arguments);
                 });
+    }
+
+    private long awaitBothDeadlineLeases(HikariDataSource first, HikariDataSource second) throws Exception {
+        long cleanupDeadline = System.nanoTime() + Duration.ofSeconds(8).toNanos();
+        // Eviction can make Hikari report zero before the worker and physical-abort
+        // callback finish. Observe the existing lease barrier; never mutate its permits.
+        var field = StoredGatewayReviewerContextSource.class.getDeclaredField("DEADLINE_SLOTS");
+        field.setAccessible(true);
+        Semaphore slots = (Semaphore) field.get(null);
+        int initialPermits = slots.availablePermits();
+        while ((slots.availablePermits() != 2
+                || first.getHikariPoolMXBean().getActiveConnections() != 0
+                || second.getHikariPoolMXBean().getActiveConnections() != 0)
+                && System.nanoTime() < cleanupDeadline) {
+            Thread.sleep(20);
+        }
+        assertThat(slots.availablePermits()).as("both worker/watchdog leases settled").isEqualTo(2);
+        assertThat(first.getHikariPoolMXBean().getActiveConnections()).isZero();
+        assertThat(second.getHikariPoolMXBean().getActiveConnections()).isZero();
+        System.out.println("deadline cleanup permits: " + initialPermits + " -> " + slots.availablePermits());
+        return cleanupDeadline;
+    }
+
+    private void assertSingleHealthyRecovery(CountingPool pool, Fixture fixture, long cleanupDeadline) {
+        var ownerA = spy(new StoredRunReviewerAuthoritySource(pool, credentials));
+        var ownerB = spy(new StoredGatewayPreCallScopeSource(pool, json));
+        AtomicInteger aReads = new AtomicInteger(), bReads = new AtomicInteger();
+        doAnswer(call -> { aReads.incrementAndGet(); return call.callRealMethod(); })
+                .when(ownerA).resolve(any(InvocationKey.class), any(Duration.class));
+        doAnswer(call -> { bReads.incrementAndGet(); return call.callRealMethod(); })
+                .when(ownerB).resolve(any(InvocationKey.class), any(Duration.class));
+        int borrowsBefore = pool.borrows.get();
+        long remaining = Math.min(Duration.ofSeconds(5).toNanos(), cleanupDeadline - System.nanoTime());
+        assertThat(remaining).as("healthy recovery remains within the eight-second cleanup interval").isPositive();
+        var recovered = new StoredGatewayReviewerContextSource(pool, ownerA, ownerB)
+                .resolve(fixture.key(), Duration.ofNanos(remaining));
+        System.out.println("healthy recovery borrows/owner A/owner B: "
+                + (pool.borrows.get() - borrowsBefore) + "/" + aReads.get() + "/" + bReads.get());
+        assertThat(pool.borrows).hasValue(borrowsBefore + 1);
+        assertThat(aReads).hasValue(1);
+        assertThat(bReads).hasValue(1);
+        assertThat(recovered).isNotNull();
+        assertThat(recovered.key()).isEqualTo(fixture.key());
+        assertThat(recovered.reviewer().actorId()).isEqualTo(ACTOR);
+        assertThat(pool.getHikariPoolMXBean().getActiveConnections()).isZero();
+        assertThat(System.nanoTime()).isLessThan(cleanupDeadline);
     }
 
     private TimedResolution timedResolve(StoredGatewayReviewerContextSource source,
