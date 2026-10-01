@@ -44,15 +44,26 @@ class FlywayUpgradeIntegrationTest {
         LegacyAttestation legacyPass = insertLegacyPassAttestation(legacyNamespace);
 
         Flyway current = flyway(null);
-        assertThat(current.migrate().migrationsExecuted).isEqualTo(13);
-        assertThat(appliedVersionCount()).isEqualTo(22);
+        assertThat(current.migrate().migrationsExecuted).isEqualTo(14);
+        assertThat(appliedVersionCount()).isEqualTo(23);
         assertThat(current.validateWithResult().validationSuccessful).isTrue();
-        assertThat(current.info().current().getVersion()).isEqualTo(MigrationVersion.fromVersion("19"));
+        assertThat(current.info().current().getVersion()).isEqualTo(MigrationVersion.fromVersion("20"));
         verifyDocumentSourceTimestamp(legacyNamespace);
         verifyReviewerSessionRevocationSchema();
         verifyRunReviewerGrantSchemaWithoutBackfill(legacyNamespace);
         verifyGcProjectionGuardAndLegacyPassWithoutBackfill(legacyPass);
         verifyUnverifiedSlotPlanSchemaWithoutBackfill(legacyNamespace);
+        try (var connection = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+             var query = connection.createStatement();
+             var guard = query.executeQuery("""
+                     select tgenabled from pg_trigger
+                      where tgrelid = 'release_attestations'::regclass
+                        and tgname = 'release_attestation_decision_metrics_guard'
+                     """)) {
+            assertThat(guard.next()).isTrue();
+            assertThat(guard.getString(1)).isEqualTo("O");
+        }
 
         UUID leaseId = UUID.randomUUID();
         Instant now = Instant.now();

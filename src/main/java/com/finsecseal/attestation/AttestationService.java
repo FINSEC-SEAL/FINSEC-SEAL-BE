@@ -23,6 +23,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.util.HtmlUtils;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.cfg.JsonNodeFeature;
 import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 
@@ -55,6 +56,7 @@ public class AttestationService {
 
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
+    private final ObjectMapper metricTreeMapper;
     private final CanonicalJsonService canonicalJsonService;
     private final DigestService digestService;
     private final RedactionService redactionService;
@@ -70,6 +72,7 @@ public class AttestationService {
     ) {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
+        this.metricTreeMapper = objectMapper.rebuild().enable(JsonNodeFeature.USE_BIG_DECIMAL_FOR_FLOATS).build();
         this.canonicalJsonService = canonicalJsonService;
         this.digestService = digestService;
         this.redactionService = redactionService;
@@ -85,6 +88,14 @@ public class AttestationService {
         JsonNode snapshot = decision.inputSnapshot();
         validateSnapshot(decision, snapshot, invalidation != null);
         StoredAttestation existing = findStored(decision.id());
+        // Before V20 these four reports were stored in Decisions but omitted
+        // from Attestations. Only a persisted, fully verified old projection
+        // retains that shape; new and partially projected documents cannot.
+        boolean historicalMetricProjection = existing != null
+                && AttestationDecisionMetricValidator.FIELDS.stream().noneMatch(existing.document()::has);
+        if (!historicalMetricProjection) {
+            new AttestationDecisionMetricValidator(jdbcTemplate).validate(decision.releaseId(), snapshot);
+        }
         // A stored pre-report PASS remains readable only after the original
         // Decision/document/hash checks below. No new or modern-schema PASS
         // can be attested without a versioned GC negative-proof contract.
@@ -92,7 +103,7 @@ public class AttestationService {
                 && (existing == null || snapshot.has("criticalInvariantAnySuccess"))) {
             incomplete("PASS Attestation requires a verifiable GC negative-proof contract");
         }
-        ObjectNode expectedDocument = buildDocument(decision, snapshot);
+        ObjectNode expectedDocument = buildDocument(decision, snapshot, !historicalMetricProjection);
         String expectedHash = digestService.sha256(canonicalJsonService.canonicalize(expectedDocument));
         String expectedHtml = renderHtml(expectedDocument, expectedHash);
         boolean inserted = false;
@@ -134,6 +145,14 @@ public class AttestationService {
         return view(existing, invalidation);
     }
 
+    /**
+     * json/default retains canonical bytes; json-precise exports the verified document as compact UTF-8
+     * JSON with profile urn:finsec-seal:attestation:json-precise:v1 and a distinct -precise.json filename.
+     * The modern four report numeric values and array order are preserved, not original lexical
+     * spelling/whitespace or decimals already discarded in common/historical fields. Legacy omissions
+     * are retained. X-Attestation-Hash remains the canonical document hash: canonicalizing a precise
+     * parse verifies canonical equivalence, not raw-file SHA256 or every original decimal's identity.
+     */
     @Transactional
     public AttestationDto.Export export(UUID releaseId, String format, String actorId) {
         AttestationDto.View view = findOrCreate(releaseId, actorId);
@@ -144,6 +163,13 @@ public class AttestationService {
                     canonicalJsonService.canonicalize(view.document()),
                     "application/json",
                     "finsec-attestation-" + suffix + ".json",
+                    view.documentHash(),
+                    view.stale()
+            );
+            case "json-precise" -> new AttestationDto.Export(
+                    json(view.document()).getBytes(StandardCharsets.UTF_8),
+                    "application/json; profile=\"urn:finsec-seal:attestation:json-precise:v1\"",
+                    "finsec-attestation-" + suffix + "-precise.json",
                     view.documentHash(),
                     view.stale()
             );
@@ -162,7 +188,7 @@ public class AttestationService {
             }
             default -> throw new BusinessException(
                     ErrorCode.VALIDATION_ERROR,
-                    "format must be json or html"
+                    "format must be json, json-precise or html"
             );
         };
     }
@@ -326,7 +352,7 @@ public class AttestationService {
         }
     }
 
-    private ObjectNode buildDocument(DecisionSnapshot decision, JsonNode snapshot) {
+    private ObjectNode buildDocument(DecisionSnapshot decision, JsonNode snapshot, boolean projectMetricReports) {
         ObjectNode document = objectMapper.createObjectNode();
         document.put("schemaVersion", FORMAT_VERSION);
         document.put("attestationType", ATTESTATION_TYPE);
@@ -343,6 +369,11 @@ public class AttestationService {
         copy(document, snapshot, "sandbox");
         copy(document, snapshot, "results");
         copy(document, snapshot, "metrics");
+        if (projectMetricReports) {
+            for (String field : AttestationDecisionMetricValidator.FIELDS) {
+                if (snapshot.has(field)) copy(document, snapshot, field);
+            }
+        }
         if (snapshot.has("observedEffectCounts")) copy(document, snapshot, "observedEffectCounts");
         if (snapshot.has("criticalInvariantAnySuccess")) {
             copy(document, snapshot, "criticalInvariantAnySuccess");
@@ -1013,7 +1044,17 @@ public class AttestationService {
 
     private JsonNode parseJson(String value) {
         try {
-            return objectMapper.readTree(value);
+            JsonNode document = objectMapper.readTree(value);
+            if (document instanceof ObjectNode object
+                    && AttestationDecisionMetricValidator.FIELDS.stream().anyMatch(object::has)) {
+                // Preserve the old/common tree and historical HTML representation.
+                // Only D's report subtrees need decimal precision for exact JSONB projection.
+                JsonNode precise = metricTreeMapper.readTree(value);
+                for (String field : AttestationDecisionMetricValidator.FIELDS) {
+                    if (object.has(field)) object.set(field, precise.path(field));
+                }
+            }
+            return document;
         } catch (Exception exception) {
             throw new IllegalStateException("Stored Attestation JSON is invalid", exception);
         }
