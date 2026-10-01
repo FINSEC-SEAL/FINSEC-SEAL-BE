@@ -41,6 +41,9 @@ import com.finsecseal.sandbox.tool.StoredGatewayPreCallScopeSource;
 import com.finsecseal.sandbox.tool.ToolAdapter;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Metrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import jakarta.servlet.http.Cookie;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -107,6 +110,7 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
     private static final String ACTOR = "stored-gateway-reviewer";
     private static final String HASH = "sha256:" + "a".repeat(64);
     private static final String OTHER_HASH = "sha256:" + "b".repeat(64);
+    private static final String FAILURE_EVENTS = "finsec.policy.gateway.reviewer.failure.events";
     // Fixed table/key allowlist; no SQL identifier comes from a request or fixture value.
     private static final List<SnapshotTable> SNAPSHOT_TABLES = List.of(
             new SnapshotTable("test_runs", "t.id"),
@@ -227,6 +231,207 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
             assertThat(reviewers.resolve(healthy.key(), Duration.ofSeconds(5))).isNotNull();
             assertThat(counts(healthy)).isEqualTo(healthyBefore);
         }
+    }
+
+    @ParameterizedTest
+    @EnumSource(ResetAt.class)
+    void swallowedResetFailureRetiresItsExactLeaseAndAllowsOneFreshHealthyRead(ResetAt reset) throws Exception {
+        Fixture fixture = fixture(TestRunMode.BASELINE);
+        StoredDigest before = storedDigest();
+        ResetFailureProbe probe = new ResetFailureProbe();
+        try (HikariDataSource pool = resetFailurePool(reset, probe)) {
+            var ownerA = spy(new StoredRunReviewerAuthoritySource(pool, credentials));
+            var ownerB = spy(new StoredGatewayPreCallScopeSource(pool, json));
+            doAnswer(call -> {
+                Object result = call.callRealMethod();
+                probe.authorityRead.set(result != null);
+                return result;
+            }).when(ownerA).resolve(any(InvocationKey.class), any(Duration.class));
+            doAnswer(call -> {
+                Object result = call.callRealMethod();
+                probe.scopeRead.set(result != null);
+                return result;
+            }).when(ownerB).resolve(any(InvocationKey.class), any(Duration.class));
+            var reviewers = new StoredGatewayReviewerContextSource(pool, ownerA, ownerB);
+            long started = System.nanoTime();
+            var resolution = reviewers.resolve(fixture.key(), Duration.ofSeconds(5));
+            assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(5));
+            assertThat(probe.authorityRead).isTrue();
+            assertThat(probe.scopeRead).isTrue();
+            assertThat(probe.injected).isTrue();
+            assertThat(probe.defaults).containsExactly(new ConnectionDefaults(true, false,
+                    Connection.TRANSACTION_READ_COMMITTED));
+            assertThat(probe.rollbacks).hasSize(1);
+            assertThat(resolution).isNotNull();
+            assertThat(resolution.key()).isEqualTo(fixture.key());
+            assertThat(resolution.reviewer().actorId()).isEqualTo(ACTOR);
+            assertThat(resolution.reviewer().workspaceId()).isEqualTo(AgentService.DEMO_WORKSPACE_ID);
+            assertThat(resolution.reviewer().role()).isEqualTo("AI_SECURITY_REVIEWER");
+            assertThat(resolution.reviewer().sessionId()).isEqualTo(revocations.sessionDigest(fixture.session()));
+            assertThat(resolution.reviewer().authenticated()).isTrue();
+            assertThat(resolution.reviewer().csrfVerified()).isTrue();
+            assertThat(resolution.reviewer().demoMode()).isFalse();
+            assertThat(probe.borrowed).hasSize(1);
+            assertThat(probe.retired).containsExactly(probe.borrowed.getFirst());
+
+            long cleanupDeadline = awaitDeadlineLeases(pool);
+            while (!probe.closedSuccessfully.get() && System.nanoTime() < cleanupDeadline) Thread.sleep(20);
+            assertThat(probe.closedSuccessfully).isTrue();
+            assertThat(probe.faultedPhysical.get().isClosed()).isTrue();
+            assertThat(storedDigest()).isEqualTo(before);
+            assertThat(Duration.ofNanos(cleanupDeadline - System.nanoTime())).isGreaterThan(Duration.ofSeconds(1));
+            Duration remaining = Duration.ofNanos(Math.min(Duration.ofSeconds(5).toNanos(),
+                    cleanupDeadline - System.nanoTime()));
+            var healthy = reviewers.resolve(fixture.key(), remaining);
+            assertThat(healthy).isNotNull();
+            assertThat(healthy.key()).isEqualTo(fixture.key());
+            assertThat(healthy.reviewer()).isEqualTo(resolution.reviewer());
+            assertThat(System.nanoTime()).isLessThan(cleanupDeadline);
+            assertThat(probe.rollbacks).hasSize(2);
+            assertThat(probe.rollbacks.getLast()).isNotSameAs(probe.faultedPhysical.get());
+            assertThat(probe.borrowed).hasSize(2);
+            assertThat(probe.retired).containsExactlyElementsOf(probe.borrowed);
+            assertThat(pool.getHikariPoolMXBean().getActiveConnections()).isZero();
+            assertThat(deadlineSlots().availablePermits()).isEqualTo(2);
+            assertThat(storedDigest()).isEqualTo(before);
+        }
+    }
+
+    @Test
+    void diagnosticsUseOnlyFixedOperationalEventNamesAndTags() throws Exception {
+        try (OperationalDiagnostics diagnostics = new OperationalDiagnostics()) {
+            assertThat(diagnostics.registry.getMeters()).hasSize(7);
+            assertThat(diagnostics.registry.getMeters()).allSatisfy(meter -> {
+                assertThat(meter.getId().getName()).isEqualTo(FAILURE_EVENTS);
+                assertThat(meter.getId().getTags()).hasSize(1);
+                assertThat(meter.getId().getTags().getFirst().getKey()).isEqualTo("reason");
+                assertThat(meter.getId().getType()).isEqualTo(io.micrometer.core.instrument.Meter.Type.COUNTER);
+            });
+            assertThat(diagnostics.registry.getMeters().stream()
+                    .map(meter -> meter.getId().getTag("reason")).toList())
+                    .containsExactlyInAnyOrder("deadline_capacity", "interrupted", "caller_timeout",
+                            "execution_failure", "resolution_failure", "retirement_failure", "abort_failure");
+        }
+    }
+
+    @Test
+    void unavailableDiagnosticRegistrationCannotChangeAuthorityOrPublicFailureSemantics() throws Exception {
+        Fixture fixture = fixture(TestRunMode.BASELINE);
+        StoredDigest before = storedDigest();
+        MeterRegistry unavailable = mock(MeterRegistry.class);
+        org.mockito.Mockito.when(unavailable.more())
+                .thenThrow(new IllegalArgumentException("private-registry-canary"));
+        Method registration = StoredGatewayReviewerContextSource.class
+                .getDeclaredMethod("registerDiagnostics", MeterRegistry.class);
+        registration.setAccessible(true);
+        registration.invoke(null, unavailable);
+        var reviewers = source();
+        var healthy = reviewers.resolve(fixture.key(), Duration.ofSeconds(5));
+        assertThat(healthy).isNotNull();
+        assertThat(healthy.key()).isEqualTo(fixture.key());
+        assertThat(healthy.reviewer().actorId()).isEqualTo(ACTOR);
+        awaitDeadlineLeases(dataSource);
+        assertThat(storedDigest()).isEqualTo(before);
+        var badKey = new InvocationKey(fixture.key().runId(), fixture.key().caseRunId(),
+                fixture.key().traceId(), fixture.key().toolCallId(), OTHER_HASH);
+        GatewayProbe gateway = gatewayProbe(reviewers);
+        var badInvocation = new ToolInvocation(fixture.invocation().proposal(), badKey.toolCallId(), OTHER_HASH);
+        Fixture forged = new Fixture(badKey, fixture.session(), fixture.context(), badInvocation);
+        GatewayException failure = assertThrows(GatewayException.class,
+                () -> gateway.gateway().invoke(fixture.context(), badInvocation, ACTOR));
+        assertPreAdmissionFailure(gateway, forged, failure, FailureCode.AUTHENTICATION_REQUIRED);
+        awaitDeadlineLeases(dataSource);
+        assertThat(storedDigest()).isEqualTo(before);
+        org.mockito.Mockito.verify(unavailable, org.mockito.Mockito.times(7)).more();
+    }
+
+    private enum ResetAt { AUTO_COMMIT, ISOLATION, READ_ONLY }
+    private record ConnectionDefaults(boolean autoCommit, boolean readOnly, int isolation) { }
+    private static final class ResetFailureProbe {
+        private final AtomicBoolean authorityRead = new AtomicBoolean();
+        private final AtomicBoolean scopeRead = new AtomicBoolean();
+        private final AtomicBoolean injected = new AtomicBoolean();
+        private final AtomicBoolean closedSuccessfully = new AtomicBoolean();
+        private final AtomicReference<Connection> faultedPhysical = new AtomicReference<>();
+        private final List<Connection> rollbacks = new CopyOnWriteArrayList<>();
+        private final List<Connection> borrowed = new CopyOnWriteArrayList<>();
+        private final List<Connection> retired = new CopyOnWriteArrayList<>();
+        private final List<ConnectionDefaults> defaults = new CopyOnWriteArrayList<>();
+    }
+
+    private HikariDataSource resetFailurePool(ResetAt reset, ResetFailureProbe probe) {
+        DataSource physical = new AbstractDataSource() {
+            @Override public Connection getConnection() throws SQLException {
+                Connection delegate = DriverManager.getConnection(POSTGRES.getJdbcUrl(),
+                        POSTGRES.getUsername(), POSTGRES.getPassword());
+                AtomicBoolean rolledBack = new AtomicBoolean();
+                return (Connection) Proxy.newProxyInstance(getClass().getClassLoader(),
+                        new Class<?>[] {Connection.class}, (proxy, method, arguments) -> {
+                            boolean resetting = arguments != null && arguments.length == 1 && switch (reset) {
+                                case AUTO_COMMIT -> method.getName().equals("setAutoCommit") && Boolean.TRUE.equals(arguments[0]);
+                                case ISOLATION -> method.getName().equals("setTransactionIsolation")
+                                        && Integer.valueOf(Connection.TRANSACTION_READ_COMMITTED).equals(arguments[0]);
+                                case READ_ONLY -> method.getName().equals("setReadOnly") && Boolean.FALSE.equals(arguments[0]);
+                            };
+                            if (resetting && rolledBack.get() && probe.authorityRead.get() && probe.scopeRead.get()
+                                    && probe.injected.compareAndSet(false, true)) {
+                                probe.faultedPhysical.set(delegate);
+                                // No fatal SQLState: observe provider retirement, not driver broken-connection eviction.
+                                throw new SQLException("private-reset-canary");
+                            }
+                            Object value = invoke(delegate, method, arguments);
+                            if (method.getName().equals("rollback")) {
+                                rolledBack.set(true);
+                                probe.rollbacks.add(delegate);
+                            }
+                            if (method.getName().equals("close") && delegate == probe.faultedPhysical.get()
+                                    && delegate.isClosed()) probe.closedSuccessfully.set(true);
+                            return value;
+                        });
+            }
+            @Override public Connection getConnection(String username, String password) throws SQLException {
+                return getConnection();
+            }
+        };
+        HikariConfig config = new HikariConfig();
+        config.setDataSource(physical);
+        config.setMaximumPoolSize(1);
+        config.setMinimumIdle(0);
+        config.setConnectionTimeout(1_000);
+        return new HikariDataSource(config) {
+            @Override public Connection getConnection() throws SQLException {
+                Connection connection = super.getConnection();
+                probe.borrowed.add(connection);
+                probe.defaults.add(new ConnectionDefaults(connection.getAutoCommit(), connection.isReadOnly(),
+                        connection.getTransactionIsolation()));
+                return connection;
+            }
+            @Override public void evictConnection(Connection connection) {
+                probe.retired.add(connection);
+                super.evictConnection(connection);
+            }
+        };
+    }
+
+    private static final class OperationalDiagnostics implements AutoCloseable {
+        private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        private OperationalDiagnostics() throws ClassNotFoundException {
+            Class.forName(StoredGatewayReviewerContextSource.class.getName());
+            Metrics.addRegistry(registry);
+        }
+        private double count(String reason) {
+            return registry.get(FAILURE_EVENTS).tag("reason", reason).functionCounter().count();
+        }
+        @Override public void close() {
+            Metrics.removeRegistry(registry);
+            registry.close();
+        }
+    }
+
+    private Semaphore deadlineSlots() throws Exception {
+        var field = StoredGatewayReviewerContextSource.class.getDeclaredField("DEADLINE_SLOTS");
+        field.setAccessible(true);
+        return (Semaphore) field.get(null);
     }
 
     private Instant grantExpiration(Fixture fixture) {
@@ -729,10 +934,12 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
         config.setMaximumPoolSize(1);
         config.setMinimumIdle(0);
         config.setConnectionTimeout(1_000);
-        try (FailFirstEvictionPool pool = new FailFirstEvictionPool(config)) {
+        try (OperationalDiagnostics diagnostics = new OperationalDiagnostics();
+                FailFirstEvictionPool pool = new FailFirstEvictionPool(config)) {
             var reviewers = new StoredGatewayReviewerContextSource(pool,
                     new StoredRunReviewerAuthoritySource(pool, credentials),
                     new StoredGatewayPreCallScopeSource(pool, json));
+            double retirementsBefore = diagnostics.count("retirement_failure");
             long started = System.nanoTime();
             assertThat(reviewers.resolve(fixture.key(), Duration.ofSeconds(3))).isNull();
             assertThat(Duration.ofNanos(System.nanoTime() - started))
@@ -750,6 +957,9 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
                 Thread.sleep(20);
             }
             assertThat(pool.getHikariPoolMXBean().getActiveConnections()).isZero();
+            while (deadlineSlots().availablePermits() != 2 && System.nanoTime() < cleanupDeadline) Thread.sleep(20);
+            assertThat(deadlineSlots().availablePermits()).isEqualTo(2);
+            assertThat(diagnostics.count("retirement_failure")).isEqualTo(retirementsBefore + 1);
             assertThat(reviewers.resolve(fixture.key(), Duration.ofSeconds(5))).isNotNull();
             assertThat(counts(fixture)).isEqualTo(before);
         }
@@ -768,7 +978,8 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
         AtomicReference<String> firstAbortThread = new AtomicReference<>();
         AtomicReference<String> secondAbortThread = new AtomicReference<>();
         CountingPool thirdPool = countingPool();
-        try (HikariDataSource firstPool = stalledPool(DelayAt.READ_ONLY_SETUP, firstSleep,
+        try (OperationalDiagnostics diagnostics = new OperationalDiagnostics();
+                HikariDataSource firstPool = stalledPool(DelayAt.READ_ONLY_SETUP, firstSleep,
                 firstAbort, releaseAborts, firstAbortThread);
                 HikariDataSource secondPool = stalledPool(DelayAt.READ_ONLY_SETUP, secondSleep,
                         secondAbort, releaseAborts, secondAbortThread);
@@ -782,6 +993,7 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
             var thirdSource = new StoredGatewayReviewerContextSource(thirdPool,
                     new StoredRunReviewerAuthoritySource(thirdPool, credentials),
                     new StoredGatewayPreCallScopeSource(thirdPool, json));
+            double capacityBefore = diagnostics.count("deadline_capacity");
             ExecutorService callers = Executors.newFixedThreadPool(2);
             try {
                 Future<TimedResolution> firstCall = callers.submit(
@@ -815,6 +1027,7 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
                 assertThat(callers.awaitTermination(6, TimeUnit.SECONDS)).isTrue();
             }
             long cleanupDeadline = awaitDeadlineLeases(firstPool, secondPool);
+            assertThat(diagnostics.count("deadline_capacity")).isEqualTo(capacityBefore + 1);
             assertSingleHealthyRecovery(thirdPool, fixture, cleanupDeadline);
             assertThat(counts(fixture)).isEqualTo(before);
             assertThat(storedDigest()).isEqualTo(rowsBefore);

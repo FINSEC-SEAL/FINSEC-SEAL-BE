@@ -6,6 +6,9 @@ import com.finsecseal.evidence.StoredRunReviewerAuthoritySource;
 import com.finsecseal.policy.GatewayRuntimeObservations.InvocationKey;
 import com.finsecseal.sandbox.tool.StoredGatewayPreCallScopeSource;
 import com.zaxxer.hikari.HikariDataSource;
+import io.micrometer.core.instrument.FunctionCounter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Metrics;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -22,6 +25,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.sql.DataSource;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -40,6 +44,7 @@ import org.springframework.transaction.support.TransactionTemplate;
         "finsec.policy.gateway.enabled", "finsec.policy.gateway.reviewer.stored.enabled"
 }, havingValue = "true")
 public final class StoredGatewayReviewerContextSource implements GatewayReviewerContextSource {
+    private static final String FAILURE_EVENTS = "finsec.policy.gateway.reviewer.failure.events";
     private static final Duration MAX_BUDGET = Duration.ofSeconds(5);
     private static final long MIN_READER_NANOS = TimeUnit.SECONDS.toNanos(1);
     private static final ThreadPoolExecutor READERS = new ThreadPoolExecutor(4, 4, 0,
@@ -59,6 +64,39 @@ public final class StoredGatewayReviewerContextSource implements GatewayReviewer
     private static final Semaphore DEADLINE_SLOTS = new Semaphore(2);
     static {
         DEADLINES.setRemoveOnCancelPolicy(true);
+        registerDiagnostics(Metrics.globalRegistry);
+    }
+
+    private enum OperationalFailure {
+        DEADLINE_CAPACITY("deadline_capacity"), INTERRUPTED("interrupted"),
+        CALLER_TIMEOUT("caller_timeout"), EXECUTION_FAILURE("execution_failure"),
+        RESOLUTION_FAILURE("resolution_failure"), RETIREMENT_FAILURE("retirement_failure"),
+        ABORT_FAILURE("abort_failure");
+
+        private final String category;
+        private final AtomicLong events = new AtomicLong();
+
+        OperationalFailure(String category) {
+            this.category = category;
+        }
+    }
+
+    private static void registerDiagnostics(MeterRegistry registry) {
+        // Registration is startup-only. Failure paths never call a registry or exporter.
+        for (OperationalFailure failure : OperationalFailure.values()) {
+            try {
+                FunctionCounter.builder(FAILURE_EVENTS, failure.events, AtomicLong::doubleValue)
+                        .tag("reason", failure.category)
+                        .description("Stored reviewer operational failure events; not security blocks")
+                        .register(registry);
+            } catch (RuntimeException unavailable) {
+                // Unavailable diagnostics must not alter authority or public error behavior.
+            }
+        }
+    }
+
+    private static void recordFailure(OperationalFailure failure) {
+        failure.events.incrementAndGet();
     }
 
     private final DataSource dataSource;
@@ -91,7 +129,10 @@ public final class StoredGatewayReviewerContextSource implements GatewayReviewer
         if (budget <= Math.max(MIN_READER_NANOS, TimeUnit.MILLISECONDS.toNanos(pool.getConnectionTimeout()))) {
             return null;
         }
-        if (!DEADLINE_SLOTS.tryAcquire()) return null;
+        if (!DEADLINE_SLOTS.tryAcquire()) {
+            recordFailure(OperationalFailure.DEADLINE_CAPACITY);
+            return null;
+        }
         long deadline = System.nanoTime() + budget;
         DeadlineLease lease = new DeadlineLease(pool);
         ScheduledFuture<?> watchdog = null;
@@ -116,8 +157,12 @@ public final class StoredGatewayReviewerContextSource implements GatewayReviewer
             });
             snapshot = worker.get(timeRemaining(deadline), TimeUnit.NANOSECONDS);
         } catch (InterruptedException failure) {
+            recordFailure(OperationalFailure.INTERRUPTED);
             Thread.currentThread().interrupt();
-        } catch (ExecutionException | TimeoutException | RuntimeException failure) {
+        } catch (TimeoutException failure) {
+            recordFailure(OperationalFailure.CALLER_TIMEOUT);
+        } catch (ExecutionException | RuntimeException failure) {
+            recordFailure(OperationalFailure.EXECUTION_FAILURE);
             // Neither SQL nor A/B operational errors may escape into Gateway error classification.
         } finally {
             if (!lease.workerSettled()) {
@@ -169,7 +214,8 @@ public final class StoredGatewayReviewerContextSource implements GatewayReviewer
             });
             completed = true;
         } catch (SQLException | RuntimeException failure) {
-            // A failed setup, owner read, rollback, or cleanup never grants reviewer authority.
+            recordFailure(OperationalFailure.RESOLUTION_FAILURE);
+            // A propagated setup, owner-read, rollback, or cleanup failure grants no authority.
             return null;
         } finally {
             if (bound) TransactionSynchronizationManager.unbindResourceIfPossible(dataSource);
@@ -181,6 +227,7 @@ public final class StoredGatewayReviewerContextSource implements GatewayReviewer
                     lease.retire(connection);
                     lease.clear(connection);
                 } catch (RuntimeException failure) {
+                    recordFailure(OperationalFailure.RETIREMENT_FAILURE);
                     completed = false;
                     lease.markRetirementFailed();
                     // Keep the borrowed reference so an armed watchdog can retry retirement.
@@ -337,6 +384,7 @@ public final class StoredGatewayReviewerContextSource implements GatewayReviewer
             try {
                 retire(borrowed);
             } catch (RuntimeException ignored) {
+                recordFailure(OperationalFailure.RETIREMENT_FAILURE);
                 // The worker also retires the lease; an uncertain pool state never grants authority.
             }
             abort(borrowed);
@@ -346,6 +394,7 @@ public final class StoredGatewayReviewerContextSource implements GatewayReviewer
             try {
                 borrowed.abort(Runnable::run);
             } catch (SQLException | RuntimeException ignored) {
+                recordFailure(OperationalFailure.ABORT_FAILURE);
                 // The worker also retires the borrowed lease; a failed abort never grants authority.
             }
         }
