@@ -10,7 +10,9 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.ArgumentMatchers.any;
 
 import com.finsecseal.agent.AgentService;
+import com.finsecseal.agent.AgentDto;
 import com.finsecseal.common.domain.ExecutionEventType;
+import com.finsecseal.common.domain.ReleaseLifecycleState;
 import com.finsecseal.common.domain.TestCaseRunStatus;
 import com.finsecseal.common.domain.TestRunMode;
 import com.finsecseal.common.domain.TestRunStatus;
@@ -24,6 +26,7 @@ import com.finsecseal.evidence.TestRunPersistenceDto;
 import com.finsecseal.evidence.TestRunPersistenceService;
 import com.finsecseal.evidence.TestRunProjectionService;
 import com.finsecseal.platform.contract.ContractReviewerCredentials;
+import com.finsecseal.platform.contract.ContractPersistenceService;
 import com.finsecseal.platform.contract.ContractReviewerSessionRevocations;
 import com.finsecseal.policy.GatewayRuntimeObservations.InvocationKey;
 import com.finsecseal.policy.LoanReviewPolicyGateway.FailureCode;
@@ -51,6 +54,7 @@ import java.sql.ResultSet;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -69,6 +73,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -86,6 +92,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ObjectNode;
 
 @Testcontainers
 @SpringBootTest(properties = {
@@ -123,6 +130,10 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
     static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:17.11-alpine");
 
     @Autowired HikariDataSource dataSource;
+    @Autowired AgentService agents;
+    @Autowired ReleaseService releases;
+    @Autowired ContractPersistenceService contracts;
+    @Autowired PlatformTransactionManager ownerTransactions;
     @Autowired JdbcTemplate db;
     @Autowired ObjectMapper json;
     @Autowired ContractReviewerCredentials credentials;
@@ -450,6 +461,144 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
         assertThat(counts(missingScope)).isEqualTo(afterSeal);
     }
 
+    @ParameterizedTest
+    @EnumSource(value = TestRunMode.class, names = {"BASELINE", "SEAL_REPLAY"})
+    void matchedModeWrongProposalCannotCallOrChangeStoredEvidence(TestRunMode mode) throws Exception {
+        Fixture actual = fixture(mode);
+        assertHealthyMatchedFixture(actual, mode);
+        InvocationKey wrong = new InvocationKey(actual.key().runId(), actual.key().caseRunId(),
+                actual.key().traceId(), actual.key().toolCallId(), OTHER_HASH);
+        Fixture forged = new Fixture(wrong, actual.session(), actual.context(),
+                new ToolInvocation(actual.invocation().proposal(), actual.key().toolCallId(), OTHER_HASH));
+        StoredDigest before = storedDigest();
+        assertGatewayStoredFailure(forged, dataSource, source(), FailureCode.AUTHENTICATION_REQUIRED);
+        assertNoStoredGatewayWrite(actual, before);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = TestRunMode.class, names = {"BASELINE", "SEAL_REPLAY"})
+    void matchedModeRevokedGrantCannotCallOrChangeStoredEvidence(TestRunMode mode) throws Exception {
+        Fixture fixture = fixture(mode);
+        assertHealthyMatchedFixture(fixture, mode);
+        revocations.revoke(fixture.session());
+        StoredDigest afterRevocation = storedDigest();
+        assertGatewayStoredFailure(fixture, dataSource, source(), FailureCode.AUTHENTICATION_REQUIRED);
+        assertNoStoredGatewayWrite(fixture, afterRevocation);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = TestRunMode.class, names = {"BASELINE", "SEAL_REPLAY"})
+    void matchedModeSealedNamespaceCannotCallOrChangeStoredEvidence(TestRunMode mode) throws Exception {
+        Fixture fixture = fixture(mode);
+        assertHealthyMatchedFixture(fixture, mode);
+        db.update("update sandbox_namespaces set state='SEALED' where id=?", fixture.key().runId());
+        StoredDigest afterSeal = storedDigest();
+        assertGatewayStoredFailure(fixture, dataSource, source(), FailureCode.AUTHENTICATION_REQUIRED);
+        assertNoStoredGatewayWrite(fixture, afterSeal);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = TestRunMode.class, names = {"BASELINE", "SEAL_REPLAY"})
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void matchedModePgSetupDeadlineCannotCallOrChangeStoredEvidence(TestRunMode mode) throws Exception {
+        Fixture fixture = fixture(mode);
+        assertHealthyMatchedFixture(fixture, mode);
+        StoredDigest before = storedDigest();
+        AtomicBoolean injected = new AtomicBoolean();
+        try (HikariDataSource pool = stalledPool(DelayAt.READ_ONLY_SETUP, injected)) {
+            var stored = new StoredGatewayReviewerContextSource(pool,
+                    new StoredRunReviewerAuthoritySource(pool, credentials),
+                    new StoredGatewayPreCallScopeSource(pool, json));
+            assertGatewayStoredFailure(fixture, pool, stored,
+                    FailureCode.AUTHENTICATION_REQUIRED, FailureCode.POLICY_EVALUATION_TIMEOUT);
+            assertThat(injected).isTrue();
+        }
+        assertNoStoredGatewayWrite(fixture, before);
+    }
+
+    @Test
+    void malformedConsumedScopeIdentityCannotEscapeOrChangeStoredEvidence() throws Exception {
+        Fixture fixture = fixture(TestRunMode.BASELINE);
+        assertHealthyMatchedFixture(fixture, TestRunMode.BASELINE);
+        StoredDigest before = storedDigest();
+        List<UnaryOperator<StoredGatewayPreCallScopeSource.ScopeSnapshot>> corruptions = List.of(
+                scope -> null,
+                scope -> scopeCopy(scope, null, scope.serverContext(), scope.namespace()),
+                scope -> scopeCopy(scope, new InvocationKey(scope.key().runId(), scope.key().caseRunId(),
+                        scope.key().traceId(), scope.key().toolCallId(), OTHER_HASH), scope.serverContext(), scope.namespace()),
+                scope -> scopeCopy(scope, scope.key(), null, scope.namespace()),
+                scope -> scopeCopy(scope, scope.key(), scope.serverContext(), null),
+                scope -> scopeCopy(scope, scope.key(), contextCopy(scope.serverContext(), UUID.randomUUID(),
+                        scope.serverContext().caseRunId(), scope.serverContext().traceId()), scope.namespace()),
+                scope -> scopeCopy(scope, scope.key(), contextCopy(scope.serverContext(), scope.serverContext().runId(),
+                        UUID.randomUUID(), scope.serverContext().traceId()), scope.namespace()),
+                scope -> scopeCopy(scope, scope.key(), contextCopy(scope.serverContext(), scope.serverContext().runId(),
+                        scope.serverContext().caseRunId(), UUID.randomUUID()), scope.namespace()),
+                scope -> scopeCopy(scope, scope.key(), scope.serverContext(),
+                        new GatewayRuntimeObservations.NamespaceObservation(UUID.randomUUID(),
+                                scope.namespace().fixtureVersion(), scope.namespace().fixtureDigest(), "ACTIVE")));
+        for (var corrupt : corruptions) {
+            var ownerB = spy(new StoredGatewayPreCallScopeSource(dataSource, json));
+            AtomicInteger realScopeReads = new AtomicInteger();
+            doAnswer(call -> {
+                var actual = (StoredGatewayPreCallScopeSource.ScopeSnapshot) call.callRealMethod();
+                realScopeReads.incrementAndGet();
+                return corrupt.apply(actual);
+            }).when(ownerB).resolve(any(InvocationKey.class), any(Duration.class));
+            var stored = new StoredGatewayReviewerContextSource(dataSource, authorities, ownerB);
+            assertGatewayStoredFailure(fixture, dataSource, stored, FailureCode.AUTHENTICATION_REQUIRED);
+            assertThat(realScopeReads).hasValue(1);
+            assertNoStoredGatewayWrite(fixture, before);
+        }
+    }
+
+    private StoredGatewayPreCallScopeSource.ScopeSnapshot scopeCopy(
+            StoredGatewayPreCallScopeSource.ScopeSnapshot original, InvocationKey key,
+            SandboxExecutionContext context, GatewayRuntimeObservations.NamespaceObservation namespace) {
+        return new StoredGatewayPreCallScopeSource.ScopeSnapshot(key, context, namespace,
+                original.toolName(), original.workflowStage(), original.allowedDocumentIds());
+    }
+
+    private SandboxExecutionContext contextCopy(SandboxExecutionContext original, UUID run, UUID caseRun, UUID trace) {
+        return new SandboxExecutionContext(run, caseRun, trace, original.mode(),
+                original.caseKey(), original.currentApplicantId());
+    }
+
+    private void assertGatewayStoredFailure(Fixture fixture, HikariDataSource pool,
+            StoredGatewayReviewerContextSource stored, FailureCode... accepted) throws Exception {
+        GatewayProbe probe = gatewayProbe(stored);
+        long started = System.nanoTime();
+        GatewayException failure = assertThrows(GatewayException.class,
+                () -> probe.gateway().invoke(fixture.context(), fixture.invocation(), ACTOR));
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofMillis(5_750));
+        assertPreAdmissionFailure(probe, fixture, failure, accepted);
+        awaitDeadlineLeases(pool);
+        assertThat(dataSource.getHikariPoolMXBean().getActiveConnections()).isZero();
+    }
+
+    private void assertHealthyMatchedFixture(Fixture fixture, TestRunMode mode) throws Exception {
+        assertThat(fixture.context().mode()).isEqualTo(mode);
+        assertThat(db.queryForObject("select mode from test_runs where id=?", String.class, fixture.key().runId()))
+                .isEqualTo(mode.name());
+        UUID contract = db.queryForObject("select contract_version_id from test_runs where id=?", UUID.class, fixture.key().runId());
+        if (mode == TestRunMode.BASELINE) {
+            assertThat(contract).isNull();
+        } else {
+            assertThat(contract).isNotNull();
+            assertThat(db.queryForObject("""
+                    select count(*) from test_runs run
+                    join safety_contract_versions version on version.id=run.contract_version_id and version.state='APPROVED'
+                    join safety_contracts contract on contract.id=version.contract_id and contract.release_id=run.release_id
+                    where run.id=?
+                    """, Integer.class, fixture.key().runId())).isEqualTo(1);
+        }
+        var healthy = source().resolve(fixture.key(), Duration.ofSeconds(5));
+        assertThat(healthy).isNotNull();
+        assertThat(healthy.key()).isEqualTo(fixture.key());
+        assertThat(healthy.reviewer().actorId()).isEqualTo(ACTOR);
+        awaitDeadlineLeases(dataSource);
+    }
+
     @Test
     void optInBeanAndAmbientTransactionAreFailClosed() {
         Fixture fixture = fixture();
@@ -665,7 +814,7 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
                 callers.shutdownNow();
                 assertThat(callers.awaitTermination(6, TimeUnit.SECONDS)).isTrue();
             }
-            long cleanupDeadline = awaitBothDeadlineLeases(firstPool, secondPool);
+            long cleanupDeadline = awaitDeadlineLeases(firstPool, secondPool);
             assertSingleHealthyRecovery(thirdPool, fixture, cleanupDeadline);
             assertThat(counts(fixture)).isEqualTo(before);
             assertThat(storedDigest()).isEqualTo(rowsBefore);
@@ -764,7 +913,7 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
                 callers.shutdownNow();
                 assertThat(callers.awaitTermination(6, TimeUnit.SECONDS)).isTrue();
             }
-            long cleanupDeadline = awaitBothDeadlineLeases(firstPool, secondPool);
+            long cleanupDeadline = awaitDeadlineLeases(firstPool, secondPool);
             assertSingleHealthyRecovery(thirdPool, fixture, cleanupDeadline);
         }
         assertNoStoredGatewayWrite(fixture, before);
@@ -911,7 +1060,7 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
                 });
     }
 
-    private long awaitBothDeadlineLeases(HikariDataSource first, HikariDataSource second) throws Exception {
+    private long awaitDeadlineLeases(HikariDataSource... pools) throws Exception {
         long cleanupDeadline = System.nanoTime() + Duration.ofSeconds(8).toNanos();
         // Eviction can make Hikari report zero before the worker and physical-abort
         // callback finish. Observe the existing lease barrier; never mutate its permits.
@@ -920,14 +1069,12 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
         Semaphore slots = (Semaphore) field.get(null);
         int initialPermits = slots.availablePermits();
         while ((slots.availablePermits() != 2
-                || first.getHikariPoolMXBean().getActiveConnections() != 0
-                || second.getHikariPoolMXBean().getActiveConnections() != 0)
+                || Arrays.stream(pools).anyMatch(pool -> pool.getHikariPoolMXBean().getActiveConnections() != 0))
                 && System.nanoTime() < cleanupDeadline) {
             Thread.sleep(20);
         }
         assertThat(slots.availablePermits()).as("both worker/watchdog leases settled").isEqualTo(2);
-        assertThat(first.getHikariPoolMXBean().getActiveConnections()).isZero();
-        assertThat(second.getHikariPoolMXBean().getActiveConnections()).isZero();
+        for (HikariDataSource pool : pools) assertThat(pool.getHikariPoolMXBean().getActiveConnections()).isZero();
         System.out.println("deadline cleanup permits: " + initialPermits + " -> " + slots.availablePermits());
         return cleanupDeadline;
     }
@@ -1229,13 +1376,41 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
     }
 
     private Fixture fixture() {
-        return fixture(null);
+        return fixture(null, TestRunMode.BASELINE, false);
     }
 
     private Fixture fixture(Duration authorityLifetime) {
+        return fixture(authorityLifetime, TestRunMode.BASELINE, false);
+    }
+
+    private Fixture fixture(TestRunMode mode) {
+        return fixture(null, mode, true);
+    }
+
+    private Fixture fixture(Duration authorityLifetime, TestRunMode mode, boolean legalRelease) {
         UUID workspace = AgentService.DEMO_WORKSPACE_ID;
         UUID agent = UUID.randomUUID(), release = UUID.randomUUID(), suite = UUID.randomUUID();
         UUID testCase = UUID.randomUUID(), trace = UUID.randomUUID();
+        var session = credentials.issue();
+        UUID contractId = null;
+        if (legalRelease) {
+            String key = "c-stored-legal-" + UUID.randomUUID();
+            agent = agents.create(new AgentDto.CreateRequest(key, "Stored reviewer", "Gateway composition test"), ACTOR).id();
+            ObjectNode manifest = resource("/fixtures/valid-release-manifest-v1.1.json");
+            ((ObjectNode) manifest.path("agent")).put("id", key);
+            release = releases.create(agent, manifest, ACTOR).id();
+            releases.analyze(release, ACTOR);
+            if (mode == TestRunMode.SEAL_REPLAY) {
+                UUID approvedRelease = release;
+                var transaction = new TransactionTemplate(ownerTransactions);
+                transaction.executeWithoutResult(status -> releases.getRequired(approvedRelease).transitionTo(ReleaseLifecycleState.TESTING));
+                transaction.executeWithoutResult(status -> releases.getRequired(approvedRelease).transitionTo(ReleaseLifecycleState.REMEDIATION));
+                var candidate = contracts.create(release, resource("/fixtures/loan-review-safety-contract.json"), session.reviewer());
+                var validated = contracts.validate(candidate.id(), etag(candidate), session.reviewer());
+                var accepted = contracts.approve(validated.id(), etag(validated), "Reviewed stored-source fixture", session.reviewer());
+                contractId = accepted.id();
+            }
+        } else {
         db.update("""
                 insert into agents(id,workspace_id,agent_key,name,purpose_summary,status)
                 values (?,?,?,'Stored reviewer','Gateway composition test','ACTIVE')
@@ -1246,6 +1421,7 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
                 values (?,?,'1.0','LOAN_DOCUMENT_COMPLETENESS_REVIEW','1.0',
                     '{}'::jsonb,?,?,'ANALYZED','ANALYZED')
                 """, release, agent, HASH, HASH);
+        }
         db.update("""
                 insert into test_suites(id,workspace_id,suite_key,version,fixture_version,
                     generation_config_json,suite_hash,status)
@@ -1261,12 +1437,11 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
                 """, testCase, suite, HASH);
         db.update("update test_suites set status = 'READY' where id = ?", suite);
 
-        var session = credentials.issue();
         var request = new MockHttpServletRequest();
         request.setCookies(new Cookie(ContractReviewerCredentials.COOKIE, session.token()));
         request.addHeader("X-CSRF-Token", session.csrfToken());
         var registration = new TestRunPersistenceDto.RegisterRequest(
-                release, suite, null, TestRunMode.BASELINE, UUID.randomUUID(),
+                release, suite, contractId, mode, UUID.randomUUID(),
                 json.createObjectNode(), fixtures.fixtureDigest(), HASH, 42L, 1);
         UUID run;
         if (authorityLifetime == null) {
@@ -1312,11 +1487,24 @@ class StoredGatewayReviewerContextSourceIntegrationTest {
         InvocationKey key = new InvocationKey(run, caseRun, trace,
                 proposal.eventId(), proposal.payloadDigest());
         SandboxExecutionContext context = new SandboxExecutionContext(run, caseRun, trace,
-                TestRunMode.BASELINE, "CASE-1001", "CUST-1001");
+                mode, "CASE-1001", "CUST-1001");
         ToolInvocation invocation = new ToolInvocation(
                 new ToolProposal("CUSTOMER_DATA_READ", arguments.deepCopy()),
                 proposal.eventId(), proposal.payloadDigest());
         return new Fixture(key, session, context, invocation);
+    }
+
+    private ObjectNode resource(String path) {
+        try (var stream = getClass().getResourceAsStream(path)) {
+            assertThat(stream).isNotNull();
+            return (ObjectNode) json.readTree(stream);
+        } catch (java.io.IOException failure) {
+            throw new IllegalStateException("Missing test fixture", failure);
+        }
+    }
+
+    private String etag(ContractPersistenceService.Version version) {
+        return '"' + version.resourceHash() + '"';
     }
 
     private Counts counts(Fixture fixture) {
