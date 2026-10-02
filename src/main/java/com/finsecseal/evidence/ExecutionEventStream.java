@@ -61,12 +61,13 @@ public class ExecutionEventStream {
                     }
                     history = eventService.history(runId, cursor, 1000);
                 }
-            } catch (RuntimeException | IOException exception) {
+            } catch (IOException exception) {
+                remove(runId, emitter);
+                throw new IllegalStateException("SSE replay failed", exception);
+            } catch (RuntimeException exception) {
                 remove(runId, emitter);
                 emitter.completeWithError(exception);
-                throw exception instanceof RuntimeException runtimeException
-                        ? runtimeException
-                        : new IllegalStateException("SSE replay failed", exception);
+                throw exception;
             }
             return emitter;
         }
@@ -82,7 +83,9 @@ public class ExecutionEventStream {
             for (SseEmitter emitter : Set.copyOf(runSubscribers)) {
                 try {
                     send(emitter, event);
-                } catch (IOException | IllegalStateException exception) {
+                } catch (IOException exception) {
+                    remove(event.runId(), emitter);
+                } catch (IllegalStateException exception) {
                     remove(event.runId(), emitter);
                     emitter.completeWithError(exception);
                 }
@@ -98,7 +101,9 @@ public class ExecutionEventStream {
                 for (SseEmitter emitter : Set.copyOf(runSubscribers)) {
                     try {
                         emitter.send(SseEmitter.event().name("heartbeat").comment("keep-alive"));
-                    } catch (IOException | IllegalStateException exception) {
+                    } catch (IOException exception) {
+                        remove(runId, emitter);
+                    } catch (IllegalStateException exception) {
                         remove(runId, emitter);
                         emitter.completeWithError(exception);
                     }
