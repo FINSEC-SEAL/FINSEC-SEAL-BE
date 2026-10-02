@@ -44,6 +44,38 @@ import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ObjectNode;
 
+// BEGIN A_SSE_PG_ADDITIVE_IMPORTS
+import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import java.io.IOException;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import javax.sql.DataSource;
+import org.mockito.stubbing.Answer;
+import org.springframework.aop.support.AopUtils;
+import org.springframework.jdbc.core.ConnectionCallback;
+import org.springframework.jdbc.datasource.ConnectionHolder;
+import org.springframework.jdbc.datasource.DataSourceUtils;
+import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+// END A_SSE_PG_ADDITIVE_IMPORTS
+
 @Testcontainers
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         "finsec.contract-access.key=test-reviewer-key-at-least-32-bytes-long",
@@ -92,6 +124,14 @@ class EventEvidenceIntegrationTest {
 
     @LocalServerPort
     int port;
+
+    // BEGIN A_SSE_PG_ADDITIVE_FIELDS
+    @Autowired
+    ExecutionEventStream executionEventStream;
+
+    @Autowired
+    PlatformTransactionManager eventTransactions;
+    // END A_SSE_PG_ADDITIVE_FIELDS
 
     @Test
     void persistsRedactsChainsAuditsAndSealsExecutionEvidence() {
@@ -945,4 +985,253 @@ class EventEvidenceIntegrationTest {
                 .isInstanceOfSatisfying(java.sql.SQLException.class, exception ->
                         assertThat(exception.getSQLState()).isEqualTo(expected));
     }
+
+    // BEGIN A_SSE_PG_ADDITIVE_CONTROLS
+    @Test
+    void commitsOwnOutboxDeliveryAfterIoDisconnectAndDoesNotRepublishIt() throws Exception {
+        Seed seed = seedRun();
+        ExecutionEventDto.Event started = appendPgControlEvent(seed, ExecutionEventType.RUN_STARTED);
+        PgEvidenceState evidence = pgEvidenceState(seed.runId());
+        Map<String, Object> pending = pgOutboxRow(started.eventId());
+        assertThat(pending.get("published_at")).isNull();
+        SseEmitter first = mock(SseEmitter.class);
+        SseEmitter second = mock(SseEmitter.class);
+        AtomicReference<SseEmitter> fault = new AtomicReference<>();
+        AtomicReference<PgTxObservation> outer = new AtomicReference<>();
+        List<ExecutionEventDto.Event> healthy = new ArrayList<>();
+        Answer<Void> delivery = invocation -> {
+            ExecutionEventDto.Event actual = pgEventFrom(invocation.getArgument(0));
+            assertThat(actual).isEqualTo(started);
+            assertSamePgTransaction(outer.get(), observePgTransaction());
+            SseEmitter emitter = (SseEmitter) invocation.getMock();
+            if (fault.compareAndSet(null, emitter)) {
+                throw new IOException("owned disconnected subscriber");
+            }
+            healthy.add(actual);
+            return null;
+        };
+        doAnswer(delivery).when(first).send(any(SseEmitter.SseEventBuilder.class));
+        doAnswer(delivery).when(second).send(any(SseEmitter.SseEventBuilder.class));
+        try (PgOwnedSubscribers owned = registerPgSubscribers(seed.runId(), first, second)) {
+            writablePgTransaction().executeWithoutResult(status -> {
+                outer.set(observePgTransaction());
+                outboxPublisher.publishPending();
+                assertThat(fault.get()).isNotNull();
+                assertThat(healthy).containsExactly(started);
+                assertThat(owned.emitters()).doesNotContain(fault.get()).hasSize(1);
+                assertPgMarked(pending, pgOutboxRow(started.eventId()));
+            });
+            assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
+            assertPgMarked(pending, pgOutboxRow(started.eventId()));
+            String committed = pgOutboxWholeRow(started.eventId());
+            assertThat(pgEvidenceState(seed.runId())).isEqualTo(evidence);
+            outboxPublisher.publishPending();
+            assertThat(pgOutboxWholeRow(started.eventId())).isEqualTo(committed);
+            assertThat(healthy).containsExactly(started);
+            verify(first, times(1)).send(any(SseEmitter.SseEventBuilder.class));
+            verify(second, times(1)).send(any(SseEmitter.SseEventBuilder.class));
+            verify(first, never()).completeWithError(any());
+            verify(second, never()).completeWithError(any());
+            printPgControl("normal-io-commit-repeat", seed, started.eventId(), outer.get(), Map.of(
+                    "ownSelected", true, "healthyDeliveries", healthy.size(), "ioCompletions", 0,
+                    "publishedAttemptsBefore", pending.get("publish_attempts"),
+                    "publishedAttemptsAfter", pgOutboxRow(started.eventId()).get("publish_attempts"),
+                    "repeatWholeRowUnchanged", true, "evidenceUnchanged", true));
+        }
+    }
+
+    @Test
+    void rollsBackOwnEventAndEveryPendingMarkWhenPublishThrowsRawRuntime() throws Exception {
+        assertPgRollbackForRawFault(new IllegalArgumentException("owned raw runtime"));
+    }
+
+    @Test
+    void rollsBackOwnEventAndEveryPendingMarkWhenPublishThrowsRawError() throws Exception {
+        assertPgRollbackForRawFault(new AssertionError("owned raw error"));
+    }
+
+    private void assertPgRollbackForRawFault(Throwable fault) throws Exception {
+        Seed seed = seedRun();
+        ExecutionEventDto.Event started = appendPgControlEvent(seed, ExecutionEventType.RUN_STARTED);
+        PgEvidenceState evidence = pgEvidenceState(seed.runId());
+        List<String> committedOutbox = pgAllOutboxWholeRows();
+        Map<String, Object> pendingStarted = pgOutboxRow(started.eventId());
+        assertThat(pendingStarted.get("published_at")).isNull();
+        AtomicReference<UUID> newId = new AtomicReference<>();
+        AtomicReference<PgTxObservation> outer = new AtomicReference<>();
+        AtomicReference<PgTxObservation> callback = new AtomicReference<>();
+        AtomicInteger startedSends = new AtomicInteger();
+        AtomicInteger faultSends = new AtomicInteger();
+        SseEmitter emitter = mock(SseEmitter.class);
+        doAnswer(invocation -> {
+            ExecutionEventDto.Event event = pgEventFrom(invocation.getArgument(0));
+            if (event.eventId().equals(started.eventId())) {
+                startedSends.incrementAndGet();
+                return null;
+            }
+            assertThat(event.eventId()).isEqualTo(newId.get());
+            assertThat(event.eventType()).isEqualTo(ExecutionEventType.MODEL_REQUEST);
+            assertThat(startedSends.get()).isEqualTo(1);
+            assertPgMarked(pendingStarted, pgOutboxRow(started.eventId()));
+            callback.set(observePgTransaction());
+            assertSamePgTransaction(outer.get(), callback.get());
+            faultSends.incrementAndGet();
+            throw fault;
+        }).when(emitter).send(any(SseEmitter.SseEventBuilder.class));
+        try (PgOwnedSubscribers owned = registerPgSubscribers(seed.runId(), emitter)) {
+            Throwable thrown = catchThrowable(() -> writablePgTransaction().executeWithoutResult(status -> {
+                outer.set(observePgTransaction());
+                newId.set(appendPgControlEvent(seed, ExecutionEventType.MODEL_REQUEST).eventId());
+                outboxPublisher.publishPending();
+            }));
+            assertThat(thrown).isSameAs(fault);
+            assertThat(newId.get()).isNotNull();
+            assertThat(faultSends.get()).isEqualTo(1);
+            assertThat(callback.get()).isNotNull();
+            assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
+            assertThat(jdbcTemplate.queryForObject("select count(*) from execution_events where id = ?", Integer.class, newId.get())).isZero();
+            assertThat(jdbcTemplate.queryForObject("select count(*) from event_outbox where event_id = ?", Integer.class, newId.get())).isZero();
+            assertThat(jdbcTemplate.queryForObject("select count(*) from audit_records where resource_type = 'EXECUTION_EVENT' and resource_id = ?", Integer.class, newId.get())).isZero();
+            assertThat(pgEvidenceState(seed.runId())).isEqualTo(evidence);
+            assertThat(pgAllOutboxWholeRows()).isEqualTo(committedOutbox);
+            verify(emitter, times(2)).send(any(SseEmitter.SseEventBuilder.class));
+            verify(emitter, never()).completeWithError(any());
+            printPgControl("outer-rollback-" + fault.getClass().getSimpleName(), seed, newId.get(), callback.get(), Map.of(
+                    "startedSendBeforeFault", startedSends.get(), "startedMarkedBeforeFault", true,
+                    "ownNewFaultCallbacks", faultSends.get(), "sameCallerThrowable", true,
+                    "newEventOutboxAuditRows", 0, "committedGlobalRowsRestored", committedOutbox.size(),
+                    "ownEvidenceRestored", true));
+        }
+    }
+
+    private ExecutionEventDto.Event appendPgControlEvent(Seed seed, ExecutionEventType type) {
+        return eventService.append(seed.runId(), new ExecutionEventDto.AppendRequest(
+                null, UUID.randomUUID(), type, null,
+                objectMapper.createObjectNode().put("email", "sse-pg@example.test"), null, null,
+                "BASELINE", objectMapper.createObjectNode().put("scope", "A_SSE_PG_TEST")), "runtime-b");
+    }
+
+    private TransactionTemplate writablePgTransaction() {
+        assertThat(AopUtils.isAopProxy(eventService)).isTrue();
+        assertThat(AopUtils.isAopProxy(auditService)).isTrue();
+        assertThat(AopUtils.isAopProxy(outboxPublisher)).isTrue();
+        TransactionTemplate transaction = new TransactionTemplate(eventTransactions);
+        transaction.setReadOnly(false);
+        return transaction;
+    }
+
+    private PgTxObservation observePgTransaction() {
+        assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isTrue();
+        assertThat(TransactionSynchronizationManager.isSynchronizationActive()).isTrue();
+        assertThat(TransactionSynchronizationManager.isCurrentTransactionReadOnly()).isFalse();
+        DataSource dataSource = Objects.requireNonNull(jdbcTemplate.getDataSource());
+        return jdbcTemplate.execute((ConnectionCallback<PgTxObservation>) connection -> {
+            Object resource = TransactionSynchronizationManager.getResource(dataSource);
+            assertThat(resource).isInstanceOf(ConnectionHolder.class);
+            Connection bound = ((ConnectionHolder) resource).getConnection();
+            Connection target = DataSourceUtils.getTargetConnection(connection);
+            assertThat(target).isSameAs(DataSourceUtils.getTargetConnection(bound));
+            assertThat(DataSourceUtils.isConnectionTransactional(bound, dataSource)).isTrue();
+            assertThat(connection.getAutoCommit()).isFalse();
+            assertThat(bound.getAutoCommit()).isFalse();
+            int callbackPid = pgBackendPid(connection);
+            assertThat(callbackPid).isEqualTo(pgBackendPid(bound));
+            return new PgTxObservation(eventTransactions.getClass().getName(),
+                    System.identityHashCode(eventTransactions), target, callbackPid);
+        });
+    }
+
+    private int pgBackendPid(Connection connection) throws SQLException {
+        try (var statement = connection.createStatement(); var result = statement.executeQuery("select pg_backend_pid()")) {
+            assertThat(result.next()).isTrue();
+            return result.getInt(1);
+        }
+    }
+
+    private void assertSamePgTransaction(PgTxObservation expected, PgTxObservation actual) {
+        assertThat(expected).isNotNull();
+        assertThat(actual.managerClass()).isEqualTo(expected.managerClass());
+        assertThat(actual.managerIdentity()).isEqualTo(expected.managerIdentity());
+        assertThat(actual.target()).isSameAs(expected.target());
+        assertThat(actual.backendPid()).isEqualTo(expected.backendPid());
+    }
+
+    private ExecutionEventDto.Event pgEventFrom(SseEmitter.SseEventBuilder builder) {
+        return builder.build().stream().map(SseEmitter.DataWithMediaType::getData)
+                .filter(ExecutionEventDto.Event.class::isInstance).map(ExecutionEventDto.Event.class::cast)
+                .findFirst().orElseThrow();
+    }
+
+    @SuppressWarnings("unchecked")
+    private PgOwnedSubscribers registerPgSubscribers(UUID runId, SseEmitter... emitters) {
+        ConcurrentMap<UUID, Set<SseEmitter>> subscribers = (ConcurrentMap<UUID, Set<SseEmitter>>)
+                ReflectionTestUtils.getField(executionEventStream, "subscribers");
+        assertThat(subscribers).isNotNull();
+        Set<SseEmitter> owned = ConcurrentHashMap.newKeySet();
+        owned.addAll(List.of(emitters));
+        assertThat(subscribers.putIfAbsent(runId, owned)).isNull();
+        return new PgOwnedSubscribers(runId, subscribers, owned, List.of(emitters));
+    }
+
+    private Map<String, Object> pgOutboxRow(UUID eventId) {
+        return jdbcTemplate.queryForMap("select * from event_outbox where event_id = ?", eventId);
+    }
+
+    private void assertPgMarked(Map<String, Object> before, Map<String, Object> marked) {
+        for (String identity : List.of("event_id", "run_id", "sequence", "event_type", "created_at")) {
+            assertThat(marked.get(identity)).isEqualTo(before.get(identity));
+        }
+        assertThat(((Number) marked.get("publish_attempts")).intValue())
+                .isEqualTo(((Number) before.get("publish_attempts")).intValue() + 1);
+        assertThat(marked.get("last_attempt_at")).isNotNull();
+        assertThat(marked.get("published_at")).isNotNull();
+    }
+
+    private String pgOutboxWholeRow(UUID eventId) {
+        return jdbcTemplate.queryForObject("select row_to_json(outbox)::text from event_outbox outbox where event_id = ?", String.class, eventId);
+    }
+
+    private List<String> pgAllOutboxWholeRows() {
+        return jdbcTemplate.queryForList("select row_to_json(outbox)::text from event_outbox outbox order by event_id", String.class);
+    }
+
+    private PgEvidenceState pgEvidenceState(UUID runId) {
+        return new PgEvidenceState(
+                jdbcTemplate.queryForList("select row_to_json(event)::text from execution_events event where run_id = ? order by sequence", String.class, runId),
+                jdbcTemplate.queryForList("select row_to_json(audit)::text from audit_records audit where resource_type = 'EXECUTION_EVENT' and resource_id in (select id from execution_events where run_id = ?) order by id", String.class, runId),
+                jdbcTemplate.queryForList("select row_to_json(counter)::text from run_event_counters counter where run_id = ?", String.class, runId),
+                jdbcTemplate.queryForObject("select row_to_json(run)::text from test_runs run where id = ?", String.class, runId),
+                eventService.history(runId, 0, 100), eventService.verifyChain(runId));
+    }
+
+    private void printPgControl(String control, Seed seed, UUID eventId, PgTxObservation transaction,
+                                Map<String, Object> result) throws Exception {
+        System.out.println("A_SSE_PG_CONTROL " + objectMapper.writeValueAsString(Map.of(
+                "control", control, "runId", seed.runId(), "eventId", eventId,
+                "managerClass", transaction.managerClass(), "managerIdentity", transaction.managerIdentity(),
+                "targetIdentity", System.identityHashCode(transaction.target()), "backendPid", transaction.backendPid(),
+                "activeWritableSameJdbc", true, "result", result)));
+    }
+
+    private record PgTxObservation(String managerClass, int managerIdentity, Connection target, int backendPid) {
+    }
+
+    private record PgEvidenceState(List<String> events, List<String> audit, List<String> counter,
+                                   String run, ExecutionEventDto.History history,
+                                   ExecutionEventDto.ChainVerification verification) {
+    }
+
+    private record PgOwnedSubscribers(UUID runId, ConcurrentMap<UUID, Set<SseEmitter>> mapping,
+                                      Set<SseEmitter> emitters, List<SseEmitter> identities) implements AutoCloseable {
+        @Override
+        public void close() {
+            for (SseEmitter emitter : identities) {
+                emitters.remove(emitter);
+            }
+            if (emitters.isEmpty()) {
+                mapping.remove(runId, emitters);
+            }
+        }
+    }
+    // END A_SSE_PG_ADDITIVE_CONTROLS
 }
