@@ -76,6 +76,17 @@ import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 // END A_SSE_PG_ADDITIVE_IMPORTS
 
+// BEGIN A_SSE_HTTP_ADDITIVE_IMPORTS
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
+// END A_SSE_HTTP_ADDITIVE_IMPORTS
+
 @Testcontainers
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         "finsec.contract-access.key=test-reviewer-key-at-least-32-bytes-long",
@@ -1234,4 +1245,306 @@ class EventEvidenceIntegrationTest {
         }
     }
     // END A_SSE_PG_ADDITIVE_CONTROLS
+    // BEGIN A_SSE_HTTP_ADDITIVE_CONTROLS
+    @Test
+    void keepsHealthyHttpReaderLiveAfterDisconnectAndReplaysFromHeaderCursor() throws Exception {
+        Seed seed = seedRun();
+        ExecutionEventDto.Event started = eventService.append(seed.runId(), new ExecutionEventDto.AppendRequest(
+                null, UUID.randomUUID(), ExecutionEventType.RUN_STARTED, null,
+                null, null, null, null, objectMapper.createObjectNode()), "runtime-b");
+        Map<String, Object> pendingStarted = pgOutboxRow(started.eventId());
+        outboxPublisher.publishPending();
+        assertPgMarked(pendingStarted, pgOutboxRow(started.eventId()));
+        List<HttpFullFrame> observed = new ArrayList<>();
+        HttpReaders readers = new HttpReaders();
+        try (readers) {
+            HttpReader first = readers.open(seed.runId(), "?after=0", null);
+            HttpReader healthy = readers.open(seed.runId(), "?after=0", null);
+            assertHttpFrame(first.frame(), started, "run.status", observed);
+            assertHttpFrame(healthy.frame(), started, "run.status", observed);
+            awaitHttpRegistration(seed.runId(), 2, Math.min(first.deadline, healthy.deadline));
+            first.closeBodyBeforeDeadline();
+            ExecutionEventDto.Event model = eventService.append(seed.runId(), new ExecutionEventDto.AppendRequest(
+                    null, UUID.randomUUID(), ExecutionEventType.MODEL_REQUEST, null,
+                    objectMapper.createObjectNode().put("customerId", "http-raw-customer"),
+                    null, null, null, objectMapper.createObjectNode()), "runtime-b");
+            assertThat(model.sequence()).isEqualTo(2);
+            assertThat(model.prevEventHash()).isEqualTo(started.eventHash());
+            Map<String, Object> pendingModel = pgOutboxRow(model.eventId());
+            outboxPublisher.publishPending();
+            assertPgMarked(pendingModel, pgOutboxRow(model.eventId()));
+            assertHttpFrame(healthy.frame(), model, "trace.event", observed);
+            assertThat(observed.getLast().data()).contains("[SYNTH_ID:").doesNotContain("http-raw-customer");
+            PgEvidenceState evidence = pgEvidenceState(seed.runId());
+            String startedOutbox = pgOutboxWholeRow(started.eventId());
+            String outbox = pgOutboxWholeRow(model.eventId());
+            HttpReader reconnect = readers.open(seed.runId(), "?after=0", "1");
+            assertHttpFrame(reconnect.frame(), model, "trace.event", observed);
+            assertThat(pgEvidenceState(seed.runId())).isEqualTo(evidence);
+            assertThat(pgOutboxWholeRow(model.eventId())).isEqualTo(outbox);
+            assertThat(pgOutboxWholeRow(started.eventId())).isEqualTo(startedOutbox);
+            assertThat(eventService.verifyChain(seed.runId()).valid()).isTrue();
+        }
+        assertThat(readers.terminated).isTrue();
+        System.out.println("A_SSE_HTTP_CONTROL " + objectMapper.writeValueAsString(Map.of(
+                "control", "twoReadersDisconnectHealthyHeaderReplay", "runId", seed.runId(),
+                "frames", observed, "initialRegistration", 2, "closedBodies", readers.closedBodies.get(),
+                "executorTerminated", readers.terminated, "ownMarked", true, "replayEvidenceUnchanged", true)));
+    }
+
+    @Test
+    void recoversExpiredHttpCursorThroughHistoryAndReceivesNextLiveHeadFrame() throws Exception {
+        Seed seed = seedRun();
+        UUID oldId = insertOldStartedEvent(seed.runId());
+        HttpReaders readers = new HttpReaders();
+        List<HttpFullFrame> observed = new ArrayList<>();
+        long head;
+        try (readers) {
+            HttpResponse<String> expired = readers.rest(seed.runId(), "/events?after=0");
+            assertThat(expired.statusCode()).isEqualTo(410);
+            assertThat(expired.body()).contains("STREAM_CURSOR_EXPIRED");
+            assertThat(httpRegistrations(seed.runId())).isEmpty();
+            HttpResponse<String> historyResponse = readers.rest(seed.runId(), "/event-history?after=0&limit=10");
+            assertThat(historyResponse.statusCode()).isEqualTo(200);
+            JsonNode history = objectMapper.readTree(historyResponse.body()).path("data");
+            ExecutionEventDto.Event old = eventService.history(seed.runId(), 0, 10).items().getFirst();
+            assertThat(old.eventId()).isEqualTo(oldId);
+            assertThat(history.path("items")).isEqualTo(objectMapper.readTree(objectMapper.writeValueAsString(List.of(old))));
+            head = history.path("headSequence").asLong();
+            assertThat(head).isEqualTo(old.sequence()).isEqualTo(1);
+            assertThat(history.has("nextCursor")).isTrue();
+            assertThat(history.path("nextCursor").isNull()).isTrue();
+            HttpResponse<String> verifyResponse = readers.rest(seed.runId(), "/events:verify");
+            assertThat(verifyResponse.statusCode()).isEqualTo(200);
+            JsonNode verification = objectMapper.readTree(verifyResponse.body()).path("data");
+            assertThat(verification.path("valid").asBoolean()).isTrue();
+            assertThat(verification.path("headHash").asString()).isEqualTo(old.eventHash());
+            Map<String, Object> pendingOld = pgOutboxRow(oldId);
+            outboxPublisher.publishPending();
+            assertPgMarked(pendingOld, pgOutboxRow(oldId));
+            HttpReader recovered = readers.open(seed.runId(), "?after=" + head, null);
+            awaitHttpRegistration(seed.runId(), 1, recovered.deadline);
+            ExecutionEventDto.Event model = eventService.append(seed.runId(), new ExecutionEventDto.AppendRequest(
+                    null, UUID.randomUUID(), ExecutionEventType.MODEL_REQUEST, null,
+                    null, null, null, null, objectMapper.createObjectNode()), "runtime-b");
+            assertThat(model.sequence()).isEqualTo(head + 1);
+            assertThat(model.prevEventHash()).isEqualTo(old.eventHash());
+            Map<String, Object> pendingModel = pgOutboxRow(model.eventId());
+            outboxPublisher.publishPending();
+            assertPgMarked(pendingModel, pgOutboxRow(model.eventId()));
+            assertHttpFrame(recovered.frame(), model, "trace.event", observed);
+            HttpResponse<String> extendedHistory = readers.rest(seed.runId(), "/event-history?after=" + head + "&limit=10");
+            assertThat(extendedHistory.statusCode()).isEqualTo(200);
+            JsonNode extended = objectMapper.readTree(extendedHistory.body()).path("data");
+            assertThat(extended.path("items")).isEqualTo(objectMapper.readTree(objectMapper.writeValueAsString(List.of(model))));
+            assertThat(extended.path("headSequence").asLong()).isEqualTo(model.sequence());
+            assertThat(extended.path("nextCursor").isNull()).isTrue();
+            assertThat(eventService.history(seed.runId(), 0, 10).items().getFirst()).isEqualTo(old);
+            HttpResponse<String> extendedVerify = readers.rest(seed.runId(), "/events:verify");
+            assertThat(extendedVerify.statusCode()).isEqualTo(200);
+            JsonNode chain = objectMapper.readTree(extendedVerify.body()).path("data");
+            assertThat(chain.path("valid").asBoolean()).isTrue();
+            assertThat(chain.path("headHash").asString()).isEqualTo(model.eventHash());
+        }
+        assertThat(readers.terminated).isTrue();
+        System.out.println("A_SSE_HTTP_CONTROL " + objectMapper.writeValueAsString(Map.of(
+                "control", "expiredHistoryHeadReconnectLive", "runId", seed.runId(), "oldEventId", oldId,
+                "historyHead", head, "frames", observed, "closedBodies", readers.closedBodies.get(),
+                "executorTerminated", readers.terminated, "expiredStatus", 410, "oldAndNewOwnMarked", true)));
+    }
+
+    private void assertHttpFrame(HttpFullFrame actual, ExecutionEventDto.Event expected, String event,
+                                 List<HttpFullFrame> observed) throws Exception {
+        assertThat(actual.id()).isEqualTo(Long.toString(expected.sequence()));
+        assertThat(actual.event()).isEqualTo(event);
+        assertThat(objectMapper.readTree(actual.data())).isEqualTo(objectMapper.readTree(objectMapper.writeValueAsString(expected)));
+        observed.add(actual);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Set<SseEmitter> httpRegistrations(UUID runId) {
+        ConcurrentMap<UUID, Set<SseEmitter>> mapping = (ConcurrentMap<UUID, Set<SseEmitter>>)
+                ReflectionTestUtils.getField(executionEventStream, "subscribers");
+        assertThat(mapping).isNotNull();
+        Set<SseEmitter> registered = mapping.get(runId);
+        return registered == null ? Set.of() : Set.copyOf(registered);
+    }
+
+    private void awaitHttpRegistration(UUID runId, int count, long deadline) throws Exception {
+        while (httpRegistrations(runId).size() != count) {
+            LockSupport.parkNanos(Math.min(TimeUnit.MILLISECONDS.toNanos(5), httpRemaining(deadline)));
+        }
+        httpRemaining(deadline);
+    }
+
+    private long httpRemaining(long deadline) throws java.util.concurrent.TimeoutException {
+        long remaining = deadline - System.nanoTime();
+        if (remaining <= 0) {
+            throw new java.util.concurrent.TimeoutException("Owned HTTP deadline expired");
+        }
+        return remaining;
+    }
+
+    private record HttpFullFrame(String id, String event, String data) {
+    }
+
+    private final class HttpReaders implements AutoCloseable {
+        final HttpClient client = HttpClient.newHttpClient();
+        final ExecutorService executor = Executors.newCachedThreadPool();
+        final List<HttpReader> readers = new ArrayList<>();
+        final List<Future<?>> frameTasks = new ArrayList<>();
+        final AtomicInteger closedBodies = new AtomicInteger();
+        boolean terminated;
+
+        HttpReader open(UUID runId, String query, String lastEventId) {
+            HttpReader reader = new HttpReader(this, runId, query, lastEventId);
+            readers.add(reader);
+            return reader;
+        }
+
+        HttpResponse<String> rest(UUID runId, String suffix) throws Exception {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            CompletableFuture<HttpResponse<String>> response = client.sendAsync(HttpRequest.newBuilder(
+                    URI.create("http://localhost:" + port + "/api/v1/test-runs/" + runId + suffix))
+                    .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
+            try {
+                return response.get(httpRemaining(deadline), TimeUnit.NANOSECONDS);
+            } finally {
+                response.cancel(true);
+            }
+        }
+
+        @Override
+        public void close() throws Exception {
+            long cleanupDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            try {
+                for (HttpReader reader : readers) {
+                    reader.closed.set(true);
+                    reader.response.cancel(true);
+                }
+                for (HttpReader reader : readers) {
+                    reader.admitted.get(httpRemaining(cleanupDeadline), TimeUnit.NANOSECONDS);
+                    reader.scheduleBodyClose();
+                }
+                for (Future<?> task : frameTasks) {
+                    task.cancel(true);
+                }
+                for (HttpReader reader : readers) {
+                    Future<?> close = reader.bodyClose.get();
+                    if (close != null) {
+                        close.get(httpRemaining(cleanupDeadline), TimeUnit.NANOSECONDS);
+                    }
+                }
+            } finally {
+                executor.shutdownNow();
+                terminated = executor.awaitTermination(httpRemaining(cleanupDeadline), TimeUnit.NANOSECONDS);
+                assertThat(terminated).isTrue();
+            }
+        }
+    }
+
+    private final class HttpReader {
+        final HttpReaders owner;
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        final AtomicBoolean closed = new AtomicBoolean();
+        final AtomicBoolean closeScheduled = new AtomicBoolean();
+        final AtomicReference<InputStream> body = new AtomicReference<>();
+        final AtomicReference<Future<?>> bodyClose = new AtomicReference<>();
+        final CompletableFuture<Void> admitted = new CompletableFuture<>();
+        final CompletableFuture<HttpResponse<InputStream>> response;
+        BufferedReader lines;
+
+        HttpReader(HttpReaders owner, UUID runId, String query, String lastEventId) {
+            this.owner = owner;
+            HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(
+                    "http://localhost:" + port + "/api/v1/test-runs/" + runId + "/events" + query))
+                    .timeout(Duration.ofSeconds(5)).header("Accept", "text/event-stream");
+            if (lastEventId != null) {
+                request.header("Last-Event-ID", lastEventId);
+            }
+            response = owner.client.sendAsync(request.GET().build(), HttpResponse.BodyHandlers.ofInputStream());
+            response.whenComplete((actual, failure) -> {
+                try {
+                    if (actual != null) {
+                        body.set(actual.body());
+                        if (closed.get()) {
+                            scheduleBodyClose();
+                        }
+                    }
+                    admitted.complete(null);
+                } catch (RuntimeException exception) {
+                    admitted.completeExceptionally(exception);
+                }
+            });
+        }
+
+        void scheduleBodyClose() {
+            InputStream owned = body.get();
+            if (owned != null && closeScheduled.compareAndSet(false, true)) {
+                bodyClose.set(owner.executor.submit(() -> {
+                    try {
+                        owned.close();
+                        owner.closedBodies.incrementAndGet();
+                    } catch (IOException exception) {
+                        throw new UncheckedIOException(exception);
+                    }
+                }));
+            }
+        }
+
+        void closeBodyBeforeDeadline() throws Exception {
+            closed.set(true);
+            response.cancel(true);
+            admitted.get(httpRemaining(deadline), TimeUnit.NANOSECONDS);
+            scheduleBodyClose();
+            assertThat(bodyClose.get()).isNotNull();
+            bodyClose.get().get(httpRemaining(deadline), TimeUnit.NANOSECONDS);
+        }
+
+        HttpFullFrame frame() throws Exception {
+            HttpResponse<InputStream> actual = response.get(httpRemaining(deadline), TimeUnit.NANOSECONDS);
+            admitted.get(httpRemaining(deadline), TimeUnit.NANOSECONDS);
+            assertThat(actual.statusCode()).isEqualTo(200);
+            assertThat(actual.headers().firstValue("content-type").orElse("")).startsWith("text/event-stream");
+            assertThat(actual.headers().firstValue("cache-control")).contains("no-cache");
+            assertThat(body.get()).isSameAs(actual.body());
+            if (lines == null) {
+                lines = new BufferedReader(new InputStreamReader(body.get(), StandardCharsets.UTF_8));
+            }
+            Future<HttpFullFrame> next = owner.executor.submit(() -> {
+                String id = null;
+                String event = null;
+                String data = null;
+                for (int count = 0; count < 64; count++) {
+                    String line = lines.readLine();
+                    if (line == null) {
+                        throw new IOException("EOF before complete owned SSE frame");
+                    }
+                    if (line.isEmpty()) {
+                        if (id == null && event == null && data == null) {
+                            continue;
+                        }
+                        if (id == null || event == null || data == null) {
+                            throw new IOException("Incomplete owned SSE frame");
+                        }
+                        return new HttpFullFrame(id, event, data);
+                    }
+                    if (line.startsWith("id:")) {
+                        id = line.substring(3).stripLeading();
+                    } else if (line.startsWith("event:")) {
+                        event = line.substring(6).stripLeading();
+                    } else if (line.startsWith("data:")) {
+                        if (data != null || line.length() > 65536) {
+                            throw new IOException("Unexpected owned SSE data shape");
+                        }
+                        data = line.substring(5).stripLeading();
+                    }
+                }
+                throw new IOException("No complete owned SSE frame within line bound");
+            });
+            owner.frameTasks.add(next);
+            return next.get(httpRemaining(deadline), TimeUnit.NANOSECONDS);
+        }
+    }
+    // END A_SSE_HTTP_ADDITIVE_CONTROLS
 }
