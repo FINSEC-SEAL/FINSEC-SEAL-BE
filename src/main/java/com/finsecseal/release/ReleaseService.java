@@ -2,6 +2,7 @@ package com.finsecseal.release;
 
 import com.finsecseal.agent.AgentEntity;
 import com.finsecseal.agent.AgentService;
+import com.finsecseal.audit.AuditDto;
 import com.finsecseal.audit.AuditService;
 import com.finsecseal.audit.PromptAccessAuditService;
 import com.finsecseal.common.api.BusinessException;
@@ -53,6 +54,7 @@ public class ReleaseService {
     private final AuditService auditService;
     private final PromptAccessAuditService promptAccessAuditService;
     private final ReleaseIntegrityVerifier integrityVerifier;
+    private final CommittedReleaseAuditPublisher committedAuditPublisher;
 
     public ReleaseService(
             AgentService agentService,
@@ -67,7 +69,8 @@ public class ReleaseService {
             DecisionInvalidationWriter invalidationWriter,
             AuditService auditService,
             PromptAccessAuditService promptAccessAuditService,
-            ReleaseIntegrityVerifier integrityVerifier
+            ReleaseIntegrityVerifier integrityVerifier,
+            CommittedReleaseAuditPublisher committedAuditPublisher
     ) {
         this.agentService = agentService;
         this.releaseRepository = releaseRepository;
@@ -82,6 +85,7 @@ public class ReleaseService {
         this.auditService = auditService;
         this.promptAccessAuditService = promptAccessAuditService;
         this.integrityVerifier = integrityVerifier;
+        this.committedAuditPublisher = committedAuditPublisher;
     }
 
     @Transactional
@@ -296,6 +300,7 @@ public class ReleaseService {
 
     @Transactional
     public ReleaseDto.Response invalidate(UUID releaseId, JsonNode reason, String actorId) {
+        committedAuditPublisher.requireWritableTransaction();
         AgentReleaseEntity release = getRequiredForUpdate(releaseId);
         ObjectNode reasonDocument = objectMapper.createObjectNode();
         reasonDocument.put("schemaVersion", "1.0");
@@ -306,15 +311,17 @@ public class ReleaseService {
         AgentEntity agent = agentService.getRequired(release.getAgentId());
         ObjectNode metadata = releaseStateDocument(release);
         metadata.put("fromState", beforeState.name());
-        auditService.append(
+        AuditDto.Record receipt = auditService.append(
                 agent.getWorkspaceId(), normalizeActor(actorId), "AGENT_RELEASE_INVALIDATED",
                 "AGENT_RELEASE", releaseId, release.getReleaseFingerprint(), release.getReleaseFingerprint(), metadata
         );
+        committedAuditPublisher.register(receipt, agent.getWorkspaceId(), releaseId, "AGENT_RELEASE_INVALIDATED");
         return ReleaseDto.Response.from(release);
     }
 
     @Transactional
     public ReleaseDto.Response applySafetyContractHash(UUID releaseId, String contractHash, JsonNode reason) {
+        committedAuditPublisher.requireWritableTransaction();
         AgentReleaseEntity release = getRequiredForUpdate(releaseId);
         String previousFingerprint = release.getReleaseFingerprint();
         String finalFingerprint = fingerprintService.releaseFingerprint(
@@ -330,11 +337,12 @@ public class ReleaseService {
         }
         release.applySafetyContract(contractHash, finalFingerprint, reason);
         AgentEntity agent = agentService.getRequired(release.getAgentId());
-        auditService.append(
+        AuditDto.Record receipt = auditService.append(
                 agent.getWorkspaceId(), "system:contract-approval", "RELEASE_CONTRACT_FINGERPRINT_APPLIED",
                 "AGENT_RELEASE", releaseId, previousFingerprint, finalFingerprint,
                 releaseStateDocument(release)
         );
+        committedAuditPublisher.register(receipt, agent.getWorkspaceId(), releaseId, "RELEASE_CONTRACT_FINGERPRINT_APPLIED");
         return ReleaseDto.Response.from(release);
     }
 
