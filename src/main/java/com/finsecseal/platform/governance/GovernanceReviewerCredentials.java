@@ -336,6 +336,81 @@ public final class GovernanceReviewerCredentials {
                 && (issuanceCookieHeader == null || safeContractOutputFrame(issuanceCookieHeader));
     }
 
+    /** Pure issuer-local check: no clock, authority IO, issuance, or extra retained reference. */
+    boolean safeAuditComment(Session session, GovernanceReviewerContext mutationIdentity,
+            HttpServletRequest request, String admittedKey, String exactFinalComment) {
+        if (session == null || session.issuer != this || mutationIdentity == null || request == null
+                || !mutationIdentity.belongsTo(this) || !mutationIdentity.csrfVerified()
+                || !session.context.belongsTo(this)
+                || !mutationIdentity.sessionId().equals(session.context.sessionId())
+                || !mutationIdentity.workspaceId().equals(session.context.workspaceId())
+                || !mutationIdentity.actorId().equals(session.context.actorId())
+                || mutationIdentity.issuedAt() != session.context.issuedAt()
+                || mutationIdentity.expiresAt() != session.context.expiresAt()
+                || !mutationIdentity.generation().equals(session.context.generation())
+                || exactFinalComment == null || exactFinalComment.length() > 2000
+                || !wellFormedUtf16(exactFinalComment) || exactFinalComment.isBlank()) return false;
+        byte[] exactUtf8 = exactFinalComment.getBytes(StandardCharsets.UTF_8);
+        try {
+            if (exactUtf8.length > MAX_OUTPUT_UTF8_BYTES || !safeActualResponseFrame(exactUtf8)
+                    || auditCommentContains(exactUtf8, session.token)
+                    || auditCommentContains(exactUtf8, session.csrf)) return false;
+            // Canonical risk POST has no Authorization. Rebind that absence after filtering.
+            var authorization = request.getHeaders("Authorization");
+            if (authorization != null && authorization.hasMoreElements()) return false;
+            if (!auditHeaderMatches(request, "X-CSRF-Token", session.csrf, 128)
+                    || !auditHeaderMatches(request, "Idempotency-Key", admittedKey, 128)) return false;
+            var cookies = request.getCookies();
+            // Bounded traversal, without copying or inspecting unrelated cookie values.
+            if (cookies == null || cookies.length > MAX_OUTPUT_UTF8_BYTES) return false;
+            int ownedCookies = 0;
+            for (var cookie : cookies) {
+                if (cookie != null && COOKIE.equals(cookie.getName())) {
+                    if (++ownedCookies != 1 || !session.token.equals(cookie.getValue())) return false;
+                }
+            }
+            if (ownedCookies != 1) return false;
+            var rawCookies = request.getHeaders("Cookie");
+            if (rawCookies != null && rawCookies.hasMoreElements()) {
+                String rawCookie = rawCookies.nextElement();
+                if (rawCookies.hasMoreElements() || rawCookie == null || rawCookie.isEmpty()
+                        || rawCookie.length() > MAX_OUTPUT_UTF8_BYTES || !wellFormedUtf16(rawCookie)) return false;
+                byte[] rawCookieUtf8 = rawCookie.getBytes(StandardCharsets.UTF_8);
+                try {
+                    if (rawCookieUtf8.length > MAX_OUTPUT_UTF8_BYTES
+                            || containsExactBytes(exactUtf8, rawCookieUtf8)) return false;
+                } finally { java.util.Arrays.fill(rawCookieUtf8, (byte) 0); }
+            }
+            return true;
+        } finally { java.util.Arrays.fill(exactUtf8, (byte) 0); }
+    }
+
+    private static boolean auditHeaderMatches(HttpServletRequest request, String name,
+            String expected, int maxUtf16) {
+        var values = request.getHeaders(name);
+        if (expected == null || values == null || !values.hasMoreElements()) return false;
+        String actual = values.nextElement();
+        return !values.hasMoreElements() && actual != null && actual.length() <= maxUtf16
+                && wellFormedUtf16(actual) && expected.equals(actual);
+    }
+
+    private static boolean auditCommentContains(byte[] exactUtf8, String reference) {
+        if (reference == null || reference.isEmpty() || reference.length() > MAX_OUTPUT_UTF8_BYTES) return false;
+        byte[] referenceUtf8 = reference.getBytes(StandardCharsets.UTF_8);
+        try { return referenceUtf8.length <= MAX_OUTPUT_UTF8_BYTES && containsExactBytes(exactUtf8, referenceUtf8); }
+        finally { java.util.Arrays.fill(referenceUtf8, (byte) 0); }
+    }
+
+    private static boolean wellFormedUtf16(String value) {
+        for (int index = 0; index < value.length(); index++) {
+            char unit = value.charAt(index);
+            if (Character.isHighSurrogate(unit)) {
+                if (++index >= value.length() || !Character.isLowSurrogate(value.charAt(index))) return false;
+            } else if (Character.isLowSurrogate(unit)) return false;
+        }
+        return true;
+    }
+
     /** A-package response transport guard; no public credential/reference comparison API. */
     boolean safeActualResponseFrame(byte[] exactUtf8Frame) {
         if (exactUtf8Frame == null || exactUtf8Frame.length > MAX_OUTPUT_UTF8_BYTES) return false;

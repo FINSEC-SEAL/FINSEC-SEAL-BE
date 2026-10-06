@@ -63,6 +63,17 @@ public final class GovernanceAccess {
         return new MutationContext(this, facts, admission.recordId(), admission.requestDigest());
     }
 
+    /** CPU-only privacy/request binding; not current authority or a transaction commit fence. */
+    public void requireSafeAuditComment(MutationContext context, HttpServletRequest actualRequest,
+            String exactFinalComment) {
+        if (context == null || context.issuer != this || actualRequest == null
+                || context.facts.logout || context.facts.findingId == null
+                || !"POST".equals(context.facts.method)
+                || !credentials.safeAuditComment(context.facts.session, context.facts.identity,
+                        actualRequest, context.facts.key, exactFinalComment)
+                || facts(actualRequest) != context.facts) throw denied();
+    }
+
     /** Call after ALL consumer locks, immediately before the first write, including source TestRun locks. */
     public void verifyMutation(MutationContext context, UUID storedWorkspaceId, UUID lockedFindingId) {
         if (context == null || context.issuer != this
