@@ -1565,6 +1565,185 @@ class GovernanceAuthenticationIntegrationTest {
         assertThat(snapshot(withAdmission())).isEqualTo(before);
     }
 
+    @Test void admittedAuditCommentBindsSameSealedFactsAcrossCachedRequestAndRejectsMutatedInputs() throws Exception {
+        Graph graph = graph(WORKSPACE);
+        var before = snapshot(GOVERNED);
+        class CountingClock extends Clock {
+            private final Clock delegate;
+            private final AtomicInteger calls;
+            CountingClock(Clock delegate, AtomicInteger calls) { this.delegate = delegate; this.calls = calls; }
+            @Override public ZoneId getZone() { return delegate.getZone(); }
+            @Override public Clock withZone(ZoneId zone) { return new CountingClock(delegate.withZone(zone), calls); }
+            @Override public Instant instant() { calls.incrementAndGet(); return delegate.instant(); }
+        }
+        var clockCalls = new AtomicInteger();
+        var local = localIssuer(new CountingClock(Clock.systemUTC(), clockCalls));
+        // Real spies preserve actual PG execution; no authority/SQL return value is stubbed.
+        var observedDb = org.mockito.Mockito.spy(db);
+        var localRevocations = org.mockito.Mockito.spy(new GovernanceReviewerSessionRevocations(observedDb, digest, local));
+        var localAccess = new GovernanceAccess(observedDb, local, localRevocations, instance);
+        var localFilter = new GovernanceAccessFilter(local, localRevocations, localAccess, json);
+        var session = issue(local);
+        AtomicInteger completedChecks = new AtomicInteger();
+        var response = direct(localFilter, mutation("POST", riskPath(graph.finding), session), (req, res) -> {
+            var request = (HttpServletRequest) req;
+            org.mockito.Mockito.clearInvocations(observedDb, localRevocations);
+            var context = localAccess.requireMutationContext(request);
+            assertThat(org.mockito.Mockito.mockingDetails(observedDb).getInvocations())
+                    .as("real mutation-context admission uses JdbcTemplate").isNotEmpty();
+            org.mockito.Mockito.verify(localRevocations, org.mockito.Mockito.atLeastOnce())
+                    .isRevoked(org.mockito.Mockito.any(GovernanceReviewerContext.class));
+            assertThat(request.getClass().getSimpleName()).isEqualTo("CachedBodyRequest");
+            assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
+            var currentIdentity = local.mutationContext(session, request);
+            org.mockito.Mockito.clearInvocations(observedDb, localRevocations);
+            clockCalls.set(0);
+            localAccess.requireSafeAuditComment(context, request, "Reviewed rationale");
+            localAccess.requireSafeAuditComment(context, new jakarta.servlet.http.HttpServletRequestWrapper(request), "Reviewed rationale");
+            org.mockito.Mockito.verifyNoInteractions(observedDb, localRevocations);
+            assertThat(clockCalls.get()).as("public comment guard clock calls").isZero();
+            assertThat(local.current(currentIdentity, true)).isTrue();
+            assertThat(clockCalls.get()).as("current authority positive clock control").isPositive();
+            assertCommentDenied(() -> localAccess.requireSafeAuditComment(null, request, "Reviewed rationale"));
+            assertCommentDenied(() -> localAccess.requireSafeAuditComment(context, null, "Reviewed rationale"));
+            assertCommentDenied(() -> new GovernanceAccess(observedDb, local, localRevocations, instance)
+                    .requireSafeAuditComment(context, request, "Reviewed rationale"));
+            var copied = mutation("POST", riskPath(graph.finding), session);
+            copied.removeHeader("Idempotency-Key"); copied.addHeader("Idempotency-Key", context.idempotencyKey());
+            assertCommentDenied(() -> localAccess.requireSafeAuditComment(context, copied, "Reviewed rationale"));
+            localAccess.establish(copied, session, local.mutationContext(session, copied), graph.finding,
+                    context.idempotencyKey(), false, false);
+            assertCommentDenied(() -> localAccess.requireSafeAuditComment(context, copied, "Reviewed rationale"));
+            for (HttpServletRequest changed : List.of(
+                    new jakarta.servlet.http.HttpServletRequestWrapper(request) { @Override public String getMethod() { return "PUT"; } },
+                    new jakarta.servlet.http.HttpServletRequestWrapper(request) { @Override public String getRequestURI() { return riskPath(UUID.randomUUID()); } },
+                    new jakarta.servlet.http.HttpServletRequestWrapper(request) { @Override public String getQueryString() { return "changed=true"; } },
+                    alteredAuditHeader(request, "Idempotency-Key", "different-key"),
+                    alteredAuditHeader(request, "X-CSRF-Token", "different-csrf"),
+                    alteredAuditHeader(request, "Authorization", "synthetic-comment-owned-auth-reference-at-least-32"),
+                    new jakarta.servlet.http.HttpServletRequestWrapper(request) {
+                        @Override public Cookie[] getCookies() { return new Cookie[]{new Cookie(GovernanceReviewerCredentials.COOKIE, "different-token")}; }
+                    })) assertCommentDenied(() -> localAccess.requireSafeAuditComment(context, changed, "Reviewed rationale"));
+            String originalTrace = TraceIdFilter.currentTraceId();
+            MDC.put(TraceIdFilter.TRACE_ID, UUID.randomUUID().toString());
+            try { assertCommentDenied(() -> localAccess.requireSafeAuditComment(context, request, "Reviewed rationale")); }
+            finally { MDC.put(TraceIdFilter.TRACE_ID, originalTrace); }
+            localAccess.requireSafeAuditComment(context, request, "Reviewed rationale");
+            org.mockito.Mockito.verifyNoInteractions(observedDb, localRevocations);
+            // Mark completion only after every positive, purity and mutated-input assertion returned.
+            completedChecks.incrementAndGet();
+        });
+        assertThat(response.getStatus()).as("sealed-request direct callback response").isEqualTo(200);
+        assertThat(completedChecks.get()).as("all sealed-request callback assertions completed").isEqualTo(1);
+        assertThat(snapshot(GOVERNED)).isEqualTo(before);
+    }
+
+    @Test @ExtendWith(OutputCaptureExtension.class)
+    void actualTcpAuditCommentDeniesLiteralReferencesBeforeContinuationWithoutDomainWrites(CapturedOutput output) throws Exception {
+        Graph graph = graph(WORKSPACE);
+        var before = snapshot(GOVERNED);
+        try (var selected = startCommentProbeContext()) {
+            int selectedPort = ((ServletWebServerApplicationContext) selected).getWebServer().getPort();
+            var selectedProbe = selected.getBean(ContinuationProbe.class);
+            var exchange = httpAt(selectedPort, "GET", SESSION, null, List.of("Authorization", "GovernanceBootstrap " + BOOTSTRAP));
+            assertThat(exchange.statusCode()).isEqualTo(200);
+            var view = json.readTree(exchange.body()).path("data");
+            var session = new Session(exchange.headers().firstValue("Set-Cookie").orElseThrow().split(";", 2)[0],
+                    view.path("csrfToken").asString(), UUID.fromString(view.path("sessionId").asString()));
+            int start = selectedProbe.callCount();
+            String safeKey = key();
+            var safe = httpAt(selectedPort, "POST", riskPath(graph.finding),
+                    json.writeValueAsString(Map.of("comment", "Reviewed rationale")), mutationHeaders(session, safeKey));
+            assertThat(safe.statusCode()).isEqualTo(200);
+            assertThat(selectedProbe.callCount()).isEqualTo(start + 1);
+            for (String reference : List.of(BOOTSTRAP, SIGNING, CONTRACT_KEY, session.cookie.split("=", 2)[1], session.csrf)) {
+                String selectedKey = key();
+                var denied = httpAt(selectedPort, "POST", riskPath(graph.finding),
+                        json.writeValueAsString(Map.of("comment", "Reviewed " + reference)), mutationHeaders(session, selectedKey));
+                assertThat(denied.statusCode()).isEqualTo(403);
+                assertNoStore(denied);
+                assertThat(denied.headers().allValues("Set-Cookie")).isEmpty();
+                assertThat(denied.body()).doesNotContain(reference);
+                assertThat(selectedProbe.callCount()).isEqualTo(start + 1);
+                assertIdempotencySecretsAbsent(session, "POST", riskPath(graph.finding), selectedKey, "COMPLETED", false);
+            }
+            assertThat(snapshot(GOVERNED)).isEqualTo(before);
+            String captureControl = "AUDIT_COMMENT_CAPTURE_OK";
+            assertThat(captureControl.getBytes(java.nio.charset.StandardCharsets.UTF_8).length).isLessThan(32);
+            org.slf4j.LoggerFactory.getLogger(GovernanceAuthenticationIntegrationTest.class).warn(captureControl);
+            assertThat(output.getAll()).as("same actual captured log transport positive control").contains(captureControl);
+            assertThat(output.getAll()).doesNotContain(BOOTSTRAP, SIGNING, CONTRACT_KEY, session.cookie.split("=", 2)[1], session.csrf);
+        }
+    }
+
+    @Test void pureAuditCommentSuccessStillRequiresFinalExpiryAndCommittedRevocationCheckAfterAllLocks() throws Exception {
+        for (boolean revoke : List.of(false, true)) {
+            Graph graph = graph(WORKSPACE);
+            var before = snapshot(GOVERNED);
+            var clock = new MutableClock();
+            var local = localIssuer(clock);
+            var localRevocations = new GovernanceReviewerSessionRevocations(db, digest, local);
+            var localAccess = new GovernanceAccess(db, local, localRevocations, instance);
+            var localFilter = new GovernanceAccessFilter(local, localRevocations, localAccess, json);
+            var session = issue(local);
+            AtomicInteger continuations = new AtomicInteger();
+            AtomicInteger completedChecks = new AtomicInteger();
+            var response = direct(localFilter, mutation("POST", riskPath(graph.finding), session), (req, res) -> {
+                var request = (HttpServletRequest) req;
+                var context = localAccess.requireMutationContext(request);
+                new TransactionTemplate(transactions).executeWithoutResult(status -> {
+                    lockAll(db, graph);
+                    String preparedComment = "Reviewed rationale";
+                    localAccess.requireSafeAuditComment(context, request, preparedComment);
+                    if (revoke) {
+                        var identity = local.mutationContext(session, request);
+                        var independentWriter = new GovernanceReviewerSessionRevocations(independentDb(), digest, local);
+                        independentWriter.revoke(identity);
+                        assertThat(independentWriter.isRevoked(session.identity())).isTrue();
+                    } else clock.now = Instant.ofEpochSecond(session.identity().expiresAt());
+                    assertDenied(() -> {
+                        localAccess.verifyMutation(context, WORKSPACE, graph.finding);
+                        continuations.incrementAndGet();
+                    });
+                    status.setRollbackOnly();
+                });
+                // Each expiry/committed-revocation branch proves completion after transaction processing.
+                completedChecks.incrementAndGet();
+            });
+            assertThat(response.getStatus()).as("%s branch direct callback response",
+                    revoke ? "committed-revocation" : "expiry").isEqualTo(200);
+            assertThat(completedChecks.get()).as("%s branch final-authority assertions completed",
+                    revoke ? "committed-revocation" : "expiry").isEqualTo(1);
+            assertThat(continuations.get()).isZero();
+            assertThat(snapshot(GOVERNED)).isEqualTo(before);
+        }
+    }
+
+    private HttpServletRequest alteredAuditHeader(HttpServletRequest request, String name, String value) {
+        return new jakarta.servlet.http.HttpServletRequestWrapper(request) {
+            @Override public String getHeader(String selected) { return name.equalsIgnoreCase(selected) ? value : super.getHeader(selected); }
+            @Override public java.util.Enumeration<String> getHeaders(String selected) {
+                return name.equalsIgnoreCase(selected) ? java.util.Collections.enumeration(List.of(value)) : super.getHeaders(selected);
+            }
+        };
+    }
+
+    private ConfigurableApplicationContext startCommentProbeContext() {
+        return new SpringApplicationBuilder(FinsecSealApplication.class, ProbeConfiguration.class)
+                .run("--server.port=0", "--spring.main.banner-mode=off", "--spring.main.lazy-initialization=false",
+                        "--spring.datasource.url=" + POSTGRES.getJdbcUrl(),
+                        "--spring.datasource.username=" + POSTGRES.getUsername(),
+                        "--spring.datasource.password=" + POSTGRES.getPassword(),
+                        "--finsec.crypto.key-base64=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                        "--finsec.scheduling.enabled=false", "--finsec.generation.worker-enabled=false",
+                        "--spring.datasource.hikari.maximum-pool-size=2",
+                        "--finsec.governance-access.bootstrap-key=" + BOOTSTRAP,
+                        "--finsec.governance-access.signing-key=" + SIGNING,
+                        "--finsec.governance-access.actor=" + ACTOR,
+                        "--finsec.governance-access.workspace=" + WORKSPACE,
+                        "--finsec.contract-access.key=" + CONTRACT_KEY);
+    }
+
     @Test void actualJPAHolderFalseBeforeAfterJdbcAndAccessPositiveWithoutForcedFlags() throws Exception {
         Graph graph = graph(WORKSPACE);
         assertThat(transactions).isInstanceOf(JpaTransactionManager.class);
@@ -1758,6 +1937,7 @@ class GovernanceAuthenticationIntegrationTest {
         var session = issue(local);
         var mutationIdentity = local.mutationContext(session, csrf(session.csrfToken()));
         AtomicInteger continuations = new AtomicInteger();
+        AtomicInteger completedChecks = new AtomicInteger();
         AtomicInteger waitingPid = new AtomicInteger();
         CountDownLatch enteringLocks = new CountDownLatch(1);
         UUID blockedId = switch (blockedTable) {
@@ -1770,20 +1950,23 @@ class GovernanceAuthenticationIntegrationTest {
                 statement.setObject(1, blockedId); try (var result = statement.executeQuery()) { assertThat(result.next()).isTrue(); }
             }
             var future = pool.submit(() -> {
-                direct(localFilter, mutation("POST", riskPath(graph.finding), session), (req, res) -> {
+                var response = direct(localFilter, mutation("POST", riskPath(graph.finding), session), (req, res) -> {
                     var context = localAccess.requireMutationContext((HttpServletRequest) req);
                     new TransactionTemplate(transactions).executeWithoutResult(status -> {
                         waitingPid.set(db.queryForObject("select pg_backend_pid()", Integer.class));
                         enteringLocks.countDown();
                         lockAll(db, graph);
+                        localAccess.requireSafeAuditComment(context, (HttpServletRequest) req, "Reviewed rationale");
                         assertDenied(() -> localAccess.verifyMutation(context, WORKSPACE, graph.finding));
                         // A D-shaped continuation would only be reached after successful verification.
                         if (local.current(mutationIdentity, true) && !localRevocations.isRevoked(mutationIdentity))
                             continuations.incrementAndGet();
                         status.setRollbackOnly();
                     });
+                    // A swallowed guard denial cannot count as completed final-verification/rollback evidence.
+                    completedChecks.incrementAndGet();
                 });
-                return null;
+                return response;
             });
             assertThat(enteringLocks.await(10, TimeUnit.SECONDS)).isTrue();
             awaitPostgresLock(waitingPid.get());
@@ -1793,8 +1976,12 @@ class GovernanceAuthenticationIntegrationTest {
                 assertThat(writer.isRevoked(session.identity())).isTrue();
             } else clock.now = Instant.ofEpochSecond(session.identity().expiresAt());
             holder.commit();
-            future.get(15, TimeUnit.SECONDS);
+            var response = future.get(15, TimeUnit.SECONDS);
+            assertThat(response.getStatus()).as("lock-wait table=%s branch=%s direct callback response",
+                    blockedTable, revoke ? "committed-revocation" : "expiry").isEqualTo(200);
         }
+        assertThat(completedChecks.get()).as("lock-wait table=%s branch=%s final-authority assertions completed",
+                blockedTable, revoke ? "committed-revocation" : "expiry").isEqualTo(1);
         assertThat(continuations.get()).isZero();
         assertThat(snapshot(GOVERNED)).isEqualTo(before);
     }
@@ -1949,6 +2136,12 @@ class GovernanceAuthenticationIntegrationTest {
                 .contains(GovernanceReviewerCredentials.COOKIE + "=", "Max-Age=0", "Secure", "HttpOnly", "SameSite=Lax");
     }
     private static void assertDenied(Runnable call) { assertThatThrownBy(call::run).isInstanceOf(BusinessException.class); }
+    private static void assertCommentDenied(Runnable call) {
+        assertThatThrownBy(call::run).isInstanceOfSatisfying(BusinessException.class, failure -> {
+            assertThat(failure.errorCode()).isEqualTo(com.finsecseal.common.api.ErrorCode.OPERATOR_AUTH_REQUIRED);
+            assertThat(failure.getMessage()).isEqualTo("Current admitted governance mutation authority required");
+        });
+    }
     private String key() { return "gov-" + UUID.randomUUID(); }
     private static String riskPath(UUID finding) { return "/api/v1/findings/" + finding + ":accept-risk"; }
     private static List<String> withAdmission() {
@@ -2063,7 +2256,8 @@ class GovernanceAuthenticationIntegrationTest {
 
         @Transactional
         @PostMapping("/api/v1/findings/{findingId}:accept-risk")
-        public Map<String, Object> verify(@PathVariable UUID findingId, HttpServletRequest request) {
+        public Map<String, Object> verify(@PathVariable UUID findingId, HttpServletRequest request,
+                @org.springframework.web.bind.annotation.RequestBody(required = false) Map<String, String> body) {
             var context = access.requireMutationContext(request);
             var holder = (ConnectionHolder) TransactionSynchronizationManager.getResource(db.getDataSource());
             assertThat(holder.isSynchronizedWithTransaction()).isFalse();
@@ -2075,6 +2269,9 @@ class GovernanceAuthenticationIntegrationTest {
                     where f.id=? for update of f,r,a,tr
                     """, findingId);
             assertThat(holder.isSynchronizedWithTransaction()).isFalse();
+            String preparedComment = body == null ? "Governance continuation probe"
+                    : body.getOrDefault("comment", "Governance continuation probe");
+            access.requireSafeAuditComment(context, request, preparedComment);
             access.verifyMutation(context, (UUID) row.get("workspace"), findingId);
             calls.incrementAndGet();
             return Map.of("holderSynchronized", holder.isSynchronizedWithTransaction(),
