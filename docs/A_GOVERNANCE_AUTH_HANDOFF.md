@@ -1,3 +1,80 @@
+# A5 설치·검증 관측 — UTC 2026-10-04T23:45:54.973570+00:00
+
+이 단락은 위 시각의 관측 기록이며 이후 검증 결과를 미리 선언하지 않는다. fresh Run `20261004T220353Z-e2ef1f3d`에서 Access·Credentials·Unit exact3가 실제 설치됐다. Root의 선택된 UNIT1 fresh 시험은43 PASS/실패0·오류0·skip0, 필수3 누락0이었다. 원형 checkpoint `20261004T233154Z-829021d2`는 APPROVED_WITH_NOTES/WARN/outer0로 UNIT1을 수용했고, `ROOT_A5_UNIT2_ACTUAL_SCOPE_GO_20261004T234343Z/ROOT_UNIT2_SCOPE_GO.json`의 제한된 GO에 따라 HTTP 확장 시험 source와 이 문서를 설치했다.
+
+이 작성시점에 새 HTTP 시험은 미실행이며 Root의 선택된 HTTP+Credentials focus가 다음 단계다. exact5 전체 full/tested-final/post와 A5 게시는 대기 상태다. 게시된 core Auth PR142의 HEAD `eecb8c80d0ab723fd5993de762c476cd0449febc`는 A5 공급 게시 증거가 아니다. 현재 설치나43 PASS는 D whole10·SUP025 합성 검토 또는 전체 공급 완료를 뜻하지 않는다. 최초 sandbox Gradle cache lock 실패와 기존 FAIL/P0/cadence 기록을 보존한다.
+
+아래88172-byte 선택 문서 전체와 그 안의73765-byte 기존 handoff suffix는 byte-exact 이력이다. 각 단락의 미적용/UNKNOWN/관측값은 그 작성시점 상태로 읽는다. 최신 final/post/게시 사실은 해당 Run의 `dev_harness/runs/20261004T220353Z-e2ef1f3d/checkpoint_log.md`, 원형 검증 증거와 PR142의 실제 최신 본문·게시 receipt를 참조한다. B 미완성 의존은 SKIP/UNKNOWN이며 완료로 계산하지 않는다.
+
+---
+
+# A→D 최종 감사 comment 공급 계약
+
+이 본문은 `GovernanceAccess.requireSafeAuditComment(MutationContext,HttpServletRequest,String exactFinalComment)`와 동일하게 설치된 선택 source의 입력·책임·한계를 정의한다. source가 실제 설치되어 본문과 일치한 경우에만 공급 계약 설명으로 유효하며, 계약 문서 자체는 컴파일·시험·pre/final/post·게시 또는 D workflow 완료의 증거가 아니다. 실제 상태는 해당 exact source의 원형 증거와 게시 receipt로 판단한다.
+
+## 공급 API와 입력 계약
+
+void 진입점은 자기 Access issuer가 발급한 opaque mutation context와 동일한 private FilterFacts를 공유하는 actual request를 요구한다. wrapper/CachedBodyRequest의 Java 객체 동일성을 요구하지 않는다. private Credentials helper는 기존 sealed issuer proof·같은 Session identity·owned governance Cookie token 정확1개·동일 단일 CSRF·mutation Authorization 부재를 검사하고 기존 facts는 method/path/query/current MDC trace/동일 Idempotency-Key를 대조한다. public Admission/actorheader/bodyflag는 권한을 만들지 않는다.
+
+최종 문자열은 null/blank 또는2000 UTF16 초과/고립 surrogate이면 거절한다. wellformed exact string을 trim·치환·normalization·JSON 재직렬화 없이 UTF8로 옮겨6000 bytes 이하에서 기존 A2+private C fingerprint 및 Session token/CSRF와 비교한다. 2000 wellformed UTF16이면 UTF8 최대6000이라는 관계를 유지한다. 임시 byte[]는 지우고 request/comment/결과나 새 matcher를 field/log/DB/비동기에 보관하지 않는다. 새 공개 membership API/raw C getter·retained credential capability·authority flag·clock/DB/IO는 추가하지 않는다.
+
+선택 대상의 구체 header 정책은 정확한 단일 CSRF/Idempotency(각128 UTF16 이하/wellformed/동일값), mutation Authorization 부재, parsed owned Cookie 정확1개와 traversal ceiling6000개다. raw Cookie header가 존재하면 단일/nonempty/wellformed/6000 UTF16 및UTF8 bytes 이하의 전체 값을 일시 검사한다. parsed Cookie만 노출되는 servlet/mock 표현은 허용한다. 이는 unrelated Cookie value 전체나 getter 내부 allocation bound·기존 HTTP header 전반의 privacy를 의미하지 않는다. 오류는 기존 generic OPERATOR_AUTH_REQUIRED/detail을 유지한다.
+
+## 실제 권한·D 소비 경계
+
+새 guard는 sealed request/최종 literal comment의 memory-only 검사다. 현재 config/generation/expiry/revocation/reservation·physical writable READ_COMMITTED 권한의 최종 판정은 기존 `verifyMutation(context,storedWorkspaceId,lockedFindingId)`3args에 남으며 guard 성공은 권한 유지나 commit fence가 아니다.
+
+D는 ALL blocking locks(원본 source Run/workspace/Release/Finding/latestDecision/관련 audit 포함)→최종 comment/reason/hash/time CPU 준비→comment guard→기존3arg finalverify→즉시 첫 DML 순서를 지킨다. 검증한 동일 comment만 risk audit와 A invalidation reason에 사용한다. D actualRequest4arg bridge·RiskPG pointcut·OPEN→ACCEPTED_RISK/REVIEW와 기존3 BLOCKED 우선·과거 Decision/Attestation 보존은 후속 D 소유이며 이 A 공급 계약이 해당 구현·검증을 완료하지 않는다.
+
+## 검증 범위와 남은 한계
+
+제안 시험은 기존6@Test source다. parsed owned Cookie 동일/상이 duplicate, wellformed/Unicode/exact-window/31-byte actual-present floor·near-miss, delegated Clock의 helper/public guard0↔current 양성, 실제 selected JdbcTemplate/Revocations spy의 admission 양성→clearInvocations→guard0, 같은 CapturedOutput24-byte safe WARN 양성↔secret absence, 정상 FinsecApplication+Probe의 실제 TCP/PG admission/sealed request/ALL-locks expiry·committed revocation 대조를 포함한다. 테스트 소스가 실행 성공을 의미하지 않는다. spy는 주입된2대상 interaction만, CountingClock은 주입된 instant 호출만, governed snapshot은 해당 fixture의 범위만 관측한다. global IO/all clock source/all wire/global log/no-store 전반의 무노출은 주장하지 않는다.
+
+C31 reference는 기존>=32 privacy floor 밖의 대조이며 short secret 전체 안전성 또는 C authority의 허용을 뜻하지 않는다. existing C signer provisioning/UTF8 replacement/configured/keyValid·private fingerprint startup snapshot/rotation·CPU·authenticated guess/timing 한계는 유지한다. actual request getter fault 전체·encoded/escaped semantics·serialized 전체 audit JSON·historical COMPLETED replay/common·D RFC 고정 type/title/code/detail/trace 출력은 이 comment guard의 완결 범위가 아니다. D/common RFC·역사 replay closure는 별도 미선택 의존성이다.
+
+standalone A 시험은 normal FinsecApplication+ProbeConfiguration이며 production FindingController 제외·TypeExcludeFilters/component exclusion은 없다. 구현된 D mapping의 adoption/integration 또는 A test-context isolation 전에 실제 D source/parent evidence와 별도 source-bound SUP025 composition checkpoint로 필요 여부와 좁은 A fixture scope를 선택한다. 지금 observed startup collision을 주장하지 않는다. 선택된 fixture 수정은 A 소유로 검증·게시하고 D PR에 섞지 않는다.
+
+## 작성시점 DATA 역사와 기록 원칙
+
+작성 UTC 2026-10-04T20:31:55.155760+00:00: 위 계약 prefix는 향후 원형선택/정확한 source설치 때 사용할 scratch DATA다. 실제 게시 Auth HEAD/PR/API-source receipt·새 A5 runtime/Run/pre/preedit는UNKNOWN이고 적용·컴파일·시험·native·Git은0이었다. 이후 현재 검증/게시 결과는 새 원형 증거로 판단하며 이 dated snapshot을 현재 미시험 라벨이나 성공으로 바꾸지 않는다. API3 중간 checkpoint 수용은 전체5/focus/full/final/post/공급 수용이 아니다. 기존 큰 Auth PR에 작은 기능커밋으로 포함하고 A5 fragment PR은 만들지 않는다. B 미완성 runtime/history/trials/certification은 사용자 선택대로 SKIP/UNKNOWN이며 완료로 계산하지 않는다.
+
+아래 전체 V3 DATA81785/V2 DATA79270/기존 handoff73765-byte 원문은 작성시점 역사로 byte-exact 보존한다. 이전 후보/FAIL/P0/cadence/UNKNOWN401을 현재 구현 결과나 새 공급 승인으로 읽지 않는다.
+
+---
+
+# V3 DATA 측정 보완 — 생산 comment guard 변경 없음
+
+작성 UTC 2026-10-04T20:13:15.642124+00:00. V2의 생산 Access/Credentials와 계약 후보는 byte-exact 유지하며 Test2·선택정보만 보완한 미적용·미컴파일·미시험 DATA다. 원형 측정 결과/PASS를 주장하지 않는다. 기존6 @Test 선언을 그대로 유지하고 새 testcase count·totalPASS forecast는 만들지 않는다. 아래 V2 DATA 문서와 실제73765-byte handoff 전체는 suffix 원문으로 보존한다.
+
+- parsed owned Cookie가 동일 token으로2개 또는 정상 token+상이 value로2개인 두 직접 음성을 기존 Unit testcase에 추가한다.
+- 기존 MutableClock 의미는 바꾸지 않고 각 Unit/실제 sealed-request testcase의 delegated CountingClock을 독립 사용한다. issuer setup/current()의 실제 counter 양성과 counter reset 뒤 pure helper/public guard calls0을 대조한다. clock/expiry/current authority의 판정은 여전히 기존3arg verifyMutation에 남는다.
+- 실제 filter/common admission 이후 requireMutationContext 직전에 real JdbcTemplate/Revocations spies의 invocation history만 clear한다. 실제 requireMutationContext의 SQL·isRevoked 양성 interaction을 확인하고 다시 clear한 뒤 public comment guard만 verifyNoInteractions로 대조한다. authority/SQL 반환값 stub·mock proof·DB bypass는 없다. Mockito final spy/actual Runtime DI/SQL 관측 성공은 아직 UNEXECUTED이며 source 후보가 실행을 증명하지 않는다.
+- 같은 CapturedOutput TCP negative testcase에서 test-only 고정24-byte WARN `AUDIT_COMMENT_CAPTURE_OK`를 실제 emit하고 같은 getAll.contains 양성을 먼저 확인한 뒤 기존 A/C/token/CSRF absent 검사를 유지한다. 이 test marker는 production Filter diagnostic를 복구하지 않으며 모든 로그 transport/global 출력 privacy가 완료됐다는 주장이 아니다.
+
+Authorization 부재·raw/parsed Cookie 및128/6000 bounded header 정책은 fresh original pre의 명시 선택 사항으로 그대로 남는다. eligible31-byte C reference는 privacy floor 밖의 실제-present 대조이며 C authority 허용·모든 short secret 안전성을 뜻하지 않는다. exact comment literal UTF8 검사·기존 private C startup snapshot/CPU·guess/rotation 한계 및 D/common fixed RFC/역사 replay privacy 미선택 의존성도 유지한다. published Auth SHA/fresh exact5 pre/preedit/SUP025 및 별도 Root 적용 전 제품/API 공급0이다.
+
+---
+
+# 미래 A→D 최종 감사 comment 공급 계약 DATA 후보
+
+작성 UTC 2026-10-04T19:55:58.790398+00:00. 이 prefix와 scratch 코드5는 현재 API 공급·제품 설치·게시 Auth supplier·fresh pre/preedit·컴파일·시험·post 수용의 증거가 아니다. 아래 동결된 handoff 전체 73765 bytes는 교정 전 역사 원문으로 그대로 보존한다. 이 후보는 실제 published Auth parent를 선택한 뒤 새 exact5 원형 pre/preedit로 검토해야 한다. 실제 D source+실제 published combined parent의 SUP025 별도 composition checkpoint 전 A fixture isolation은 금지한다.
+
+public 후보는 `GovernanceAccess.requireSafeAuditComment(MutationContext,HttpServletRequest,String exactFinalComment)` void method1개다. 기존 opaque context의 자기 issuer/private proof·동일 Session identity를 확인하고 private FilterFacts를 공유하는 actual request만 허용한다. Servlet wrapper/CachedBodyRequest의 Java 객체 동일성을 요구하지 않는다. 기존 facts를 통해 method/path/query/현재 MDC trace/단일 Idempotency-Key를 다시 대조하며, private pure helper는 owned governance Cookie token1·동일 단일 CSRF·risk POST Authorization 부재를 검사한다. raw Admission/actor header/body flag가 권한을 만들지 않는다.
+
+null/blank/>2000 UTF16/고립 high·low surrogate는 거절한다. wellformed final 문자열을 strip/replace/normalization/JSON rewrite 없이 UTF8로 변환해 <=6000 bytes에서 기존 safeActualResponseFrame의 A2/private C matcher와 Session token/CSRF 전체 reference를 검사한다. 2000 wellformed UTF16이면 최대6000 UTF8라는 관계를 유지하며 불가능한 '6001 bytes && <=2000 UTF16' 음성을 만들지 않는다. issuer 내부 boolean은 package-private이고 새 field/raw C/getter/public matcher/authority flag/retained request·comment/log/DB/clock/config 재읽기가 없다. 임시 비교 byte[]는 finally로 지운다.
+
+원형에 선택 요청하는 구체 header 정책은 단일 CSRF/Idempotency(각128 UTF16 이하/wellformed/동일 실제값), mutation Authorization 부재, owned parsed Cookie token 정확1개다. parsed Cookie 배열 traversal ceiling은6000개로 둔다. raw Cookie header가 노출되면 단일/nonempty/wellformed/<=6000 UTF16 및UTF8 bytes의 전체 값을 임시 검사한다. raw header가 없고 parsed cookie만 제공되는 servlet/mock 표현은 허용한다. 이 cardinality/예산은 선택 전 concrete 후보이며 기존 모든 HTTP header 정책을 자동 변경하는 것이 아니다. unrelated Cookie value 전체의 privacy·request getter 내부 allocation까지 bound했다고 주장하지 않는다. generic 오류는 기존 OPERATOR_AUTH_REQUIRED의 기존 고정 detail이고 그 외 common/D RFC 출력 closure는 별도다.
+
+D 순서는 ALL blocking locks(원본 source Run 포함) 완료→최종 comment/reason/hash/time CPU 준비→comment guard→기존 verifyMutation(context,storedWorkspace,lockedFinding)3args→즉시 첫 DML이다. 새 guard는 현재 expiry/revocation/reservation/config 확인·transaction write 권한·commit fence가 아니다. 정상 guard 뒤 expiry 또는 별도 committed revocation 변화가 있으면 기존3arg verifyMutation이 마지막으로 거절한다. D Controller→Service actualRequest4arg 및 RiskPG pointcut 수정은 후속 D scope이며 이 exact5에는 없다.
+
+제안6 @Test는 미컴파일·미실행이다. Unit은 exact string/ASCII·Korean·supplementary 경계·malformed 거부, 실제 otherwise-present A/C/Session window와31-byte floor·near-miss, bounded Cookie/CSRF/Auth/Idempotency를 다룬다. 실제 Filter/common CachedBodyRequest·PG admission fixture에서는 동일 private facts의 wrapper 정상 및 foreign/missing/replaced facts/method/path/query/trace/key/CSRF/Cookie/Auth 변경 거부를 관측한다. 새 isolated 실제 TCP probe는 literal comment secret 거부→continuation0/domain snapshots 유지·legitimate Admission/이전 issuance quota 구분·실제 response/storage/log carrier를 다룬다. ALL locks 뒤 guard 성공 후 actual expiry/독립 durable revocation으로 finalverify와 sentinel continuation이 거절되도록 한다. 기존 physical lock-wait expiry/revocation controls에도 pure guard를 finalverify 직전에 넣는다. 실제 D Finding acceptance/ledger/A invalidation/C cache eviction credit는0이다.
+
+판정·privacy 한계: 검사 대상은 exact literal UTF8이고 전체 serialized audit JSON·encoded/escaped 의미·historical COMPLETED replay·framework/common/D 고정 RFC9457 출력 전체가 아니다. D fixed-output closure는 별도 미선택 원형 소유권 의존성이다. existing C fingerprint startup snapshot/rotation·O(BL) CPU·authenticated accept/refuse/timing guess surface는 기존 계약대로 남는다. current clock/config/revocation/admission의 최종 검증은 기존3arg가 수행한다. 이 후보는 C provisioning/signing/UTF8replacement 의미나 private capability 보관 계약을 변경하지 않는다.
+
+배송은 기존 큰 A Auth PR의 추가 작은 feat(a)/test(a) 커밋 후보이며 fragment PR0이다. 실제 적용/검증/게시 조건은 published Auth parent→fresh exact5 original pre/preedit→Root bounded apply→immediate SOURCE→선택된 fresh focus/full1200/tested-final/post 실제 수용이다. B 미완성 runtime/history/trials/certification은 사용자 선택대로 SKIP/UNKNOWN이며 완료로 계산하지 않는다.
+
+---
+
 # LOG001: A 소유 storage diagnostic emission 제거 계약과 보존 이력
 
 로그 formatter의 delimiter와 고정 diagnostic 문구가 결합하면 각각의 event field 검사를 통과한 자격증명 전체가 실제 콘솔 출력에 나타날 수 있다. 이 좁은 교정안은 GovernanceAccessFilter의 해당 logger field와 단일 warn emission을 제거한다. 새로운 logging format·framework/common/C 설정·credential charset 금지나 다른 고정 prefix 추가로 해결하지 않는다. storage failure는 기존500·no-store·실제 ordered problem JSON의 전체 UTF8 검사/빈 refusal을 유지한다. 기존 MDC temporary suppression과 finally의 정확 복원, trace guard, private C privacy capability·Cookie/JSON/Idempotency/UUID guards 및 모든 constructor 검사를 이완하지 않는다.
