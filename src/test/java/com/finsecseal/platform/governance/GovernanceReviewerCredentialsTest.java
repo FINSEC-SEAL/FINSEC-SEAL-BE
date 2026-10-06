@@ -867,6 +867,152 @@ class GovernanceReviewerCredentialsTest {
                 raw.substring(0, raw.length() - 1) + ",\"traceId\":\"");
     }
 
+    @Test void exactFinalAuditCommentKeepsWellFormedBoundsWithoutNormalizationOrClockAuthority() {
+        var session = issue();
+        var request = auditCommentRequest(session, "audit-comment-key");
+        var mutation = issuer.mutationContext(session, request);
+        for (String invalid : new String[]{null, "", " \t\n", "a".repeat(2001), "\uD800", "\uDC00", "x\uD800y"})
+            assertThat(issuer.safeAuditComment(session, mutation, request, "audit-comment-key", invalid)).isFalse();
+        for (String valid : List.of("a".repeat(2000), "한".repeat(2000), "😀".repeat(1000), "  reviewed rationale  ")) {
+            assertThat(valid.getBytes(StandardCharsets.UTF_8).length).isLessThanOrEqualTo(6000);
+            assertThat(issuer.safeAuditComment(session, mutation, request, "audit-comment-key", valid)).isTrue();
+        }
+        clock.now = Instant.ofEpochSecond(session.identity().expiresAt());
+        assertThat(issuer.safeAuditComment(session, mutation, request, "audit-comment-key", "Reviewed rationale")).isTrue();
+        assertThat(issuer.current(mutation, true)).isFalse();
+
+        // Separate delegated clock: measuring this pure helper does not change MutableClock's contract.
+        class CountingClock extends Clock {
+            private final Clock delegate;
+            private final java.util.concurrent.atomic.AtomicInteger calls;
+            CountingClock(Clock delegate, java.util.concurrent.atomic.AtomicInteger calls) {
+                this.delegate = delegate; this.calls = calls;
+            }
+            @Override public ZoneId getZone() { return delegate.getZone(); }
+            @Override public Clock withZone(ZoneId zone) { return new CountingClock(delegate.withZone(zone), calls); }
+            @Override public Instant instant() { calls.incrementAndGet(); return delegate.instant(); }
+        }
+        var clockCalls = new java.util.concurrent.atomic.AtomicInteger();
+        var countedClock = new CountingClock(Clock.systemUTC(), clockCalls);
+        var measured = new GovernanceReviewerCredentials(BOOTSTRAP, SIGNING, ACTOR, WORKSPACE, "", countedClock);
+        var measuredSession = measured.exchange(exchange(BOOTSTRAP));
+        assertThat(measuredSession).isNotNull();
+        var measuredRequest = auditCommentRequest(measuredSession, "audit-comment-key");
+        var measuredMutation = measured.mutationContext(measuredSession, measuredRequest);
+        assertThat(clockCalls.get()).as("issuer setup observes delegated clock").isPositive();
+        clockCalls.set(0);
+        assertThat(measured.safeAuditComment(measuredSession, measuredMutation, measuredRequest,
+                "audit-comment-key", "Reviewed rationale")).isTrue();
+        assertThat(measured.safeAuditComment(measuredSession, measuredMutation, measuredRequest,
+                "audit-comment-key", "Reviewed " + BOOTSTRAP)).isFalse();
+        assertThat(clockCalls.get()).as("pure comment helper clock calls").isZero();
+        assertThat(measured.current(measuredMutation, true)).isTrue();
+        assertThat(clockCalls.get()).as("current authority positive clock control").isPositive();
+    }
+
+    @Test void auditCommentReusesPrivateReferenceWindowsAndRejectsActualSessionSecrets() {
+        for (String cReference : List.of("synthetic-comment-private-C-reference-at-least-32", "é".repeat(16), " ".repeat(32))) {
+            var selected = issuer(BOOTSTRAP, SIGNING, ACTOR, WORKSPACE, cReference);
+            var session = selected.exchange(exchange(BOOTSTRAP));
+            assertThat(session).isNotNull();
+            var request = auditCommentRequest(session, "audit-comment-key");
+            var mutation = selected.mutationContext(session, request);
+            for (String reference : List.of(BOOTSTRAP, SIGNING, cReference, session.token(), session.csrfToken())) {
+                for (String comment : List.of(reference + " suffix", "prefix " + reference + " suffix", "prefix " + reference))
+                    assertThat(selected.safeAuditComment(session, mutation, request, "audit-comment-key", comment)).isFalse();
+            }
+            String nearMiss = cReference.substring(0, cReference.length() - 1) + "x";
+            assertThat(selected.safeAuditComment(session, mutation, request, "audit-comment-key", "left[" + nearMiss + "]right")).isTrue();
+            assertThat(selected.safeAuditComment(session, mutation, request, "audit-comment-key", "Reviewed rationale")).isTrue();
+            assertThat(issuer.safeAuditComment(session, mutation, request, "audit-comment-key", "Reviewed rationale")).isFalse();
+            assertThat(selected.safeAuditComment(session, session.identity(), request, "audit-comment-key", "Reviewed rationale")).isFalse();
+        }
+        for (String shortReference : List.of("q".repeat(31), "é".repeat(15) + "a")) {
+            assertThat(shortReference.getBytes(StandardCharsets.UTF_8)).hasSize(31);
+            var selected = issuer(BOOTSTRAP, SIGNING, ACTOR, WORKSPACE, shortReference);
+            var session = selected.exchange(exchange(BOOTSTRAP));
+            assertThat(session).isNotNull();
+            var request = auditCommentRequest(session, "audit-comment-key");
+            assertThat(selected.safeAuditComment(session, selected.mutationContext(session, request), request,
+                    "audit-comment-key", "prefix " + shortReference + " suffix")).isTrue();
+        }
+    }
+
+    @Test void auditCommentBindsCookieCsrfAuthorizationAndBoundedHeaderCardinality() {
+        var session = issue();
+        // Otherwise-valid issuer proof: change only the contract boundary under test.
+        String maximumKey = "k".repeat(128);
+        var bounded = auditCommentRequest(session, maximumKey);
+        var boundedMutation = issuer.mutationContext(session, bounded);
+        assertThat(boundedMutation).isNotNull();
+        assertThat(issuer.safeAuditComment(session, boundedMutation, bounded, maximumKey, "Reviewed rationale")).isTrue();
+        bounded.removeHeader("Idempotency-Key"); bounded.addHeader("Idempotency-Key", maximumKey + "k");
+        assertThat(issuer.safeAuditComment(session, boundedMutation, bounded, maximumKey + "k", "Reviewed rationale")).isFalse();
+        bounded.removeHeader("Idempotency-Key"); bounded.addHeader("Idempotency-Key", maximumKey);
+        String cookiePrefix = GovernanceReviewerCredentials.COOKIE + "=" + session.token() + "; other=";
+        String maximumRawCookie = cookiePrefix + "x".repeat(6000 - cookiePrefix.length());
+        assertThat(maximumRawCookie.getBytes(StandardCharsets.UTF_8)).hasSize(6000);
+        bounded.removeHeader("Cookie"); bounded.addHeader("Cookie", maximumRawCookie);
+        assertThat(issuer.safeAuditComment(session, boundedMutation, bounded, maximumKey, "Reviewed rationale")).isTrue();
+        int rawCookieBudget = 6000 - cookiePrefix.length();
+        String maximumMultibyteCookie = cookiePrefix + "한".repeat(rawCookieBudget / 3) + "x".repeat(rawCookieBudget % 3);
+        assertThat(maximumMultibyteCookie.getBytes(StandardCharsets.UTF_8)).hasSize(6000);
+        bounded.removeHeader("Cookie"); bounded.addHeader("Cookie", maximumMultibyteCookie);
+        assertThat(issuer.safeAuditComment(session, boundedMutation, bounded, maximumKey, "Reviewed rationale")).isTrue();
+        String oversizedUtf8Cookie = cookiePrefix + "한".repeat((6000 - cookiePrefix.length()) / 3 + 1);
+        assertThat(oversizedUtf8Cookie.length()).isLessThanOrEqualTo(6000);
+        assertThat(oversizedUtf8Cookie.getBytes(StandardCharsets.UTF_8).length).isGreaterThan(6000);
+        for (String invalidRawCookie : List.of("", "\uD800", oversizedUtf8Cookie)) {
+            bounded.removeHeader("Cookie"); bounded.addHeader("Cookie", invalidRawCookie);
+            assertThat(issuer.safeAuditComment(session, boundedMutation, bounded, maximumKey, "Reviewed rationale")).isFalse();
+        }
+        bounded.removeHeader("Cookie");
+        var maximumCookies = new Cookie[6000];
+        java.util.Arrays.fill(maximumCookies, new Cookie("other", "unrelated"));
+        maximumCookies[5999] = new Cookie(GovernanceReviewerCredentials.COOKIE, session.token());
+        bounded.setCookies(maximumCookies); bounded.removeHeader("Cookie");
+        assertThat(issuer.safeAuditComment(session, boundedMutation, bounded, maximumKey, "Reviewed rationale")).isTrue();
+        var oversizedCookies = java.util.Arrays.copyOf(maximumCookies, 6001);
+        oversizedCookies[6000] = new Cookie("other", "unrelated");
+        bounded.setCookies(oversizedCookies); bounded.removeHeader("Cookie");
+        assertThat(issuer.safeAuditComment(session, boundedMutation, bounded, maximumKey, "Reviewed rationale")).isFalse();
+        bounded.setCookies(new Cookie("other", "unrelated")); bounded.removeHeader("Cookie");
+        assertThat(issuer.safeAuditComment(session, boundedMutation, bounded, maximumKey, "Reviewed rationale")).isFalse();
+
+        var request = auditCommentRequest(session, "audit-comment-key");
+        var mutation = issuer.mutationContext(session, request);
+        request.removeHeader("Cookie");
+        request.addHeader("Cookie", GovernanceReviewerCredentials.COOKIE + "=" + session.token());
+        assertThat(issuer.safeAuditComment(session, mutation, request, "audit-comment-key", "Reviewed rationale")).isTrue();
+        request.addHeader("Cookie", "extra=value");
+        assertThat(issuer.safeAuditComment(session, mutation, request, "audit-comment-key", "Reviewed rationale")).isFalse();
+        request.removeHeader("Cookie"); request.addHeader("Cookie", "x".repeat(6001));
+        assertThat(issuer.safeAuditComment(session, mutation, request, "audit-comment-key", "Reviewed rationale")).isFalse();
+        request.removeHeader("Cookie");
+        request.addHeader("Authorization", "synthetic-comment-owned-auth-reference-at-least-32");
+        assertThat(issuer.safeAuditComment(session, mutation, request, "audit-comment-key", "Reviewed rationale")).isFalse();
+        request.removeHeader("Authorization"); request.addHeader("X-CSRF-Token", session.csrfToken());
+        assertThat(issuer.safeAuditComment(session, mutation, request, "audit-comment-key", "Reviewed rationale")).isFalse();
+        request.removeHeader("X-CSRF-Token"); request.addHeader("X-CSRF-Token", session.csrfToken());
+        request.setCookies(new Cookie(GovernanceReviewerCredentials.COOKIE, "different-cookie"));
+        assertThat(issuer.safeAuditComment(session, mutation, request, "audit-comment-key", "Reviewed rationale")).isFalse();
+        request.setCookies(new Cookie(GovernanceReviewerCredentials.COOKIE, session.token()),
+                new Cookie(GovernanceReviewerCredentials.COOKIE, session.token()));
+        assertThat(issuer.safeAuditComment(session, mutation, request, "audit-comment-key", "Reviewed rationale")).isFalse();
+        request.setCookies(new Cookie(GovernanceReviewerCredentials.COOKIE, session.token()),
+                new Cookie(GovernanceReviewerCredentials.COOKIE, "different-cookie"));
+        assertThat(issuer.safeAuditComment(session, mutation, request, "audit-comment-key", "Reviewed rationale")).isFalse();
+        request.setCookies(new Cookie(GovernanceReviewerCredentials.COOKIE, session.token()));
+        request.addHeader("Idempotency-Key", "duplicate-key");
+        assertThat(issuer.safeAuditComment(session, mutation, request, "audit-comment-key", "Reviewed rationale")).isFalse();
+    }
+
+    private MockHttpServletRequest auditCommentRequest(GovernanceReviewerCredentials.Session session, String key) {
+        var request = cookie(session.token());
+        request.addHeader("X-CSRF-Token", session.csrfToken()); request.addHeader("Idempotency-Key", key);
+        return request;
+    }
+
     private GovernanceReviewerCredentials issuer(String bootstrap, String signing, String actor, String workspace, String cKey) {
         return new GovernanceReviewerCredentials(bootstrap, signing, actor, workspace, cKey, clock);
     }
